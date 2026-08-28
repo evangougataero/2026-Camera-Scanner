@@ -1,0 +1,511 @@
+/* =========================================================
+   MAIN AI CHECK BUTTON
+   ========================================================= */
+
+#ebay-comp-checker-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 24px !important;
+  z-index: 2147483647 !important;
+
+  background: #111 !important;
+  color: white !important;
+
+  border: none !important;
+  border-radius: 10px !important;
+
+  padding: 12px 16px !important;
+
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25) !important;
+}
+
+#ebay-comp-checker-btn:hover {
+  background: #333 !important;
+}
+
+
+/* =========================================================
+   AI DEBUG PANEL
+   ========================================================= */
+
+#ebay-ai-debug-panel {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 84px !important;
+
+  width: 360px !important;
+  max-height: 75vh !important;
+  overflow: auto !important;
+
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 12px !important;
+
+  padding: 14px !important;
+
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28) !important;
+
+  font-family: Arial, sans-serif !important;
+  font-size: 12px !important;
+}
+
+#ebay-ai-debug-panel pre {
+  font-family: Consolas, Monaco, monospace !important;
+}
+
+#ebay-ai-debug-close:hover {
+  background: #ddd !important;
+}
+
+
+/* =========================================================
+   RESULT PANEL
+   ========================================================= */
+
+#ebay-comp-result-panel {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 24px !important;
+
+  width: 390px !important;
+  max-height: 80vh !important;
+  overflow: auto !important;
+
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 12px !important;
+
+  padding: 14px !important;
+
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28) !important;
+
+  font-family: Arial, sans-serif !important;
+  font-size: 12px !important;
+}
+
+
+/* =========================================================
+   BUTTON STACK
+
+   Bottom → Top:
+
+   24px  AI Check eBay Sold
+   76px  Random Keyword Scan
+   128px Stop Scan
+   180px Failed Reevaluations
+   232px Library Saving
+   284px Saved Deals
+   336px Scam Listings
+   388px Session Listings
+
+   Saved Deals / Scam Listings / Session Listings are hidden
+   by content.js when Library Saving is OFF.
+   ========================================================= */
+
+
+/* =========================================================
+   REMOVE STANDARD AUTO SCAN BUTTON
+   ========================================================= */
+
+#marketplace-auto-analyzer-start-btn {
+  display: none !important;
+}
+
+
+/* =========================================================
+   RANDOM KEYWORD SCAN
+   ========================================================= */
+
+#marketplace-random-keyword-scan-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 76px !important;
+  z-index: 2147483647 !important;
+
+  background: #4c1d95 !important;
+  color: white !important;
+
+  border: none !important;
+  border-radius: 10px !important;
+
+  padding: 10px 14px !important;
+
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22) !important;
+}
+
+#marketplace-random-keyword-scan-btn:hover {
+  background: #5b21b6 !important;
+}
+
+
+/* =========================================================
+   STOP SCAN
+   ========================================================= */
+
+#marketplace-auto-analyzer-stop-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 128px !important;
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 10px !important;
+
+  padding: 10px 14px !important;
+
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22) !important;
+}
+
+#marketplace-auto-analyzer-stop-btn:hover {
+  background: #f2f2f2 !important;
+}
+
+
+/* =========================================================
+   FAILED REEVALUATIONS
+   ========================================================= */
+
+#failed-reevaluation-listings-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 180px !important;
+  z-index: 2147483647 !important;
+
+  background: #92400e !important;
+  color: white !important;
+
+  border: 1px solid #b45309 !important;
+  border-radius: 10px !important;
+
+  padding: 10px 14px !important;
+
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22) !important;
+}
+
+#failed-reevaluation-listings-btn:hover {
+  background: #b45309 !important;
+}
+
+
+/* Failed Reevaluations panel */
+
+#failed-reevaluation-listings-panel {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 234px !important;
+
+  width: 470px !important;
+  max-height: 75vh !important;
+  overflow: auto !important;
+
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 12px !important;
+
+  padding: 14px !important;
+
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28) !important;
+
+  font-family: Arial, sans-serif !important;
+  font-size: 12px !important;
+}
+
+#failed-reevaluation-listings-close:hover,
+#failed-reevaluation-listings-clear:hover {
+  background: #ddd !important;
+}
+
+
+/* =========================================================
+   LIBRARY SAVING TOGGLE
+   ========================================================= */
+
+#library-saving-toggle-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 232px !important;
+  z-index: 2147483647 !important;
+
+  color: white !important;
+
+  border-radius: 10px !important;
+
+  padding: 10px 14px !important;
+
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22) !important;
+}
+
+
+/* Library Saving OFF */
+
+#library-saving-toggle-btn[data-enabled="false"] {
+  background: #7f1d1d !important;
+  border: 1px solid #991b1b !important;
+}
+
+#library-saving-toggle-btn[data-enabled="false"]:hover {
+  background: #991b1b !important;
+}
+
+
+/* Library Saving ON */
+
+#library-saving-toggle-btn[data-enabled="true"] {
+  background: #166534 !important;
+  border: 1px solid #15803d !important;
+}
+
+#library-saving-toggle-btn[data-enabled="true"]:hover {
+  background: #15803d !important;
+}
+
+
+/* Fallback in case data-enabled has not been set yet */
+
+#library-saving-toggle-btn:not([data-enabled]) {
+  background: #7f1d1d !important;
+  border: 1px solid #991b1b !important;
+}
+
+
+/* =========================================================
+   SAVED DEALS
+   Library-only button
+   ========================================================= */
+
+#saved-deals-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 284px !important;
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 10px !important;
+
+  padding: 10px 14px !important;
+
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22) !important;
+}
+
+#saved-deals-btn:hover {
+  background: #f2f2f2 !important;
+}
+
+
+/* Saved Deals library panel */
+
+#saved-deal-library-panel {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 130px !important;
+
+  width: 430px !important;
+  max-height: 75vh !important;
+  overflow: auto !important;
+
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 12px !important;
+
+  padding: 14px !important;
+
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28) !important;
+
+  font-family: Arial, sans-serif !important;
+  font-size: 12px !important;
+}
+
+#saved-deal-library-close:hover,
+#saved-deal-library-clear:hover {
+  background: #ddd !important;
+}
+
+
+/* =========================================================
+   SCAM LISTINGS
+   Library-only button
+   ========================================================= */
+
+#scam-listings-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 336px !important;
+  z-index: 2147483647 !important;
+
+  background: #7f1d1d !important;
+  color: white !important;
+
+  border: 1px solid #991b1b !important;
+  border-radius: 10px !important;
+
+  padding: 10px 14px !important;
+
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22) !important;
+}
+
+#scam-listings-btn:hover {
+  background: #991b1b !important;
+}
+
+
+/* Scam Listings panel */
+
+#scam-listings-panel {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 286px !important;
+
+  width: 440px !important;
+  max-height: 75vh !important;
+  overflow: auto !important;
+
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 12px !important;
+
+  padding: 14px !important;
+
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28) !important;
+
+  font-family: Arial, sans-serif !important;
+  font-size: 12px !important;
+}
+
+#scam-listings-close:hover,
+#scam-listings-clear:hover {
+  background: #ddd !important;
+}
+
+
+/* =========================================================
+   SESSION LISTINGS
+   Library-only button
+   ========================================================= */
+
+#session-listings-btn {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 388px !important;
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 10px !important;
+
+  padding: 10px 14px !important;
+
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: Arial, sans-serif !important;
+
+  cursor: pointer !important;
+
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22) !important;
+}
+
+#session-listings-btn:hover {
+  background: #f2f2f2 !important;
+}
+
+
+/* Session Listings panel */
+
+#session-listings-panel {
+  position: fixed !important;
+  right: 24px !important;
+  bottom: 338px !important;
+
+  width: 460px !important;
+  max-height: 75vh !important;
+  overflow: auto !important;
+
+  z-index: 2147483647 !important;
+
+  background: white !important;
+  color: #111 !important;
+
+  border: 1px solid #ddd !important;
+  border-radius: 12px !important;
+
+  padding: 14px !important;
+
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28) !important;
+
+  font-family: Arial, sans-serif !important;
+  font-size: 12px !important;
+}
+
+#session-listings-close:hover,
+#session-listings-clear:hover {
+  background: #ddd !important;
+}

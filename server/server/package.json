@@ -1,0 +1,20 @@
+{
+  "name": "marketplace-ai-comp-server",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@google-cloud/vision": "^6.0.0",
+    "@supabase/supabase-js": "^2.112.3",
+    "better-sqlite3": "^13.0.3",
+    "cloudinary": "^2.10.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.7",
+    "express": "^4.18.3",
+    "googleapis": "^173.0.0",
+    "openai": "^4.76.0",
+    "sharp": "^0.34.5"
+  }
+}

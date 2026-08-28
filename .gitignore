@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Accidental backup folder
+.gitignore-folder-backup/
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+marketplace-analysis-logs/
+openai-api-logs/
+
+# Credentials
+google-credentials.json
+service-account*.json
+
+# Windows/macOS
+Thumbs.db
+.DS_Store
+
+auto-thingy-5dc9a0238a62.json

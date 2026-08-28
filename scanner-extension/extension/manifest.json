@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "SCANNER Marketplace eBay AI Comp Checker",
+  "version": "0.3.0",
+  "description": "Uses AI to identify Facebook Marketplace items, open eBay sold comps, and estimate deal quality.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:3000/*",
+    "http://127.0.0.1:3000/*",
+    "https://www.ebay.com/*",
+    "https://www.facebook.com/*",
+    "https://web.facebook.com/*",
+    "https://www.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.facebook.com/marketplace/*",
+        "https://web.facebook.com/marketplace/*",
+        "https://www.facebook.com/*",
+        "https://web.facebook.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.ebay.com/sch/*"
+      ],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

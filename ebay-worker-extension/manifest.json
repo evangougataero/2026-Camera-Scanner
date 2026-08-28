@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "eBay Remote Comp Worker",
+  "version": "1.0.0",
+
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms"
+  ],
+
+  "host_permissions": [
+    "http://127.0.0.1:3000/*",
+    "http://localhost:3000/*",
+    "https://www.ebay.com/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.ebay.com/sch/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
