@@ -7043,7 +7043,10 @@ Requirements:
 - Do not sound like you are summarizing the listing.
 - Say that I am in California.
 - Make clear that I am looking to have the item shipped.
-- It is fine to say I will cover shipping.
+- Make clear that I will pay the seller before they ship the item.
+- Make clear that I will also cover the shipping cost.
+- Phrase the payment point casually and naturally, such as "I can pay upfront", "I can pay before you ship it", or equivalent wording.
+- Do not imply that the seller needs to ship before receiving payment.
 - Do NOT mention "Buy Now", negotiation, negotiating, offers, offer price, asking price, discounts, profit, resale, or eBay.
 - Do NOT invent any product or listing detail.
 - Only reference products or details supplied above.
