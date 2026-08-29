@@ -288,14 +288,6 @@ const analysisLogStorage =
 const visionClient =
   new vision.ImageAnnotatorClient();
 
-const PRODUCT_DATABASE_PATH = path.resolve(
-  "camera-products.db"
-);
-
-const productDb = new Database(
-  PRODUCT_DATABASE_PATH
-);
-
 /*
   ============================================================
   MARKETPLACE OUTREACH QUEUE DATABASE
@@ -1235,19 +1227,8 @@ console.error = (...args) => {
 
 cleanupOldLocalAnalysisLogs();
 
-productDb.exec(`
-  CREATE TABLE IF NOT EXISTS products (
-    canonical_name TEXT PRIMARY KEY,
-    brand TEXT NOT NULL,
-    model TEXT NOT NULL,
-    product_type TEXT NOT NULL,
-    estimated_resale_price REAL NOT NULL
-  )
-`);
-
 console.log(
-  "[PRODUCT DATABASE] Ready:",
-  PRODUCT_DATABASE_PATH
+  "[PRODUCT DATABASE] Using global Supabase camera_products table."
 );
 
 function normalizeCanonicalName(value) {
@@ -1338,7 +1319,7 @@ function getCanonicalNameForItem(item) {
   );
 }
 
-function findProductInDatabase(item) {
+async function findProductInDatabase(item) {
   const canonicalName =
     getCanonicalNameForItem(item);
 
@@ -1346,21 +1327,40 @@ function findProductInDatabase(item) {
     return null;
   }
 
-  return productDb
-    .prepare(`
-      SELECT
+  const {
+    data,
+    error
+  } =
+    await supabaseAdmin
+      .from(
+        "camera_products"
+      )
+      .select(`
         canonical_name,
         brand,
         model,
         product_type,
         estimated_resale_price
-      FROM products
-      WHERE canonical_name = ?
-    `)
-    .get(canonicalName) || null;
+      `)
+      .eq(
+        "canonical_name",
+        canonicalName
+      )
+      .maybeSingle();
+
+  if (error) {
+    throw new Error(
+      `Supabase product lookup failed for "${canonicalName}": ${
+        error.message ||
+        String(error)
+      }`
+    );
+  }
+
+  return data || null;
 }
 
-function saveProductToDatabase({
+async function saveProductToDatabase({
   item,
   estimatedResalePrice
 }) {
@@ -1368,7 +1368,9 @@ function saveProductToDatabase({
     getCanonicalNameForItem(item);
 
   const price =
-    Number(estimatedResalePrice);
+    Number(
+      estimatedResalePrice
+    );
 
   if (
     !canonicalName ||
@@ -1378,40 +1380,63 @@ function saveProductToDatabase({
     return false;
   }
 
-  productDb.prepare(`
-    INSERT INTO products (
-      canonical_name,
-      brand,
-      model,
-      product_type,
-      estimated_resale_price
-    )
-    VALUES (?, ?, ?, ?, ?)
+  const {
+    error
+  } =
+    await supabaseAdmin
+      .from(
+        "camera_products"
+      )
+      .upsert(
+        {
+          canonical_name:
+            canonicalName,
 
-    ON CONFLICT(canonical_name)
-    DO UPDATE SET
-      brand = excluded.brand,
-      model = excluded.model,
-      product_type = excluded.product_type,
-      estimated_resale_price =
-        excluded.estimated_resale_price
-  `).run(
-    canonicalName,
-    String(item.brand || "").trim(),
-    String(item.model || "").trim(),
-    String(item.productType || "").trim(),
-    price
-  );
+          brand:
+            String(
+              item.brand || ""
+            ).trim(),
+
+          model:
+            String(
+              item.model || ""
+            ).trim(),
+
+          product_type:
+            String(
+              item.productType || ""
+            ).trim(),
+
+          estimated_resale_price:
+            price,
+
+          updated_at:
+            new Date()
+              .toISOString()
+        },
+        {
+          onConflict:
+            "canonical_name"
+        }
+      );
+
+  if (error) {
+    throw new Error(
+      `Supabase product save failed for "${canonicalName}": ${
+        error.message ||
+        String(error)
+      }`
+    );
+  }
 
   console.log(
-    "[PRODUCT DATABASE] Saved:",
+    "[PRODUCT DATABASE] Saved globally to Supabase:",
     canonicalName,
     "$" + price
   );
 
   return true;
 }
-
 process.on("uncaughtException", error => {
   console.error("UNCAUGHT EXCEPTION:");
   console.error(error);
@@ -2835,58 +2860,82 @@ const OPENAI_MODEL_PRICING_USD_PER_MILLION = {
 
 app.post(
   "/lookup-product-values",
-  (req, res) => {
+  async (req, res) => {
     try {
       const items =
-        Array.isArray(req.body?.items)
+        Array.isArray(
+          req.body?.items
+        )
           ? req.body.items
           : [];
 
-const results =
-  items.map((item, index) => {
-    const databaseProduct =
-      findProductInDatabase(item);
+      const results =
+        await Promise.all(
+          items.map(
+            async (
+              item,
+              index
+            ) => {
+              const databaseProduct =
+                await findProductInDatabase(
+                  item
+                );
 
-    if (!databaseProduct) {
-      return {
-        index,
-        found: false,
-        canonicalName:
-          getCanonicalNameForItem(item)
-      };
-    }
+              if (!databaseProduct) {
+                return {
+                  index,
 
-    return {
-      index,
-      found: true,
-      canonicalName:
-        databaseProduct.canonical_name,
-      estimatedResalePrice:
-        Number(
-          databaseProduct
-            .estimated_resale_price
-        )
-    };
-  });
+                  found:
+                    false,
 
-console.log(
-  "[PRODUCT DATABASE] Lookup results:",
-  results
-);
+                  canonicalName:
+                    getCanonicalNameForItem(
+                      item
+                    )
+                };
+              }
 
-res.json({
-  results
-});
+              return {
+                index,
+
+                found:
+                  true,
+
+                canonicalName:
+                  databaseProduct
+                    .canonical_name,
+
+                estimatedResalePrice:
+                  Number(
+                    databaseProduct
+                      .estimated_resale_price
+                  )
+              };
+            }
+          )
+        );
+
+      console.log(
+        "[PRODUCT DATABASE] Supabase lookup results:",
+        results
+      );
+
+      res.json({
+        results
+      });
+
     } catch (error) {
       console.error(
-        "Product database lookup failed:",
+        "Global product database lookup failed:",
         error
       );
 
-      res.status(500).json({
-        error:
-          "Product database lookup failed."
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            "Global product database lookup failed."
+        });
     }
   }
 );
@@ -6613,8 +6662,10 @@ if (
   validSoldCount >=
     minimumRelevantSales90Days
 ) {
-  saveProductToDatabase({
-    item: target,
+  await saveProductToDatabase({
+    item:
+      target,
+
     estimatedResalePrice:
       expectedSalePrice
   });
