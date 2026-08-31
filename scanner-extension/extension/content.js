@@ -1872,15 +1872,12 @@ const MARKETPLACE_SEARCH_TERMS = [
   "vintage camera",
   "old camera",
   "camera bundle",
-  "camera lot",
   "camera equipment",
   "photography equipment",
   "camera gear",
   "camera with lens",
   "interchangeable lens camera",
   "professional camera",
-  "vlogging camera",
-  "point and shoot camera",
   "digital video camera",
 
   "camera",
@@ -1931,8 +1928,6 @@ const MARKETPLACE_SEARCH_TERMS = [
   "cannon lens",
   "nikon camara",
   "camera lense",
-  "camcorder",
-  "photography stuff",
   "photo camera",
   "digital cam",
   "rebel camera"
@@ -7865,6 +7860,88 @@ async function readJsonSafely(response) {
   }
 }
 
+function getGalleryPrimaryProductCount(
+  galleries
+) {
+  const uniqueProductIds =
+    new Set();
+
+  let productsWithoutIds = 0;
+
+
+  for (
+    const gallery of galleries || []
+  ) {
+    const products =
+      Array.isArray(
+        gallery
+          ?.galleryAnalysis
+          ?.products
+      )
+        ? gallery.galleryAnalysis.products
+        : [];
+
+
+    for (
+      const product of products
+    ) {
+      const productId =
+        String(
+          product?.productId || ""
+        ).trim();
+
+
+      /*
+        Product IDs are global across galleries.
+
+        If camera_1 appears in Gallery 1 and
+        Gallery 2, it is still only ONE
+        physical primary product.
+      */
+      if (productId) {
+        uniqueProductIds.add(
+          productId
+        );
+      } else {
+        /*
+          Defensive fallback.
+
+          A product should normally always
+          have a productId, but don't let a
+          malformed result cause us to
+          undercount a large bundle.
+        */
+        productsWithoutIds += 1;
+      }
+    }
+  }
+
+
+  return (
+    uniqueProductIds.size +
+    productsWithoutIds
+  );
+}
+
+
+function isGalleryWithinPrimaryProductLimit(
+  galleries,
+  maximumProducts = 5
+) {
+  const primaryProductCount =
+    getGalleryPrimaryProductCount(
+      galleries
+    );
+
+  return {
+    primaryProductCount,
+
+    allowed:
+      primaryProductCount <=
+      maximumProducts
+  };
+}
+
 function pickBestGoogleTargets(
   galleries,
   imageUrls
@@ -9225,13 +9302,78 @@ if (!factsResponse.ok) {
         ? galleryData.galleries
         : [];
 
-    console.log(
-      "[STEP 2] Complete gallery result:"
-    );
+console.log(
+  "[STEP 2] Complete gallery result:"
+);
 
-    console.log(
-      galleryData
-    );
+console.log(
+  galleryData
+);
+
+
+/*
+  Quiet bundle-size check.
+
+  This is deliberately NOT part of any
+  AI prompt. It only inspects the physical
+  products already returned by Step 2.
+*/
+const galleryProductLimit =
+  isGalleryWithinPrimaryProductLimit(
+    galleries,
+    5
+  );
+
+
+if (
+  !galleryProductLimit.allowed
+) {
+  const passResult = {
+    recommendation:
+      "Pass",
+
+    reason:
+      `Listing contains ${galleryProductLimit.primaryProductCount} primary products. Maximum allowed is 5.`,
+
+    facebookPrice,
+
+    totalExpectedSalePrice:
+      null,
+
+    profitAtAsk:
+      null,
+
+    profitAt35:
+      null,
+
+    maxBuyPrice:
+      null,
+
+    validSoldCount:
+      0,
+
+    medianSoldPrice:
+      null,
+
+    items:
+      [],
+
+    ignoredItems:
+      []
+  };
+
+
+  console.log(
+    `[PRIMARY PRODUCT LIMIT] Skipping listing: ${galleryProductLimit.primaryProductCount} products detected.`
+  );
+
+
+  await markMarketplaceAutoAnalysisComplete(
+    passResult
+  );
+
+  return;
+}
 
 
 showDebugPreview({
