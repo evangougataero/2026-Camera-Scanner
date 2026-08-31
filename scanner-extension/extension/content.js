@@ -31,33 +31,135 @@ const MARKETPLACE_ANALYSIS_JOBS_KEY =
 const MARKETPLACE_FINISH_LOCK_KEY =
   "marketplaceAnalysisFinishLock";
 
-  async function getMarketplaceAnalysisJobs() {
-  const stored =
-    await chrome.storage.local.get(
-      MARKETPLACE_ANALYSIS_JOBS_KEY
-    );
+  const MARKETPLACE_ANALYSIS_JOB_PREFIX =
+  "marketplaceAnalysisJob:";
 
-  return Array.isArray(
-    stored[
-      MARKETPLACE_ANALYSIS_JOBS_KEY
-    ]
-  )
-    ? stored[
-        MARKETPLACE_ANALYSIS_JOBS_KEY
-      ]
-    : [];
+const MARKETPLACE_BACKGROUND_JOB_STATUSES =
+  new Set([
+    "waiting-dataforseo",
+    "resume-ready",
+    "finishing"
+  ]);
+
+const MARKETPLACE_JOB_STALE_MS = {
+  analyzing: 4 * 60 * 1000,
+  "waiting-dataforseo": 12 * 60 * 1000,
+  "resume-ready": 2 * 60 * 1000,
+  finishing: 6 * 60 * 1000
+};
+
+const MARKETPLACE_DEFAULT_JOB_STALE_MS =
+  4 * 60 * 1000;
+
+const MARKETPLACE_ORPHAN_GRACE_MS =
+  90 * 1000;
+
+
+function getMarketplaceAnalysisJobStorageKey(
+  jobId
+) {
+  return (
+    MARKETPLACE_ANALYSIS_JOB_PREFIX +
+    String(jobId || "")
+  );
 }
 
 
-async function saveMarketplaceAnalysisJobs(
-  jobs
+function isMarketplaceAnalysisJobTerminal(
+  job
 ) {
-  await chrome.storage.local.set({
-    [MARKETPLACE_ANALYSIS_JOBS_KEY]:
-      Array.isArray(jobs)
-        ? jobs
-        : []
-  });
+  return [
+    "complete",
+    "failed"
+  ].includes(
+    String(
+      job?.status || ""
+    )
+  );
+}
+
+
+function isMarketplaceBackgroundAnalysisJob(
+  job
+) {
+  return MARKETPLACE_BACKGROUND_JOB_STATUSES.has(
+    String(
+      job?.status || ""
+    )
+  );
+}
+
+
+function getMarketplaceAnalysisJobLastActivityAt(
+  job
+) {
+  return Math.max(
+    Number(job?.updatedAt || 0),
+    Number(job?.dataForSeoReturnedAt || 0),
+    Number(job?.parkedAt || 0),
+    Number(job?.startedAt || 0),
+    Number(job?.createdAt || 0)
+  );
+}
+
+
+function isMarketplaceAnalysisJobStale(
+  job,
+  now = Date.now()
+) {
+  if (
+    !job ||
+    isMarketplaceAnalysisJobTerminal(job)
+  ) {
+    return false;
+  }
+
+  const lastActivityAt =
+    getMarketplaceAnalysisJobLastActivityAt(
+      job
+    );
+
+  if (!lastActivityAt) {
+    return true;
+  }
+
+  const status =
+    String(
+      job?.status || ""
+    );
+
+  const staleAfterMs =
+    MARKETPLACE_JOB_STALE_MS[
+      status
+    ] ||
+    MARKETPLACE_DEFAULT_JOB_STALE_MS;
+
+  return (
+    now - lastActivityAt >=
+    staleAfterMs
+  );
+}
+
+async function getMarketplaceAnalysisJobs() {
+  const stored =
+    await chrome.storage.local.get(
+      null
+    );
+
+  return Object.entries(
+    stored
+  )
+    .filter(
+      ([key, value]) =>
+        key.startsWith(
+          MARKETPLACE_ANALYSIS_JOB_PREFIX
+        ) &&
+        value?.jobId
+    )
+    .map(
+      ([, value]) =>
+        value
+    );
 }
 
 
@@ -73,6 +175,105 @@ function getCurrentMarketplaceAnalysisJobId() {
 }
 
 
+async function getMarketplaceAnalysisJobById(
+  jobId
+) {
+  if (!jobId) {
+    return null;
+  }
+
+  const key =
+    getMarketplaceAnalysisJobStorageKey(
+      jobId
+    );
+
+  const stored =
+    await chrome.storage.local.get(
+      key
+    );
+
+  return (
+    stored[key] ||
+    null
+  );
+}
+
+
+async function patchMarketplaceAnalysisJobById(
+  jobId,
+  patch = {},
+  options = {}
+) {
+  if (!jobId) {
+    return null;
+  }
+
+  const existing =
+    await getMarketplaceAnalysisJobById(
+      jobId
+    );
+
+  if (
+    !existing &&
+    options.createIfMissing === false
+  ) {
+    return null;
+  }
+
+  const currentUrl =
+    String(
+      options.currentUrl ||
+      patch.url ||
+      ""
+    ).split("?")[0];
+
+  const now =
+    Date.now();
+
+  const updated = {
+    ...(
+      existing || {
+        jobId,
+
+        listingId:
+          getFacebookMarketplaceItemId(
+            currentUrl
+          ) ||
+          String(jobId)
+            .replace(
+              /^listing-/,
+              ""
+            ),
+
+        url:
+          currentUrl,
+
+        createdAt:
+          now
+      }
+    ),
+
+    ...patch,
+
+    jobId,
+
+    updatedAt:
+      now
+  };
+
+  await chrome.storage.local.set({
+    [
+      getMarketplaceAnalysisJobStorageKey(
+        jobId
+      )
+    ]:
+      updated
+  });
+
+  return updated;
+}
+
+
 async function upsertMarketplaceAnalysisJob(
   patch = {}
 ) {
@@ -83,70 +284,15 @@ async function upsertMarketplaceAnalysisJob(
     return null;
   }
 
-  const jobs =
-    await getMarketplaceAnalysisJobs();
-
-  const existingIndex =
-    jobs.findIndex(
-      job =>
-        job?.jobId ===
-        jobId
-    );
-
-  const currentUrl =
-    window.location.href
-      .split("?")[0];
-
-  const existing =
-    existingIndex >= 0
-      ? jobs[
-          existingIndex
-        ]
-      : {
-          jobId,
-
-          listingId:
-            getFacebookMarketplaceItemId(
-              currentUrl
-            ),
-
-          url:
-            currentUrl,
-
-          createdAt:
-            Date.now()
-        };
-
-  const updated = {
-    ...existing,
-    ...patch,
+  return patchMarketplaceAnalysisJobById(
     jobId,
-    url:
-      existing.url ||
-      currentUrl,
-
-    updatedAt:
-      Date.now()
-  };
-
-  if (
-    existingIndex >= 0
-  ) {
-    jobs[
-      existingIndex
-    ] =
-      updated;
-  } else {
-    jobs.push(
-      updated
-    );
-  }
-
-  await saveMarketplaceAnalysisJobs(
-    jobs
+    patch,
+    {
+      currentUrl:
+        window.location.href
+          .split("?")[0]
+    }
   );
-
-  return updated;
 }
 
 
@@ -158,14 +304,9 @@ async function removeCurrentMarketplaceAnalysisJob() {
     return;
   }
 
-  const jobs =
-    await getMarketplaceAnalysisJobs();
-
-  await saveMarketplaceAnalysisJobs(
-    jobs.filter(
-      job =>
-        job?.jobId !==
-        jobId
+  await chrome.storage.local.remove(
+    getMarketplaceAnalysisJobStorageKey(
+      jobId
     )
   );
 }
@@ -177,16 +318,112 @@ async function countActiveMarketplaceAnalysisJobs() {
 
   return jobs.filter(
     job =>
-      ![
-        "complete",
-        "failed"
-      ].includes(
-        String(
-          job?.status ||
-          ""
-        )
+      !isMarketplaceAnalysisJobTerminal(
+        job
       )
   ).length;
+}
+
+
+async function failMarketplaceAnalysisJobById(
+  jobId,
+  failureReason,
+  stage = "watchdog"
+) {
+  return patchMarketplaceAnalysisJobById(
+    jobId,
+    {
+      status:
+        "failed",
+
+      stage,
+
+      failureReason:
+        String(
+          failureReason ||
+          "Analysis job failed."
+        ),
+
+      failedAt:
+        Date.now()
+    },
+    {
+      createIfMissing:
+        false
+    }
+  );
+}
+
+
+async function pruneStaleMarketplaceAnalysisJobs() {
+  const jobs =
+    await getMarketplaceAnalysisJobs();
+
+  const now =
+    Date.now();
+
+  for (const job of jobs) {
+    if (
+      !isMarketplaceAnalysisJobStale(
+        job,
+        now
+      )
+    ) {
+      continue;
+    }
+
+    console.warn(
+      "[PIPELINE WATCHDOG] Stale job:",
+      job
+    );
+
+    await failMarketplaceAnalysisJobById(
+      job.jobId,
+      `Job remained stuck in "${job.status}" past its watchdog limit.`,
+      "stale-watchdog"
+    );
+
+    const lockStored =
+      await chrome.storage.local.get(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+
+    if (
+      lockStored[
+        MARKETPLACE_FINISH_LOCK_KEY
+      ] === job.jobId
+    ) {
+      await chrome.storage.local.remove(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+    }
+  }
+}
+
+
+async function clearMarketplaceAnalysisJobRegistry() {
+  const stored =
+    await chrome.storage.local.get(
+      null
+    );
+
+  const keys = Object.keys(
+    stored
+  ).filter(
+    key =>
+      key.startsWith(
+        MARKETPLACE_ANALYSIS_JOB_PREFIX
+      )
+  );
+
+  await chrome.storage.local.remove([
+    ...keys,
+
+    // Remove data left by the old implementation too.
+    MARKETPLACE_ANALYSIS_JOBS_KEY,
+
+    MARKETPLACE_FINISH_LOCK_KEY
+  ]);
 }
 
 async function acquireMarketplaceFinishLock() {
@@ -197,7 +434,15 @@ async function acquireMarketplaceFinishLock() {
     return;
   }
 
+
   while (true) {
+    /*
+      Prevent a crashed lock owner from blocking
+      all future listings forever.
+    */
+    await pruneStaleMarketplaceAnalysisJobs();
+
+
     const stored =
       await chrome.storage.local.get(
         MARKETPLACE_FINISH_LOCK_KEY
@@ -211,6 +456,7 @@ async function acquireMarketplaceFinishLock() {
         ""
       ).trim();
 
+
     if (
       !currentOwner ||
       currentOwner ===
@@ -221,18 +467,18 @@ async function acquireMarketplaceFinishLock() {
           jobId
       });
 
-      /*
-        Verify we actually won the lock.
-      */
+
       const verify =
         await chrome.storage.local.get(
           MARKETPLACE_FINISH_LOCK_KEY
         );
 
+
       if (
         verify[
           MARKETPLACE_FINISH_LOCK_KEY
-        ] === jobId
+        ] ===
+          jobId
       ) {
         console.log(
           "[PIPELINE LOCK] Acquired finish lock:",
@@ -243,13 +489,54 @@ async function acquireMarketplaceFinishLock() {
       }
     }
 
+
+    const ownerJob =
+      await getMarketplaceAnalysisJobById(
+        currentOwner
+      );
+
+
+    if (
+      currentOwner &&
+      (
+        !ownerJob ||
+        isMarketplaceAnalysisJobTerminal(
+          ownerJob
+        ) ||
+        isMarketplaceAnalysisJobStale(
+          ownerJob
+        )
+      )
+    ) {
+      console.warn(
+        "[PIPELINE LOCK] Removing stale lock:",
+        {
+          currentOwner,
+          ownerStatus:
+            ownerJob?.status ||
+            "missing"
+        }
+      );
+
+      await chrome.storage.local.remove(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+
+      continue;
+    }
+
+
     console.log(
-      "[PIPELINE LOCK] Waiting for older listing to finish:",
+      "[PIPELINE LOCK] Waiting for older listing:",
       {
         jobId,
-        currentOwner
+        currentOwner,
+        ownerStatus:
+          ownerJob?.status ||
+          "missing"
       }
     );
+
 
     await sleep(
       500
@@ -3833,10 +4120,7 @@ async function startMarketplaceAutoAnalyzer(
   Jobs from a previous stopped/crashed session
   must never block a new scan.
 */
-await chrome.storage.local.remove([
-  MARKETPLACE_ANALYSIS_JOBS_KEY,
-  MARKETPLACE_FINISH_LOCK_KEY
-]);
+await clearMarketplaceAnalysisJobRegistry();
 
 console.log(
   "[PIPELINE] Cleared stale analysis jobs and finish lock."
@@ -4164,7 +4448,9 @@ async function openNextMarketplaceListing() {
 
   if (!state?.running) return;
 
-  const activeAnalysisJobCount =
+await pruneStaleMarketplaceAnalysisJobs();
+
+const activeAnalysisJobCount =
   await countActiveMarketplaceAnalysisJobs();
 
 
@@ -4173,9 +4459,11 @@ if (
   MAX_CONCURRENT_MARKETPLACE_ANALYSES
 ) {
   console.log(
-    "[MARKETPLACE BROWSE] Maximum concurrent listing jobs reached:",
+    "[MARKETPLACE BROWSE] Maximum concurrent listing jobs reached. Waiting for capacity:",
     activeAnalysisJobCount
   );
+
+  await waitForMarketplaceChildListingToFinish();
 
   return;
 }
@@ -4709,6 +4997,13 @@ async function waitForMarketplaceChildListingToFinish() {
     }
 
 
+    /*
+      Recover child tabs that died without updating
+      their job status.
+    */
+    await pruneStaleMarketplaceAnalysisJobs();
+
+
     const jobs =
       await getMarketplaceAnalysisJobs();
 
@@ -4716,14 +5011,8 @@ async function waitForMarketplaceChildListingToFinish() {
     const activeJobs =
       jobs.filter(
         job =>
-          ![
-            "complete",
-            "failed"
-          ].includes(
-            String(
-              job?.status ||
-              ""
-            )
+          !isMarketplaceAnalysisJobTerminal(
+            job
           )
       );
 
@@ -4731,18 +5020,16 @@ async function waitForMarketplaceChildListingToFinish() {
     const parkedJobs =
       activeJobs.filter(
         job =>
-          job?.status ===
+          String(
+            job?.status || ""
+          ) ===
             "waiting-dataforseo"
       );
 
 
     /*
-      CASE 1
-
-      A listing is parked in DataForSEO and we still have
-      capacity for one more listing.
-
-      Immediately continue browsing instead of waiting.
+      DataForSEO is the ONLY point where we deliberately
+      allow another listing to be opened.
     */
     if (
       parkedJobs.length > 0 &&
@@ -4750,34 +5037,21 @@ async function waitForMarketplaceChildListingToFinish() {
         MAX_CONCURRENT_MARKETPLACE_ANALYSES
     ) {
       console.log(
-        "[MARKETPLACE BROWSE] DataForSEO wait detected. Opening another listing.",
-        {
-          activeJobs:
-            activeJobs.length,
-
-          parkedJobs:
-            parkedJobs.length
-        }
+        "[MARKETPLACE BROWSE] DataForSEO wait detected. Opening another listing."
       );
 
-
-      const waitBeforeNextMs =
+      await sleep(
         randomInt(
           1000,
           2500
-        );
-
-      await sleep(
-        waitBeforeNextMs
+        )
       );
-
 
       if (
         !(await isMarketplaceAutoAnalyzerRunning())
       ) {
         return;
       }
-
 
       await openNextMarketplaceListing();
 
@@ -4786,11 +5060,7 @@ async function waitForMarketplaceChildListingToFinish() {
 
 
     /*
-      CASE 2
-
-      No active jobs remain.
-
-      Normal completed-listing behavior.
+      All jobs finished.
     */
     if (
       activeJobs.length === 0
@@ -4799,24 +5069,18 @@ async function waitForMarketplaceChildListingToFinish() {
         "[MARKETPLACE BROWSE] All active listing jobs finished."
       );
 
-
-      const waitBeforeNextMs =
+      await sleep(
         randomInt(
           5000,
           10000
-        );
-
-      await sleep(
-        waitBeforeNextMs
+        )
       );
-
 
       if (
         !(await isMarketplaceAutoAnalyzerRunning())
       ) {
         return;
       }
-
 
       await openNextMarketplaceListing();
 
@@ -4825,11 +5089,10 @@ async function waitForMarketplaceChildListingToFinish() {
 
 
     /*
-      CASE 3
+      Both analysis slots are currently occupied.
 
-      Two listing jobs already exist.
-
-      Do not open a third.
+      Do not open a third listing. The stale-job
+      watchdog above still runs every 750ms.
     */
     if (
       activeJobs.length >=
@@ -4840,9 +5103,7 @@ async function waitForMarketplaceChildListingToFinish() {
 
 
     /*
-      CASE 4
-
-      One listing is still actively analyzing normally.
+      A normal foreground listing is still running.
     */
     if (
       String(
@@ -4852,6 +5113,112 @@ async function waitForMarketplaceChildListingToFinish() {
     ) {
       continue;
     }
+
+
+    /*
+      These are VALID background states.
+
+      In particular, resume-ready and finishing must
+      NOT be treated as orphaned simply because the
+      DataForSEO listing cleared currentListingUrl.
+    */
+    const legitimateBackgroundJobs =
+      activeJobs.filter(
+        job =>
+          isMarketplaceBackgroundAnalysisJob(
+            job
+          )
+      );
+
+    if (
+      legitimateBackgroundJobs.length ===
+      activeJobs.length
+    ) {
+      continue;
+    }
+
+
+    /*
+      Actual orphan recovery.
+
+      Give status transitions 90 seconds before
+      declaring the foreground job dead.
+    */
+    const now =
+      Date.now();
+
+    const orphanedJobs =
+      activeJobs.filter(
+        job =>
+          !isMarketplaceBackgroundAnalysisJob(
+            job
+          ) &&
+          now -
+            getMarketplaceAnalysisJobLastActivityAt(
+              job
+            ) >=
+            MARKETPLACE_ORPHAN_GRACE_MS
+      );
+
+
+    if (
+      orphanedJobs.length === 0
+    ) {
+      continue;
+    }
+
+
+    console.warn(
+      "[MARKETPLACE BROWSE] Orphaned job(s) detected:",
+      orphanedJobs
+    );
+
+
+    for (
+      const job of orphanedJobs
+    ) {
+      await failMarketplaceAnalysisJobById(
+        job.jobId,
+        "Job remained active after losing its foreground Marketplace slot.",
+        "orphaned"
+      );
+
+      const lockStored =
+        await chrome.storage.local.get(
+          MARKETPLACE_FINISH_LOCK_KEY
+        );
+
+      if (
+        lockStored[
+          MARKETPLACE_FINISH_LOCK_KEY
+        ] ===
+          job.jobId
+      ) {
+        await chrome.storage.local.remove(
+          MARKETPLACE_FINISH_LOCK_KEY
+        );
+      }
+    }
+
+
+    await sleep(
+      randomInt(
+        1000,
+        2000
+      )
+    );
+
+
+    if (
+      !(await isMarketplaceAutoAnalyzerRunning())
+    ) {
+      return;
+    }
+
+
+    await openNextMarketplaceListing();
+
+    return;
   }
 }
 
@@ -5272,8 +5639,16 @@ if (Date.now() - startedAt > maxWaitMs) {
     "Timed out waiting for eBay analysis to finish."
   );
 
-  const currentUrl = String(
-    state.currentListingUrl ||
+/*
+  CRITICAL:
+
+  A child listing must retry ITS OWN URL.
+
+  state.currentListingUrl may belong to the newer
+  listing while this tab is parked in DataForSEO.
+*/
+const currentUrl =
+  String(
     window.location.href ||
     ""
   ).split("?")[0];
@@ -5282,6 +5657,98 @@ if (Date.now() - startedAt > maxWaitMs) {
     getFacebookMarketplaceItemId(
       currentUrl
     );
+
+    const latestJobsAtTimeout =
+  await getMarketplaceAnalysisJobs();
+
+const otherActiveJobsAtTimeout =
+  latestJobsAtTimeout.filter(
+    job =>
+      job?.jobId !==
+        analysisJobId &&
+      !isMarketplaceAnalysisJobTerminal(
+        job
+      )
+  );
+
+
+const latestStoredAtTimeout =
+  await chrome.storage.local.get(
+    MARKETPLACE_AUTO_STATE_KEY
+  );
+
+const latestStateAtTimeout =
+  latestStoredAtTimeout[
+    MARKETPLACE_AUTO_STATE_KEY
+  ] || state;
+
+const sharedCurrentUrlAtTimeout =
+  String(
+    latestStateAtTimeout
+      .currentListingUrl ||
+    ""
+  ).split("?")[0];
+
+
+/*
+  Never allow an old timed-out child to reload the
+  newer foreground listing or clear its shared state.
+*/
+if (
+  (
+    sharedCurrentUrlAtTimeout &&
+    sharedCurrentUrlAtTimeout !==
+      currentUrl
+  ) ||
+  otherActiveJobsAtTimeout.length > 0
+) {
+  const abandonedResult = {
+    recommendation:
+      "Error",
+
+    reason:
+      "Listing analysis timed out while another Marketplace listing was active. The stale child was abandoned instead of retrying another listing.",
+
+    facebookPrice:
+      null,
+
+    estimatedResaleValue:
+      null,
+
+    profitAtAsk:
+      null,
+
+    profitAt35:
+      null
+  };
+
+
+  await updateSessionListingResult(
+    abandonedResult
+  );
+
+
+  await failMarketplaceAnalysisJobById(
+    analysisJobId,
+    abandonedResult.reason,
+    "timeout-with-other-job"
+  );
+
+
+  console.warn(
+    "[MARKETPLACE TAB] Abandoning stale child:",
+    {
+      analysisJobId,
+      currentUrl,
+      sharedCurrentUrlAtTimeout
+    }
+  );
+
+
+  await closeCurrentMarketplaceListingTab();
+
+  return;
+}
 
   const previousRetryCount =
     await getListingAnalysisRetryCount(
@@ -9336,22 +9803,6 @@ await upsertMarketplaceAnalysisJob({
     Date.now()
 });
 
-
-/*
-  Listing A now has priority over Listing B for the
-  final database/eBay/decision portion.
-*/
-await acquireMarketplaceFinishLock();
-
-
-await upsertMarketplaceAnalysisJob({
-  status:
-    "finishing",
-
-  stage:
-    "step-5b"
-});
-
   console.log(
     "[STEP 4B] Google Lens fallback results:"
   );
@@ -9472,6 +9923,29 @@ googleLensResults
     secondPassData;
 }
 
+/*
+  SERIALIZE THE FINAL PHASE FOR EVERY LISTING.
+
+  This protects the shared database/eBay state even when
+  this listing did not require DataForSEO.
+*/
+await acquireMarketplaceFinishLock();
+
+
+await upsertMarketplaceAnalysisJob({
+  status:
+    "finishing",
+
+  stage:
+    "final-database-ebay"
+});
+
+
+/*
+  ============================================================
+  FINAL PRIMARY PRODUCTS
+  ============================================================
+*/
 
 /*
   ============================================================
@@ -11533,14 +12007,21 @@ await upsertMarketplaceAnalysisJob({
 await releaseMarketplaceFinishLock();
 
 
+const latestStoredBeforeCompletionWrite =
+  await chrome.storage.local.get(
+    MARKETPLACE_AUTO_STATE_KEY
+  );
+
+const latestStateBeforeCompletionWrite =
+  latestStoredBeforeCompletionWrite[
+    MARKETPLACE_AUTO_STATE_KEY
+  ] || state;
+
+
 await chrome.storage.local.set({
   [MARKETPLACE_AUTO_STATE_KEY]: {
-    ...state,
+    ...latestStateBeforeCompletionWrite,
 
-    /*
-      Shared state only keeps this for display/history.
-      Per-listing completion lives in the job registry.
-    */
     lastResult:
       finalResult,
 
@@ -12686,7 +13167,43 @@ function addButton() {
   const button = document.createElement("button");
   button.id = "ebay-comp-checker-btn";
   button.innerText = "AI Check eBay Sold";
-  button.onclick = aiCheckListing;
+button.onclick =
+  async () => {
+    try {
+      await aiCheckListing();
+
+    } catch (error) {
+      console.error(
+        "[PIPELINE JOB] Unhandled listing-analysis failure:",
+        error
+      );
+
+      try {
+        await upsertMarketplaceAnalysisJob({
+          status:
+            "failed",
+
+          stage:
+            "unhandled-error",
+
+          failureReason:
+            error?.message ||
+            String(error),
+
+          failedAt:
+            Date.now()
+        });
+
+        await releaseMarketplaceFinishLock();
+
+      } catch (cleanupError) {
+        console.error(
+          "[PIPELINE JOB] Could not record failed job:",
+          cleanupError
+        );
+      }
+    }
+  };
 
   document.body.appendChild(button);
 }
