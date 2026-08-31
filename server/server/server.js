@@ -7,7 +7,10 @@ import { google } from "googleapis";
 import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
-import { randomUUID } from "crypto";
+import {
+  randomUUID,
+  createHash
+} from "crypto";
 import vision from "@google-cloud/vision";
 import {
   createClient
@@ -18,6 +21,1953 @@ import {
 } from "async_hooks";
 
 import util from "util";
+
+
+import {
+  XMLParser
+} from "fast-xml-parser";
+import {
+  fileURLToPath
+} from "url";
+
+/*
+  ============================================================
+  DATAFORSEO
+  ============================================================
+*/
+
+const DATAFORSEO_LOGIN =
+  String(
+    process.env.DATAFORSEO_LOGIN ||
+    ""
+  ).trim();
+
+const DATAFORSEO_PASSWORD =
+  String(
+    process.env.DATAFORSEO_PASSWORD ||
+    ""
+  ).trim();
+
+
+function getDataForSeoAuthHeader() {
+  if (
+    !DATAFORSEO_LOGIN ||
+    !DATAFORSEO_PASSWORD
+  ) {
+    throw new Error(
+      "Missing DATAFORSEO_LOGIN or DATAFORSEO_PASSWORD in .env"
+    );
+  }
+
+  return (
+    "Basic " +
+    Buffer
+      .from(
+        `${DATAFORSEO_LOGIN}:${DATAFORSEO_PASSWORD}`
+      )
+      .toString("base64")
+  );
+}
+
+
+function sleepDataForSeo(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  );
+}
+
+async function searchDataForSeoByImage(
+  imageUrl
+) {
+  const cleanImageUrl =
+    String(
+      imageUrl || ""
+    ).trim();
+
+
+  if (
+    !/^https?:\/\//i.test(
+      cleanImageUrl
+    )
+  ) {
+    throw new Error(
+      "DataForSEO requires a public HTTP/HTTPS image URL."
+    );
+  }
+
+
+  const authHeader =
+    getDataForSeoAuthHeader();
+
+
+  /*
+    ============================================================
+    STEP 1 — CREATE SEARCH-BY-IMAGE TASK
+    ============================================================
+  */
+
+  const createResponse =
+    await fetch(
+      "https://api.dataforseo.com/v3/serp/google/search_by_image/task_post",
+      {
+        method:
+          "POST",
+
+        headers: {
+          Authorization:
+            authHeader,
+
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify([
+            {
+              image_url:
+                cleanImageUrl,
+
+              location_code:
+                2840,
+
+              language_code:
+                "en",
+
+              priority:
+                2
+            }
+          ])
+      }
+    );
+
+
+  const createData =
+    await createResponse.json();
+
+
+  const createdTask =
+    createData?.tasks?.[0];
+
+
+  if (
+    !createdTask?.id
+  ) {
+    throw new Error(
+      createdTask?.status_message ||
+      createData?.status_message ||
+      "DataForSEO did not return a task ID."
+    );
+  }
+
+
+  const taskId =
+    String(
+      createdTask.id
+    );
+
+
+  console.log(
+    "[DATAFORSEO] Search By Image task created:",
+    {
+      taskId,
+
+      cost:
+        createdTask?.cost
+    }
+  );
+
+
+  /*
+    ============================================================
+    STEP 2 — WAIT FOR COMPLETED RESULT
+    ============================================================
+  */
+
+  const startedAt =
+    Date.now();
+
+  const timeoutMs =
+    10 * 60 * 1000;
+
+  const pollIntervalMs =
+    5000;
+
+
+  while (
+    Date.now() - startedAt <
+    timeoutMs
+  ) {
+    await sleepDataForSeo(
+      pollIntervalMs
+    );
+
+
+    const resultResponse =
+      await fetch(
+        `https://api.dataforseo.com/v3/serp/google/search_by_image/task_get/advanced/${encodeURIComponent(
+          taskId
+        )}`,
+        {
+          method:
+            "GET",
+
+          headers: {
+            Authorization:
+              authHeader,
+
+            "Content-Type":
+              "application/json"
+          }
+        }
+      );
+
+
+    const resultData =
+      await resultResponse.json();
+
+
+    const task =
+      resultData?.tasks?.[0];
+
+
+    /*
+      Task still pending.
+    */
+    if (
+      Number(
+        task?.status_code
+      ) === 40601 ||
+      Number(
+        task?.status_code
+      ) === 40602
+    ) {
+      console.log(
+        "[DATAFORSEO] Task pending:",
+        {
+          taskId,
+
+          status:
+            task?.status_message
+        }
+      );
+
+      continue;
+    }
+
+
+    const result =
+      Array.isArray(
+        task?.result
+      )
+        ? task.result[0]
+        : null;
+
+
+    if (
+      Number(
+        task?.status_code
+      ) === 20000 &&
+      result
+    ) {
+      console.log(
+        "[DATAFORSEO] Search By Image complete:",
+        {
+          taskId,
+
+          itemsCount:
+            result?.items_count,
+
+          resultsCount:
+            result?.se_results_count
+        }
+      );
+
+
+      return {
+        taskId,
+
+        cost:
+          Number(
+            task?.cost ||
+            createdTask?.cost ||
+            0
+          ),
+
+        result
+      };
+    }
+
+
+    /*
+      Any non-pending non-success state.
+    */
+    if (
+      task?.status_code &&
+      Number(
+        task.status_code
+      ) !== 20000
+    ) {
+      throw new Error(
+        task?.status_message ||
+        `DataForSEO task failed with status ${task.status_code}.`
+      );
+    }
+  }
+
+
+  throw new Error(
+    "DataForSEO Search By Image timed out."
+  );
+}
+
+function extractDataForSeoEvidence(
+  dataForSeoResult
+) {
+  const items =
+    Array.isArray(
+      dataForSeoResult?.items
+    )
+      ? dataForSeoResult.items
+      : [];
+
+
+  const organicResults =
+    items
+      .filter(
+        item =>
+          item?.type ===
+          "organic"
+      )
+      .slice(
+        0,
+        25
+      )
+      .map(
+        item => ({
+          rank:
+            Number(
+              item?.rank_absolute ||
+              0
+            ),
+
+          domain:
+            String(
+              item?.domain ||
+              ""
+            ).trim(),
+
+          title:
+            String(
+              item?.title ||
+              ""
+            ).trim(),
+
+          description:
+            String(
+              item?.description ||
+              ""
+            ).trim(),
+
+          url:
+            String(
+              item?.url ||
+              ""
+            ).trim(),
+
+          highlighted:
+            Array.isArray(
+              item?.highlighted
+            )
+              ? item.highlighted
+              : []
+        })
+      );
+
+
+  /*
+    DataForSEO also gives us Google's
+    "Visual matches" image collection.
+
+    Keep only a limited number of URLs.
+  */
+  const visualMatchesItem =
+    items.find(
+      item =>
+        item?.type ===
+          "images" &&
+        Array.isArray(
+          item?.items
+        )
+    );
+
+
+  const visualMatchUrls =
+    Array.isArray(
+      visualMatchesItem?.items
+    )
+      ? visualMatchesItem.items
+          .map(
+            item =>
+              String(
+                item?.image_url ||
+                ""
+              ).trim()
+          )
+          .filter(Boolean)
+          .slice(
+            0,
+            15
+          )
+      : [];
+
+
+  return {
+    googleAssociatedKeyword:
+      String(
+        dataForSeoResult?.keyword ||
+        ""
+      ).trim() ||
+      null,
+
+    organicResults,
+
+    visualMatchUrls
+  };
+}
+
+async function cleanDataForSeoIdentificationEvidence({
+  promptText,
+  evidence
+}) {
+  const prompt = `
+You are cleaning Google Lens / Search By Image evidence for a camera-equipment identification system.
+
+You are NOT allowed to blindly choose the most common search result.
+
+The original identification instruction was:
+
+${promptText}
+
+Below are raw Google Search By Image observations.
+
+${JSON.stringify(
+  evidence,
+  null,
+  2
+)}
+
+Your job has TWO purposes:
+
+1. Clean and organize the visual-search evidence.
+2. Decide whether the evidence is actually strong enough to support the identification requested by the original instruction.
+
+IMPORTANT:
+
+- Google visual-search results are noisy observations, not ground truth.
+- Completely unrelated results must be discarded.
+- Closely related but commercially different camera/lens models must remain separate.
+- Do NOT merge generations such as:
+  IS
+  IS II
+  STM
+  USM
+  II
+  III
+  G2
+
+- Repeated appearances of the same exact model across independent relevant results increase support.
+- A single high-ranked result does NOT establish identity.
+- Generic family agreement is weaker than exact-model agreement.
+- If results broadly agree on only a family, but disagree on exact revision, preserve that ambiguity.
+- Never pick the most popular/common model simply because it is common.
+- Never fill in a missing model suffix from general camera knowledge.
+- If the supplied evidence does not reliably distinguish one exact model, return UNKNOWN.
+- Respect exclusions or multi-product instructions contained in the original identification instruction.
+
+For a SINGLE-product or EXCLUSION request:
+recommendedIdentification must contain ONLY one full exact model name, or exactly UNKNOWN.
+
+For a GROUP request:
+recommendedIdentification must contain one model per line.
+If a requested product cannot be reliably identified, write UNKNOWN on that line.
+
+Return exactly this JSON:
+
+{
+  "recommendedIdentification": "string",
+  "confidence": "high" | "medium" | "low",
+  "consensus": "strong" | "mixed" | "weak" | "none",
+  "candidateModels": [
+    {
+      "model": "string",
+      "support": "strong" | "moderate" | "weak"
+    }
+  ],
+  "discardedAsIrrelevant": [
+    "string"
+  ],
+  "summary": "short explanation of what the Google evidence actually establishes"
+}
+
+Return valid JSON only.
+Do not use Markdown.
+`.trim();
+
+
+  const response =
+    await createLoggedOpenAiResponse({
+      step:
+        "DataForSEO visual evidence cleaner",
+
+      request: {
+        model:
+          "gpt-4.1-mini",
+
+        input: [
+          {
+            role:
+              "user",
+
+            content: [
+              {
+                type:
+                  "input_text",
+
+                text:
+                  prompt
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+
+  const rawText =
+    String(
+      response.output_text ||
+      ""
+    ).trim();
+
+
+  let parsed;
+
+
+  try {
+    parsed =
+      JSON.parse(
+        rawText
+      );
+
+  } catch (error) {
+    console.error(
+      "[DATAFORSEO CLEANER] Invalid JSON:",
+      rawText
+    );
+
+    throw new Error(
+      "DataForSEO evidence cleaner returned invalid JSON."
+    );
+  }
+
+
+  const recommendedIdentification =
+    String(
+      parsed?.recommendedIdentification ||
+      "UNKNOWN"
+    ).trim() ||
+    "UNKNOWN";
+
+
+  const cleaned = {
+    recommendedIdentification,
+
+    confidence:
+      [
+        "high",
+        "medium",
+        "low"
+      ].includes(
+        String(
+          parsed?.confidence ||
+          ""
+        ).toLowerCase()
+      )
+        ? String(
+            parsed.confidence
+          ).toLowerCase()
+        : "low",
+
+    consensus:
+      [
+        "strong",
+        "mixed",
+        "weak",
+        "none"
+      ].includes(
+        String(
+          parsed?.consensus ||
+          ""
+        ).toLowerCase()
+      )
+        ? String(
+            parsed.consensus
+          ).toLowerCase()
+        : "none",
+
+    candidateModels:
+      Array.isArray(
+        parsed?.candidateModels
+      )
+        ? parsed.candidateModels
+        : [],
+
+    discardedAsIrrelevant:
+      Array.isArray(
+        parsed?.discardedAsIrrelevant
+      )
+        ? parsed.discardedAsIrrelevant
+        : [],
+
+    summary:
+      String(
+        parsed?.summary ||
+        ""
+      ).trim()
+  };
+
+
+  console.log(
+    "[DATAFORSEO CLEANER] Cleaned evidence:",
+    cleaned
+  );
+
+
+  return cleaned;
+}
+
+const __filename =
+  fileURLToPath(
+    import.meta.url
+  );
+
+const __dirname =
+  path.dirname(
+    __filename
+  );
+
+const LENSFUN_DB_DIRECTORY =
+  path.join(
+    __dirname,
+    "data",
+    "lensfun",
+    "db"
+  );
+
+let lensfunDatabase = {
+  lenses: [],
+  cameras: [],
+  mounts: []
+};
+
+function removeLeadingLensBrand(
+  model,
+  brand
+) {
+  const cleanModel =
+    String(model || "")
+      .trim();
+
+  const cleanBrand =
+    String(brand || "")
+      .trim();
+
+  if (
+    !cleanModel ||
+    !cleanBrand
+  ) {
+    return cleanModel;
+  }
+
+  const escapedBrand =
+    cleanBrand.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    );
+
+  return cleanModel
+    .replace(
+      new RegExp(
+        `^${escapedBrand}\\s+`,
+        "i"
+      ),
+      ""
+    )
+    .trim();
+}
+
+function lensfunArrayify(value) {
+  if (value == null) {
+    return [];
+  }
+
+  return Array.isArray(value)
+    ? value
+    : [value];
+}
+
+
+function lensfunText(value) {
+  if (
+    typeof value === "string" ||
+    typeof value === "number"
+  ) {
+    return String(value).trim();
+  }
+
+  if (
+    value &&
+    typeof value === "object"
+  ) {
+    return String(
+      value["#text"] ||
+      ""
+    ).trim();
+  }
+
+  return "";
+}
+
+
+function loadLensfunDatabase() {
+  const parser =
+    new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: "@_",
+      textNodeName: "#text"
+    });
+
+
+  const files =
+    fs.readdirSync(
+      LENSFUN_DB_DIRECTORY
+    )
+      .filter(
+        fileName =>
+          fileName
+            .toLowerCase()
+            .endsWith(".xml")
+      );
+
+
+  const lenses = [];
+  const cameras = [];
+  const mounts = [];
+
+
+  for (
+    const fileName of files
+  ) {
+    const fullPath =
+      path.join(
+        LENSFUN_DB_DIRECTORY,
+        fileName
+      );
+
+    try {
+      const xml =
+        fs.readFileSync(
+          fullPath,
+          "utf8"
+        );
+
+      const parsed =
+        parser.parse(xml);
+
+      const root =
+        parsed?.lensdatabase;
+
+      if (!root) {
+        continue;
+      }
+
+
+      for (
+        const lens of
+          lensfunArrayify(root.lens)
+      ) {
+        lenses.push({
+          maker:
+            lensfunText(
+              lens?.maker
+            ),
+
+          model:
+            lensfunText(
+              lens?.model
+            ),
+
+          mounts:
+            lensfunArrayify(
+              lens?.mount
+            )
+              .map(lensfunText)
+              .filter(Boolean),
+
+          cropfactor:
+            lens?.cropfactor ?? null,
+
+          focal:
+            lens?.focal ?? null,
+
+          aperture:
+            lens?.aperture ?? null,
+
+          sourceFile:
+            fileName,
+
+          raw:
+            lens
+        });
+      }
+
+
+      for (
+        const camera of
+          lensfunArrayify(root.camera)
+      ) {
+        cameras.push({
+          maker:
+            lensfunText(
+              camera?.maker
+            ),
+
+          model:
+            lensfunText(
+              camera?.model
+            ),
+
+          mount:
+            lensfunText(
+              camera?.mount
+            ),
+
+          cropfactor:
+            camera?.cropfactor ?? null,
+
+          sourceFile:
+            fileName
+        });
+      }
+
+
+      for (
+        const mount of
+          lensfunArrayify(root.mount)
+      ) {
+        mounts.push({
+          name:
+            lensfunText(
+              mount?.name
+            ),
+
+          compat:
+            lensfunArrayify(
+              mount?.compat
+            )
+              .map(lensfunText)
+              .filter(Boolean),
+
+          sourceFile:
+            fileName
+        });
+      }
+
+    } catch (error) {
+      console.error(
+        `[LENSFUN] Failed parsing ${fileName}:`,
+        error
+      );
+    }
+  }
+
+
+  lensfunDatabase = {
+    lenses,
+    cameras,
+    mounts
+  };
+
+
+  console.log(
+    "[LENSFUN] Loaded:",
+    {
+      files:
+        files.length,
+
+      lenses:
+        lenses.length,
+
+      cameras:
+        cameras.length,
+
+      mounts:
+        mounts.length
+    }
+  );
+}
+
+function normalizeLensfunComparisonText(
+  value
+) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+function extractFocalLengthFromText(
+  value
+) {
+  const text =
+    String(value || "")
+      .replace(/[–—]/g, "-");
+
+
+  const match =
+    text.match(
+      /\b(\d{1,3}(?:\.\d+)?)\s*(?:-\s*(\d{1,3}(?:\.\d+)?))?\s*mm\b/i
+    );
+
+
+  if (!match) {
+    return null;
+  }
+
+
+  if (match[2]) {
+    return (
+      `${match[1]}-${match[2]}mm`
+    );
+  }
+
+
+  return `${match[1]}mm`;
+}
+
+
+function extractMaxApertureFromText(
+  value
+) {
+  const text =
+    String(value || "")
+      .replace(/[–—]/g, "-");
+
+
+  /*
+    Supports:
+
+    1:3.5-6.3
+    1:3.5–6.3
+    f/3.5-6.3
+    F3.5-6.3
+    F2.8
+  */
+  const match =
+    text.match(
+      /(?:\b1\s*:\s*|\bf\s*\/?\s*)(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?/i
+    );
+
+
+  if (!match) {
+    return null;
+  }
+
+
+  if (match[2]) {
+    return (
+      `f/${match[1]}-${match[2]}`
+    );
+  }
+
+
+  return `f/${match[1]}`;
+}
+
+
+function normalizeApertureForComparison(
+  value
+) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/^f\s*\/?/i, "")
+    .replace(/^1\s*:/i, "")
+    .replace(/\s+/g, "")
+    .replace(/[–—]/g, "-")
+    .trim();
+}
+
+
+function normalizeFocalForComparison(
+  value
+) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[–—]/g, "-")
+    .trim();
+}
+
+function hasExactObjectiveEvidence(
+  text,
+  value
+) {
+  const cleanValue =
+    normalizeLensfunComparisonText(
+      value
+    );
+
+  if (!cleanValue) {
+    return false;
+  }
+
+  /*
+    Single-character mount names such as F/E/Z
+    are far too easy to false-match against ordinary
+    OCR text such as f/3.5.
+
+    Require stronger context for those later.
+  */
+  if (cleanValue.length < 2) {
+    return false;
+  }
+
+  const escaped =
+    cleanValue
+      .replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+      )
+      .replace(
+        /\s+/g,
+        "\\s+"
+      );
+
+  const regex =
+    new RegExp(
+      `(^|[^a-z0-9-])${escaped}(?=$|[^a-z0-9-])`,
+      "i"
+    );
+
+  return regex.test(
+    normalizeLensfunComparisonText(
+      text
+    )
+  );
+}
+
+function collectObjectiveLensEvidence({
+  product,
+  productOcrResults,
+  listingTitle,
+  listingDescription,
+  listingScreenshotOcr,
+  explicitFacts
+}) {
+
+  const provisionalLensIdentity =
+  normalizeLensIdentity(
+    product?.lensIdentity ||
+    {}
+  );
+  const productId =
+    String(
+      product?.productId || ""
+    ).trim();
+
+
+  /*
+    Product IDs are global now, so gallery index
+    is deliberately NOT part of this match.
+  */
+  const matchingOcrEntries =
+    (productOcrResults || [])
+      .filter(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim() ===
+          productId
+      );
+
+
+  const productOcrText =
+    matchingOcrEntries
+      .map(
+        item =>
+          String(
+            item?.ocrText || ""
+          ).trim()
+      )
+      .filter(Boolean)
+      .join("\n");
+
+
+  const sellerEvidence =
+    [
+      listingTitle,
+      listingDescription,
+
+      ...(Array.isArray(
+        explicitFacts?.explicitlyIncluded
+      )
+        ? explicitFacts.explicitlyIncluded
+        : []),
+
+      ...(Array.isArray(
+        explicitFacts?.listingNotes
+      )
+        ? explicitFacts.listingNotes
+        : [])
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+
+  /*
+    Product OCR is considerably more important
+    for focal length / aperture than screenshot OCR.
+  */
+  const strongestText =
+    [
+      productOcrText,
+      sellerEvidence
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+
+const focalLength =
+  extractFocalLengthFromText(
+    productOcrText
+  ) ||
+  provisionalLensIdentity
+    .focalLength ||
+  extractFocalLengthFromText(
+    sellerEvidence
+  );
+
+
+const maxAperture =
+  extractMaxApertureFromText(
+    productOcrText
+  ) ||
+  provisionalLensIdentity
+    .maxAperture ||
+  extractMaxApertureFromText(
+    sellerEvidence
+  );
+
+
+  /*
+    Start with the Step-5 brand if supplied.
+
+    Unlike mount/aperture, manufacturer names
+    are generally safe for Step 5 to recognize.
+  */
+  let brand =
+    String(
+      product
+        ?.lensIdentity
+        ?.brand ||
+      ""
+    ).trim();
+
+
+  /*
+    If Step 5 did not establish a manufacturer,
+    look for a Lensfun manufacturer name literally
+    appearing in the objective evidence.
+  */
+  if (!brand) {
+const normalizedEvidence =
+  normalizeLensfunComparisonText(
+    productOcrText
+  );
+
+
+    const makers =
+      [
+        ...new Set(
+          lensfunDatabase.lenses
+            .map(
+              lens =>
+                String(
+                  lens?.maker || ""
+                ).trim()
+            )
+            .filter(Boolean)
+        )
+      ]
+        .sort(
+          (a, b) =>
+            b.length -
+            a.length
+        );
+
+
+    const matchedMaker =
+      makers.find(
+        maker =>
+          normalizedEvidence.includes(
+            normalizeLensfunComparisonText(
+              maker
+            )
+          )
+      );
+
+
+    brand =
+      matchedMaker || "";
+  }
+
+
+  /*
+    Only trust an alleged mount if that exact
+    text actually appears in objective evidence.
+  */
+  const step5Mount =
+    String(
+      product
+        ?.lensIdentity
+        ?.mountSeries ||
+      ""
+    ).trim();
+
+
+  const objectiveMount =
+  step5Mount &&
+  hasExactObjectiveEvidence(
+    strongestText,
+    step5Mount
+  )
+    ? step5Mount
+    : null;
+
+
+  return {
+  productId,
+
+  brand:
+    brand || null,
+
+  focalLength,
+
+  maxAperture,
+
+  featureModelCodes:
+    provisionalLensIdentity
+      .featureModelCodes,
+
+  generation:
+    provisionalLensIdentity
+      .generation,
+
+  explicitMount:
+    objectiveMount,
+
+  productOcrText,
+
+  sellerEvidence,
+
+  listingScreenshotOcr:
+    String(
+      listingScreenshotOcr || ""
+    ).trim()
+};
+}
+
+function expandLensfunCandidateVariants(
+  lens
+) {
+  const mounts =
+    Array.isArray(
+      lens?.mounts
+    )
+      ? lens.mounts
+          .map(
+            value =>
+              String(
+                value || ""
+              ).trim()
+          )
+          .filter(Boolean)
+      : [];
+
+
+  /*
+    A record with no mount still gets represented,
+    but its mount remains unknown.
+  */
+  const variants =
+    mounts.length
+      ? mounts
+      : [null];
+
+
+  return variants.map(
+    (mount, index) => ({
+      candidateId:
+        [
+          String(
+            lens?.sourceFile || ""
+          ),
+
+          String(
+            lens?.maker || ""
+          ),
+
+          String(
+            lens?.model || ""
+          ),
+
+          String(
+            mount || "unknown"
+          ),
+
+          String(index)
+        ]
+          .join("|")
+          .toLowerCase(),
+
+      maker:
+        String(
+          lens?.maker || ""
+        ).trim(),
+
+      model:
+        String(
+          lens?.model || ""
+        ).trim(),
+
+      mount,
+
+      sourceFile:
+        String(
+          lens?.sourceFile || ""
+        ).trim()
+    })
+  );
+}
+
+function findLensfunCandidates(
+  evidence
+) {
+  const brand =
+    normalizeLensfunComparisonText(
+      evidence?.brand
+    );
+
+  const focal =
+    normalizeFocalForComparison(
+      evidence?.focalLength
+    );
+
+  const aperture =
+    normalizeApertureForComparison(
+      evidence?.maxAperture
+    );
+
+  const explicitMount =
+    normalizeLensfunComparisonText(
+      evidence?.explicitMount
+    );
+
+
+  /*
+    We need at least something useful.
+
+    Searching all 1,564 lenses with no evidence
+    would accomplish nothing.
+  */
+  if (
+    !brand &&
+    !focal
+  ) {
+    return [];
+  }
+
+
+  const scoredRecords =
+    lensfunDatabase.lenses
+      .map(
+        lens => {
+          const makerText =
+            normalizeLensfunComparisonText(
+              lens?.maker
+            );
+
+          const modelText =
+            normalizeLensfunComparisonText(
+              lens?.model
+            );
+
+          const compactModel =
+            modelText
+              .replace(/\s+/g, "");
+
+
+          let score = 0;
+
+
+          /*
+            Manufacturer is strong evidence.
+          */
+          if (brand) {
+            if (
+              makerText === brand ||
+              makerText.includes(
+                brand
+              ) ||
+              brand.includes(
+                makerText
+              )
+            ) {
+              score += 10;
+            } else {
+              /*
+                If we confidently know Sigma,
+                don't return Canon lenses.
+              */
+              return null;
+            }
+          }
+
+
+          /*
+            Exact focal range is extremely strong.
+          */
+          if (focal) {
+            const compactFocal =
+              focal
+                .replace(/\s+/g, "");
+
+
+            if (
+              compactModel.includes(
+                compactFocal
+              )
+            ) {
+              score += 12;
+            } else {
+              return null;
+            }
+          }
+
+
+          /*
+            Aperture further narrows revisions.
+
+            We don't require it because Lensfun naming
+            conventions are not perfectly uniform.
+          */
+          if (aperture) {
+  const candidateAperture =
+    normalizeApertureForComparison(
+      extractMaxApertureFromText(
+        lens?.model
+      )
+    );
+
+
+  /*
+    If both Marketplace evidence and Lensfun
+    explicitly state an aperture and they disagree,
+    this cannot be the same exact lens.
+  */
+  if (
+    candidateAperture &&
+    candidateAperture !==
+      aperture
+  ) {
+    return null;
+  }
+
+
+  if (
+    candidateAperture ===
+    aperture
+  ) {
+    score += 8;
+  }
+}
+
+
+          return {
+            lens,
+            score
+          };
+        }
+      )
+      .filter(Boolean);
+
+
+  /*
+    Expand records by physical mount.
+  */
+  let candidates =
+    scoredRecords
+      .flatMap(
+        entry =>
+          expandLensfunCandidateVariants(
+            entry.lens
+          )
+            .map(
+              candidate => ({
+                ...candidate,
+                score:
+                  entry.score
+              })
+            )
+      );
+
+
+  /*
+    If OCR literally established a mount,
+    use it as a hard narrowing signal.
+  */
+  if (explicitMount) {
+   const mountFiltered =
+  candidates.filter(
+    candidate => {
+      const candidateMount =
+        normalizeLensfunComparisonText(
+          candidate?.mount
+        );
+
+      if (!candidateMount) {
+        return false;
+      }
+
+      return (
+        candidateMount ===
+          explicitMount ||
+
+        candidateMount.includes(
+          explicitMount
+        ) ||
+
+        explicitMount.includes(
+          candidateMount
+        )
+      );
+    }
+  );
+
+
+    if (mountFiltered.length) {
+      candidates =
+        mountFiltered;
+    }
+  }
+
+
+  /*
+    De-duplicate identical Lensfun entries.
+  */
+  const unique =
+    new Map();
+
+
+  for (
+    const candidate of candidates
+  ) {
+    const key =
+      [
+        candidate.maker,
+        candidate.model,
+        candidate.mount
+      ]
+        .map(
+          value =>
+            normalizeLensfunComparisonText(
+              value
+            )
+        )
+        .join("|");
+
+
+    if (!unique.has(key)) {
+      unique.set(
+        key,
+        candidate
+      );
+    }
+  }
+
+
+  candidates =
+    Array.from(
+      unique.values()
+    );
+
+
+  candidates.sort(
+    (a, b) =>
+      Number(
+        b.score || 0
+      ) -
+      Number(
+        a.score || 0
+      )
+  );
+
+
+  /*
+    Only retain the strongest reasonable set.
+  */
+  if (candidates.length) {
+    const bestScore =
+      Number(
+        candidates[0].score ||
+        0
+      );
+
+
+    candidates =
+      candidates.filter(
+        candidate =>
+          Number(
+            candidate.score || 0
+          ) >=
+            bestScore - 2
+      );
+  }
+
+
+  return candidates;
+}
+
+
+
+function lensfunCandidateToIdentity(
+  candidate
+) {
+  if (!candidate) {
+    return null;
+  }
+
+
+  const focalLength =
+    extractFocalLengthFromText(
+      candidate.model
+    );
+
+
+  const maxAperture =
+    extractMaxApertureFromText(
+      candidate.model
+    );
+
+
+  return {
+    brand:
+      cleanNullableIdentityField(
+        candidate.maker
+      ),
+
+    canonicalModel:
+      cleanNullableIdentityField(
+        candidate.model
+      ),
+
+    mountSeries:
+      cleanNullableIdentityField(
+        candidate.mount
+      ),
+
+    focalLength,
+
+    maxAperture,
+
+    featureModelCodes:
+      null,
+
+    generation:
+      null,
+
+    lensfunCandidateId:
+      candidate.candidateId,
+
+    lensfunSourceFile:
+      candidate.sourceFile,
+
+    resolutionMode:
+      "lensfun"
+  };
+}
+
+function hasEnoughEvidenceForLensfun(
+  evidence
+) {
+  const brand =
+    String(
+      evidence?.brand ||
+      ""
+    ).trim();
+
+  const focalLength =
+    String(
+      evidence?.focalLength ||
+      ""
+    ).trim();
+
+  /*
+    Deterministic replacement for the old AI gate.
+
+    Minimum Lensfun requirement:
+      1. known manufacturer
+      2. known focal length/range
+
+    Examples:
+      Canon + 18-55mm → yes
+      Nikon + 50mm → yes
+
+      Canon only → no
+      EF-S only → no
+  */
+  return Boolean(
+    brand &&
+    focalLength
+  );
+}
+
+async function resolveCanonicalLens({
+  product,
+  productOcrResults,
+  listingTitle,
+  listingDescription,
+  listingScreenshotOcr,
+  explicitFacts,
+  cameraContext
+}) {
+  const evidence =
+    collectObjectiveLensEvidence({
+      product,
+      productOcrResults,
+      listingTitle,
+      listingDescription,
+      listingScreenshotOcr,
+      explicitFacts
+    });
+
+
+  console.log(
+    "[LENS RESOLVER] Objective evidence:",
+    evidence
+  );
+
+
+  /*
+    ============================================================
+    DETERMINISTIC LENSFUN ELIGIBILITY
+    ============================================================
+  */
+
+  if (
+    !hasEnoughEvidenceForLensfun(
+      evidence
+    )
+  ) {
+    console.log(
+      "[LENS RESOLVER] Missing maker or focal length. Routing directly to visual fallback:",
+      {
+        productId:
+          evidence.productId,
+
+        brand:
+          evidence.brand,
+
+        focalLength:
+          evidence.focalLength
+      }
+    );
+
+
+    return {
+      evidence,
+
+      identity:
+        null,
+
+      candidates:
+        [],
+
+      mode:
+        "needs-google-lens",
+
+      reason:
+        "Lensfun requires both manufacturer and focal length."
+    };
+  }
+
+
+  /*
+    ============================================================
+    DETERMINISTIC LENSFUN LOOKUP
+    ============================================================
+  */
+
+  const candidates =
+    findLensfunCandidates(
+      evidence
+    );
+
+
+  console.log(
+    "[LENS RESOLVER] Lensfun candidates:",
+    {
+      productId:
+        evidence.productId,
+
+      count:
+        candidates.length,
+
+      candidates:
+        candidates.map(
+          candidate => ({
+            candidateId:
+              candidate.candidateId,
+
+            maker:
+              candidate.maker,
+
+            model:
+              candidate.model,
+
+            mount:
+              candidate.mount,
+
+            score:
+              candidate.score
+          })
+        )
+    }
+  );
+
+
+  /*
+    ZERO CANDIDATES
+
+    Lensfun cannot resolve it.
+    Go directly to cropped visual search.
+  */
+  if (
+    candidates.length === 0
+  ) {
+    console.log(
+      "[LENS RESOLVER] No Lensfun candidates. Routing to visual fallback:",
+      evidence.productId
+    );
+
+
+    return {
+      evidence,
+
+      identity:
+        null,
+
+      candidates:
+        [],
+
+      mode:
+        "needs-google-lens",
+
+      reason:
+        "Lensfun returned zero matching candidates."
+    };
+  }
+
+
+  /*
+    EXACTLY ONE CANDIDATE
+
+    Deterministic exact identity.
+    No DataForSEO required.
+  */
+  if (
+    candidates.length === 1
+  ) {
+    console.log(
+      "[LENS RESOLVER] Exactly one Lensfun candidate. Accepting deterministically:",
+      {
+        productId:
+          evidence.productId,
+
+        model:
+          candidates[0]
+            ?.model
+      }
+    );
+
+
+    return {
+      evidence,
+
+      identity:
+        lensfunCandidateToIdentity(
+          candidates[0]
+        ),
+
+      candidates,
+
+      mode:
+        "lensfun-single",
+
+      reason:
+        "Exactly one Lensfun candidate remained."
+    };
+  }
+
+
+  /*
+    TWO OR MORE CANDIDATES
+
+    DO NOT ask AI to choose.
+
+    Preserve all candidates as a hard candidate set
+    and route the product to cropped DataForSEO.
+  */
+  console.log(
+    "[LENS RESOLVER] Multiple Lensfun candidates. Routing to visual fallback:",
+    {
+      productId:
+        evidence.productId,
+
+      count:
+        candidates.length
+    }
+  );
+
+
+  return {
+    evidence,
+
+    identity:
+      null,
+
+    candidates,
+
+    mode:
+      "lensfun-multiple",
+
+    reason:
+      "Multiple Lensfun candidates remain; visual identification is required."
+  };
+}
 
 /*
   ============================================================
@@ -41,7 +1991,6 @@ import util from "util";
       Another scanner/device has already processed
       or claimed this listing.
 */
-
 
 function cleanupOldLocalAnalysisLogs() {
   const MAX_AGE_MS =
@@ -147,6 +2096,489 @@ app.use(express.json({
   limit: "50mb"
 }));
 
+app.post(
+  "/prepare-dataforseo-crops",
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const targets =
+        Array.isArray(
+          req.body?.targets
+        )
+          ? req.body.targets
+          : [];
+
+
+      if (!targets.length) {
+        return res
+          .status(400)
+          .json({
+            ok:
+              false,
+
+            error:
+              "No DataForSEO crop targets were supplied."
+          });
+      }
+
+
+      /*
+        Group by ORIGINAL Marketplace image.
+
+        If lens_1 and lens_2 both chose Image 3,
+        Image 3 is sent to the localizer once,
+        with both requested products.
+      */
+      const targetsByImage =
+        new Map();
+
+
+      for (
+        const target of targets
+      ) {
+        const imageUrl =
+          String(
+            target?.imageUrl ||
+            ""
+          ).trim();
+
+
+        if (
+          !imageUrl ||
+          !target?.productId
+        ) {
+          continue;
+        }
+
+
+        if (
+          !targetsByImage.has(
+            imageUrl
+          )
+        ) {
+          targetsByImage.set(
+            imageUrl,
+            []
+          );
+        }
+
+
+        targetsByImage
+          .get(
+            imageUrl
+          )
+          .push(
+            target
+          );
+      }
+
+
+      const preparedTargets =
+        [];
+
+
+      for (
+        const [
+          imageUrl,
+          imageTargets
+        ] of targetsByImage
+      ) {
+        try {
+          const prepared =
+            await prepareDataForSeoCropsForImage({
+              imageUrl,
+              targets:
+                imageTargets
+            });
+
+
+          preparedTargets.push(
+            ...prepared
+          );
+
+        } catch (error) {
+          console.error(
+            "[DATAFORSEO CROP] Image localization failed:",
+            {
+              imageUrl,
+
+              error:
+                error?.message ||
+                String(error)
+            }
+          );
+
+
+          /*
+            Do not destroy all other crop targets
+            because one source image failed.
+          */
+          preparedTargets.push(
+            ...imageTargets.map(
+              target => ({
+                ...target,
+
+                cropPrepared:
+                  false,
+
+                dataForSeoImageUrl:
+                  "",
+
+                dataForSeoCropObjectPath:
+                  "",
+
+                cropBoundingBox:
+                  null,
+
+                cropError:
+                  error?.message ||
+                  "Crop preparation failed."
+              })
+            )
+          );
+        }
+      }
+
+
+      return res.json({
+        ok:
+          true,
+
+        targets:
+          preparedTargets
+      });
+
+    } catch (error) {
+      console.error(
+        "[DATAFORSEO CROP] Endpoint failed:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          ok:
+            false,
+
+          error:
+            error?.message ||
+            "Could not prepare DataForSEO crops."
+        });
+    }
+  }
+);
+
+app.post(
+  "/dataforseo-identify-image",
+  async (
+    req,
+    res
+  ) => {
+      const cropObjectPath =
+      String(
+        req.body
+          ?.cropObjectPath ||
+        ""
+      ).trim();
+    try {
+      const imageUrl =
+        String(
+          req.body?.imageUrl ||
+          ""
+        ).trim();
+
+      const promptText =
+        String(
+          req.body?.promptText ||
+          ""
+        ).trim();
+
+
+      if (!imageUrl) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "Missing imageUrl."
+          });
+      }
+
+
+      if (!promptText) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "Missing promptText."
+          });
+      }
+
+
+      /*
+        ============================================================
+        A — GOOGLE SEARCH BY IMAGE
+        ============================================================
+      */
+
+      const search =
+        await searchDataForSeoByImage(
+          imageUrl
+        );
+
+
+      /*
+        ============================================================
+        B — DETERMINISTIC REDUCTION
+        ============================================================
+      */
+
+      const evidence =
+        extractDataForSeoEvidence(
+          search.result
+        );
+
+
+      console.log(
+        "[DATAFORSEO] Reduced evidence:",
+        evidence
+      );
+
+
+      /*
+        ============================================================
+        C — AI EVIDENCE CLEANER
+        ============================================================
+      */
+
+      const cleaned =
+        await cleanDataForSeoIdentificationEvidence({
+          promptText,
+          evidence
+        });
+
+
+      const found =
+        Boolean(
+          cleaned
+            .recommendedIdentification &&
+          cleaned
+            .recommendedIdentification
+            .trim()
+            .toLowerCase() !==
+              "unknown"
+        );
+
+
+      return res.json({
+        ok:
+          true,
+
+        found,
+
+        identification:
+          cleaned
+            .recommendedIdentification,
+
+        cleanedEvidence:
+          cleaned,
+
+        dataForSeoTaskId:
+          search.taskId,
+
+        dataForSeoCost:
+          search.cost
+      });
+
+    } catch (error) {
+      console.error(
+        "[DATAFORSEO] Identification failed:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          ok:
+            false,
+
+          error:
+            error?.message ||
+            "DataForSEO identification failed."
+        });
+    }
+    finally {
+  if (cropObjectPath) {
+    await deleteDataForSeoCrop(
+      cropObjectPath
+    );
+  }
+}
+  }
+);
+
+const EBAY_DELETION_VERIFICATION_TOKEN =
+  String(
+    process.env.EBAY_DELETION_VERIFICATION_TOKEN ||
+    ""
+  ).trim();
+
+const EBAY_DELETION_ENDPOINT =
+  String(
+    process.env.EBAY_DELETION_ENDPOINT ||
+    ""
+  ).trim();
+
+if (
+  !EBAY_DELETION_VERIFICATION_TOKEN
+) {
+  console.warn(
+    "[EBAY DELETION] Verification token is not configured."
+  );
+}
+
+if (
+  !EBAY_DELETION_ENDPOINT
+) {
+  console.warn(
+    "[EBAY DELETION] Public endpoint URL is not configured."
+  );
+}
+
+app.get(
+  "/ebay/account-deletion",
+  (req, res) => {
+    try {
+      const challengeCode =
+        String(
+          req.query?.challenge_code ||
+          ""
+        ).trim();
+
+      if (!challengeCode) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Missing challenge_code."
+          });
+      }
+
+      if (
+        !EBAY_DELETION_VERIFICATION_TOKEN ||
+        !EBAY_DELETION_ENDPOINT
+      ) {
+        return res
+          .status(500)
+          .json({
+            error:
+              "eBay account deletion verification is not configured."
+          });
+      }
+
+      const challengeResponse =
+        createHash("sha256")
+          .update(
+            challengeCode +
+            EBAY_DELETION_VERIFICATION_TOKEN +
+            EBAY_DELETION_ENDPOINT
+          )
+          .digest("hex");
+
+      console.log(
+        "[EBAY DELETION] Verification challenge received."
+      );
+
+      return res
+        .status(200)
+        .json({
+          challengeResponse
+        });
+
+    } catch (error) {
+      console.error(
+        "[EBAY DELETION] Verification failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            "Verification failed."
+        });
+    }
+  }
+);
+
+app.post(
+  "/ebay/account-deletion",
+  async (req, res) => {
+    try {
+      const payload =
+        req.body || {};
+
+      console.log(
+        "[EBAY DELETION] Notification received:",
+        {
+          topic:
+            payload?.metadata?.topic ||
+            "",
+
+          notificationId:
+            payload
+              ?.notification
+              ?.notificationId ||
+            "",
+
+          userId:
+            payload
+              ?.notification
+              ?.data
+              ?.userId ||
+            "",
+
+          username:
+            payload
+              ?.notification
+              ?.data
+              ?.username ||
+            ""
+        }
+      );
+
+      /*
+        IMPORTANT:
+
+        If your application stores records tied to
+        this eBay user, delete/anonymize those records here.
+      */
+
+      return res
+        .status(204)
+        .send();
+
+    } catch (error) {
+      console.error(
+        "[EBAY DELETION] Notification processing failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            "Could not process deletion notification."
+        });
+    }
+  }
+);
+
 const SUPABASE_URL =
   String(
     process.env.SUPABASE_URL ||
@@ -157,6 +2589,13 @@ const SUPABASE_SECRET_KEY =
   String(
     process.env.SUPABASE_SECRET_KEY ||
     ""
+  ).trim();
+
+const SUPABASE_DATAFORSEO_CROP_BUCKET =
+  String(
+    process.env
+      .SUPABASE_DATAFORSEO_CROP_BUCKET ||
+    "marketplace-dataforseo-crops"
   ).trim();
 
 const SUPABASE_HIT_LOG_BUCKET =
@@ -175,6 +2614,870 @@ if (!SUPABASE_SECRET_KEY) {
   throw new Error(
     "Missing SUPABASE_SECRET_KEY in .env"
   );
+}
+
+/*
+  ============================================================
+  DATAFORSEO TARGET CROPPING
+  ============================================================
+*/
+
+const DATAFORSEO_CROP_PADDING_RATIO =
+  0.12;
+
+
+function clampNumber(
+  value,
+  min,
+  max
+) {
+  return Math.min(
+    max,
+    Math.max(
+      min,
+      Number(value)
+    )
+  );
+}
+
+
+function normalizeLocalizerBoundingBox(
+  boundingBox
+) {
+  if (!boundingBox) {
+    return null;
+  }
+
+
+  let xMin =
+    Number(
+      boundingBox.xMin
+    );
+
+  let yMin =
+    Number(
+      boundingBox.yMin
+    );
+
+  let xMax =
+    Number(
+      boundingBox.xMax
+    );
+
+  let yMax =
+    Number(
+      boundingBox.yMax
+    );
+
+
+  if (
+    !Number.isFinite(xMin) ||
+    !Number.isFinite(yMin) ||
+    !Number.isFinite(xMax) ||
+    !Number.isFinite(yMax)
+  ) {
+    return null;
+  }
+
+
+  xMin =
+    clampNumber(
+      xMin,
+      0,
+      1000
+    );
+
+  yMin =
+    clampNumber(
+      yMin,
+      0,
+      1000
+    );
+
+  xMax =
+    clampNumber(
+      xMax,
+      0,
+      1000
+    );
+
+  yMax =
+    clampNumber(
+      yMax,
+      0,
+      1000
+    );
+
+
+  if (
+    xMax <= xMin ||
+    yMax <= yMin
+  ) {
+    return null;
+  }
+
+
+  /*
+    Reject obviously broken microscopic boxes.
+  */
+  if (
+    xMax - xMin < 20 ||
+    yMax - yMin < 20
+  ) {
+    return null;
+  }
+
+
+  return {
+    xMin,
+    yMin,
+    xMax,
+    yMax
+  };
+}
+
+
+function addPaddingToBoundingBox(
+  boundingBox,
+  paddingRatio =
+    DATAFORSEO_CROP_PADDING_RATIO
+) {
+  const width =
+    boundingBox.xMax -
+    boundingBox.xMin;
+
+  const height =
+    boundingBox.yMax -
+    boundingBox.yMin;
+
+
+  const padX =
+    width *
+    paddingRatio;
+
+  const padY =
+    height *
+    paddingRatio;
+
+
+  return {
+    xMin:
+      clampNumber(
+        boundingBox.xMin -
+          padX,
+        0,
+        1000
+      ),
+
+    yMin:
+      clampNumber(
+        boundingBox.yMin -
+          padY,
+        0,
+        1000
+      ),
+
+    xMax:
+      clampNumber(
+        boundingBox.xMax +
+          padX,
+        0,
+        1000
+      ),
+
+    yMax:
+      clampNumber(
+        boundingBox.yMax +
+          padY,
+        0,
+        1000
+      )
+  };
+}
+
+async function localizeDataForSeoTargets({
+  normalizedImageBuffer,
+  imageIndex,
+  targets
+}) {
+  const localizationTargets =
+    targets.map(
+      target => ({
+        productId:
+          String(
+            target?.productId ||
+            ""
+          ).trim(),
+
+        productType:
+          String(
+            target?.productType ||
+            ""
+          ).trim(),
+
+        knownProduct:
+          target?.knownProduct ||
+          null,
+
+        ocrText:
+          String(
+            target?.ocrText ||
+            ""
+          )
+            .trim()
+            .slice(
+              0,
+              1200
+            )
+      })
+    );
+
+
+  const prompt = `
+You are a PRODUCT LOCALIZATION system.
+
+You are looking at ONE ORIGINAL Facebook Marketplace photograph.
+
+THIS IS NOT A COLLAGE.
+
+All coordinates you return must be relative ONLY to the single supplied image.
+
+Your only job is to locate the requested PHYSICAL PRIMARY PRODUCTS.
+
+Do NOT attempt to determine their exact model.
+Do NOT add products that were not requested.
+Do NOT return bounding boxes for accessories.
+
+REQUESTED TARGETS:
+
+${JSON.stringify(
+  localizationTargets,
+  null,
+  2
+)}
+
+The partial identity information above is provided only so that you can
+distinguish the requested physical products from other objects in the image.
+
+BOUNDING BOX RULES:
+
+- Return coordinates from 0 to 1000.
+- xMin = left edge.
+- yMin = top edge.
+- xMax = right edge.
+- yMax = bottom edge.
+- The coordinates refer to THIS ORIGINAL IMAGE only.
+- Make the box reasonably tight around the entire physical product.
+- Include the complete product whenever possible.
+- Exclude other primary products as much as possible.
+- For a camera lens attached to a body, box the lens itself rather than
+  the entire camera-and-lens combination.
+- For a camera body, avoid including attached lenses when possible.
+- If two lenses are present, use the supplied evidence to associate the
+  correct physical lens with the requested productId.
+- If you cannot confidently locate a requested product, set found=false
+  and boundingBox=null.
+- Return exactly one result for every requested productId.
+
+Return exactly:
+
+{
+  "targets": [
+    {
+      "productId": "lens_1",
+      "found": true,
+      "boundingBox": {
+        "xMin": 100,
+        "yMin": 200,
+        "xMax": 700,
+        "yMax": 800
+      }
+    }
+  ]
+}
+
+Return valid JSON only.
+Do not use Markdown.
+`.trim();
+
+
+  const imageDataUrl =
+    `data:image/jpeg;base64,${normalizedImageBuffer.toString(
+      "base64"
+    )}`;
+
+
+  const parsed =
+    await runAiJsonStep({
+      step:
+        `DataForSEO crop localizer image ${imageIndex}`,
+
+      maxAttempts:
+        2,
+
+      runRequest:
+        async () =>
+          await createLoggedOpenAiResponse({
+            step:
+              `DataForSEO crop localizer image ${imageIndex}`,
+
+            request: {
+              model:
+                "gpt-5.6-luna",
+
+              input: [
+                {
+                  role:
+                    "user",
+
+                  content: [
+                    {
+                      type:
+                        "input_text",
+
+                      text:
+                        prompt
+                    },
+
+                    {
+                      type:
+                        "input_image",
+
+                      image_url:
+                        imageDataUrl,
+
+                      detail:
+                        "high"
+                    }
+                  ]
+                }
+              ]
+            }
+          })
+    });
+
+
+  return Array.isArray(
+    parsed?.targets
+  )
+    ? parsed.targets
+    : [];
+}
+
+async function uploadDataForSeoCrop({
+  productId,
+  cropBuffer
+}) {
+  const safeProductId =
+    String(
+      productId ||
+      "product"
+    )
+      .trim()
+      .replace(
+        /[^a-zA-Z0-9_-]/g,
+        "_"
+      );
+
+
+  const objectPath =
+    (
+      "dataforseo-crops/" +
+      `${Date.now()}-` +
+      `${randomUUID()}-` +
+      `${safeProductId}.jpg`
+    );
+
+
+  const {
+    error:
+      uploadError
+  } =
+    await supabaseAdmin
+      .storage
+      .from(
+        SUPABASE_DATAFORSEO_CROP_BUCKET
+      )
+      .upload(
+        objectPath,
+        cropBuffer,
+        {
+          contentType:
+            "image/jpeg",
+
+          cacheControl:
+            "300",
+
+          upsert:
+            false
+        }
+      );
+
+
+  if (uploadError) {
+    throw new Error(
+      `Could not upload DataForSEO crop: ${
+        uploadError.message ||
+        String(uploadError)
+      }`
+    );
+  }
+
+
+  const {
+    data:
+      publicUrlData
+  } =
+    supabaseAdmin
+      .storage
+      .from(
+        SUPABASE_DATAFORSEO_CROP_BUCKET
+      )
+      .getPublicUrl(
+        objectPath
+      );
+
+
+  const publicUrl =
+    String(
+      publicUrlData
+        ?.publicUrl ||
+      ""
+    ).trim();
+
+
+  if (!publicUrl) {
+    throw new Error(
+      "Supabase did not return a public crop URL."
+    );
+  }
+
+
+  return {
+    objectPath,
+    publicUrl
+  };
+}
+
+
+async function deleteDataForSeoCrop(
+  objectPath
+) {
+  const cleanPath =
+    String(
+      objectPath || ""
+    ).trim();
+
+
+  /*
+    Never permit arbitrary Supabase deletion
+    from this endpoint.
+  */
+  if (
+    !cleanPath.startsWith(
+      "dataforseo-crops/"
+    )
+  ) {
+    return;
+  }
+
+
+  try {
+    const {
+      error
+    } =
+      await supabaseAdmin
+        .storage
+        .from(
+          SUPABASE_DATAFORSEO_CROP_BUCKET
+        )
+        .remove([
+          cleanPath
+        ]);
+
+
+    if (error) {
+      console.warn(
+        "[DATAFORSEO CROP] Cleanup failed:",
+        {
+          objectPath:
+            cleanPath,
+
+          error:
+            error.message
+        }
+      );
+    }
+
+  } catch (error) {
+    console.warn(
+      "[DATAFORSEO CROP] Cleanup threw:",
+      error?.message ||
+      String(error)
+    );
+  }
+}
+
+async function prepareDataForSeoCropsForImage({
+  imageUrl,
+  targets
+}) {
+  /*
+    Download the ORIGINAL Marketplace image.
+  */
+  const originalBuffer =
+    await downloadImageBuffer(
+      imageUrl
+    );
+
+
+  /*
+    IMPORTANT:
+
+    Normalize orientation FIRST.
+
+    The AI localizer sees this exact buffer,
+    and Sharp also crops this exact buffer.
+
+    Therefore their coordinate systems are
+    guaranteed to match.
+  */
+  const normalizedImageBuffer =
+    await sharp(
+      originalBuffer
+    )
+      .rotate()
+      .jpeg({
+        quality:
+          95
+      })
+      .toBuffer();
+
+
+  const metadata =
+    await sharp(
+      normalizedImageBuffer
+    )
+      .metadata();
+
+
+  const imageWidth =
+    Number(
+      metadata.width
+    );
+
+  const imageHeight =
+    Number(
+      metadata.height
+    );
+
+
+  if (
+    !imageWidth ||
+    !imageHeight
+  ) {
+    throw new Error(
+      "Could not determine normalized image dimensions."
+    );
+  }
+
+
+  const imageIndex =
+    Number(
+      targets?.[0]
+        ?.bestImageIndex
+    ) || 0;
+
+
+  const localizedTargets =
+    await localizeDataForSeoTargets({
+      normalizedImageBuffer,
+      imageIndex,
+      targets
+    });
+
+
+  const localizedByProductId =
+    new Map(
+      localizedTargets.map(
+        item => [
+          String(
+            item?.productId ||
+            ""
+          ).trim(),
+
+          item
+        ]
+      )
+    );
+
+
+  const results =
+    [];
+
+
+  for (
+    const target of targets
+  ) {
+    const productId =
+      String(
+        target?.productId ||
+        ""
+      ).trim();
+
+
+    const localization =
+      localizedByProductId.get(
+        productId
+      );
+
+
+    if (
+      !localization ||
+      localization.found !== true
+    ) {
+      results.push({
+        ...target,
+
+        cropPrepared:
+          false,
+
+        dataForSeoImageUrl:
+          "",
+
+        dataForSeoCropObjectPath:
+          "",
+
+        cropBoundingBox:
+          null,
+
+        cropError:
+          "Product localizer could not confidently locate this physical product."
+      });
+
+      continue;
+    }
+
+
+    const rawBoundingBox =
+      normalizeLocalizerBoundingBox(
+        localization
+          .boundingBox
+      );
+
+
+    if (!rawBoundingBox) {
+      results.push({
+        ...target,
+
+        cropPrepared:
+          false,
+
+        dataForSeoImageUrl:
+          "",
+
+        dataForSeoCropObjectPath:
+          "",
+
+        cropBoundingBox:
+          null,
+
+        cropError:
+          "Product localizer returned an invalid bounding box."
+      });
+
+      continue;
+    }
+
+
+    const paddedBoundingBox =
+      addPaddingToBoundingBox(
+        rawBoundingBox
+      );
+
+
+    const left =
+      Math.max(
+        0,
+        Math.floor(
+          (
+            paddedBoundingBox
+              .xMin /
+            1000
+          ) *
+          imageWidth
+        )
+      );
+
+
+    const top =
+      Math.max(
+        0,
+        Math.floor(
+          (
+            paddedBoundingBox
+              .yMin /
+            1000
+          ) *
+          imageHeight
+        )
+      );
+
+
+    const right =
+      Math.min(
+        imageWidth,
+        Math.ceil(
+          (
+            paddedBoundingBox
+              .xMax /
+            1000
+          ) *
+          imageWidth
+        )
+      );
+
+
+    const bottom =
+      Math.min(
+        imageHeight,
+        Math.ceil(
+          (
+            paddedBoundingBox
+              .yMax /
+            1000
+          ) *
+          imageHeight
+        )
+      );
+
+
+    const cropWidth =
+      right -
+      left;
+
+    const cropHeight =
+      bottom -
+      top;
+
+
+    if (
+      cropWidth < 40 ||
+      cropHeight < 40
+    ) {
+      results.push({
+        ...target,
+
+        cropPrepared:
+          false,
+
+        dataForSeoImageUrl:
+          "",
+
+        dataForSeoCropObjectPath:
+          "",
+
+        cropBoundingBox:
+          null,
+
+        cropError:
+          "Calculated product crop was too small."
+      });
+
+      continue;
+    }
+
+
+    const cropBuffer =
+      await sharp(
+        normalizedImageBuffer
+      )
+        .extract({
+          left,
+          top,
+          width:
+            cropWidth,
+          height:
+            cropHeight
+        })
+        .jpeg({
+          quality:
+            95
+        })
+        .toBuffer();
+
+
+    const uploaded =
+      await uploadDataForSeoCrop({
+        productId,
+        cropBuffer
+      });
+
+
+    console.log(
+      "[DATAFORSEO CROP] Prepared:",
+      {
+        productId,
+        imageIndex,
+
+        sourceDimensions:
+          `${imageWidth}x${imageHeight}`,
+
+        cropPixels: {
+          left,
+          top,
+          width:
+            cropWidth,
+          height:
+            cropHeight
+        },
+
+        rawBoundingBox,
+
+        paddedBoundingBox,
+
+        publicUrl:
+          uploaded.publicUrl
+      }
+    );
+
+
+    results.push({
+      ...target,
+
+      cropPrepared:
+        true,
+
+      dataForSeoImageUrl:
+        uploaded.publicUrl,
+
+      dataForSeoCropObjectPath:
+        uploaded.objectPath,
+
+      cropBoundingBox: {
+        raw:
+          rawBoundingBox,
+
+        padded:
+          paddedBoundingBox,
+
+        pixels: {
+          left,
+          top,
+          width:
+            cropWidth,
+          height:
+            cropHeight
+        }
+      },
+
+      cropError:
+        ""
+    });
+  }
+
+
+  return results;
 }
 
 const supabaseAdmin =
@@ -1257,11 +4560,18 @@ function cleanNullableIdentityField(value) {
   return cleaned || null;
 }
 
-function normalizeLensIdentity(lensIdentity = {}) {
+function normalizeLensIdentity(
+  lensIdentity = {}
+) {
   return {
     brand:
       cleanNullableIdentityField(
         lensIdentity?.brand
+      ),
+
+    canonicalModel:
+      cleanNullableIdentityField(
+        lensIdentity?.canonicalModel
       ),
 
     mountSeries:
@@ -1287,8 +4597,68 @@ function normalizeLensIdentity(lensIdentity = {}) {
     generation:
       cleanNullableIdentityField(
         lensIdentity?.generation
+      ),
+
+    resolutionMode:
+      cleanNullableIdentityField(
+        lensIdentity?.resolutionMode
       )
   };
+}
+
+function normalizeCanonicalLensModelForComparison(
+  value
+) {
+  return String(
+    value || ""
+  )
+    .toLowerCase()
+    .replace(
+      /\bf\s*\/?\s*/g,
+      "f"
+    )
+    .replace(
+      /[^a-z0-9.]+/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+
+function findMatchingLensfunCandidate(
+  model,
+  candidates
+) {
+  const normalizedModel =
+    normalizeCanonicalLensModelForComparison(
+      model
+    );
+
+
+  if (
+    !normalizedModel ||
+    !Array.isArray(
+      candidates
+    )
+  ) {
+    return null;
+  }
+
+
+  return (
+    candidates.find(
+      candidate =>
+        normalizeCanonicalLensModelForComparison(
+          candidate?.model
+        ) ===
+        normalizedModel
+    ) ||
+    null
+  );
 }
 
 function buildNormalizedLensModel(
@@ -1299,6 +4669,81 @@ function buildNormalizedLensModel(
       lensIdentity
     );
 
+
+  /*
+    Once Lensfun/Serper has given us a canonical model,
+    preserve that model instead of reconstructing it.
+  */
+if (
+  normalized.canonicalModel
+) {
+  const modelWithoutBrand =
+    removeLeadingLensBrand(
+      normalized.canonicalModel,
+      normalized.brand
+    );
+
+
+  const cleanMount =
+    String(
+      normalized.mountSeries || ""
+    ).trim();
+
+
+  const brandKey =
+    normalizeLensfunComparisonText(
+      normalized.brand
+    );
+
+  const mountKey =
+    normalizeLensfunComparisonText(
+      cleanMount
+    );
+
+
+  /*
+    Canon lens:
+      Canon + Canon EF + EF 50mm...
+    should not become:
+      Canon Canon EF Canon EF...
+
+    Third-party lens:
+      Sigma + Canon EF + 18-250mm...
+    DOES need Canon EF preserved.
+  */
+  const mountIsSameManufacturer =
+    brandKey &&
+    mountKey &&
+    (
+      mountKey ===
+        brandKey ||
+
+      mountKey.startsWith(
+        `${brandKey} `
+      )
+    );
+
+
+  const mountForModel =
+    mountIsSameManufacturer
+      ? null
+      : cleanMount;
+
+
+  return [
+    mountForModel,
+    modelWithoutBrand
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+  /*
+    Legacy/objective-evidence fallback.
+  */
   return [
     normalized.mountSeries,
     normalized.focalLength,
@@ -2854,6 +6299,18 @@ const OPENAI_MODEL_PRICING_USD_PER_MILLION = {
     input: 0.15,
     cachedInput: 0.075,
     output: 0.60
+  },
+
+  "gpt-5-mini": {
+    input: 0.25,
+    cachedInput: 0.025,
+    output: 2.00
+  },
+
+  "gpt-5.6-luna": {
+    input: 0.20,
+    cachedInput: 0.02,
+    output: 1.20
   }
 };
 
@@ -2876,6 +6333,31 @@ app.post(
               item,
               index
             ) => {
+
+              /*
+  Do not value unresolved physical products
+  using a generic database identity.
+*/
+if (
+  item?.exactIdentityResolved ===
+  false
+) {
+  return {
+    index,
+
+    found:
+      false,
+
+    skipped:
+      true,
+
+    reason:
+      "unresolved_exact_identity",
+
+    canonicalName:
+      ""
+  };
+}
               const databaseProduct =
                 await findProductInDatabase(
                   item
@@ -3835,6 +7317,41 @@ The text below came from Google's analysis of a screenshot of the listing.
 
 Your ONLY job is to extract explicit textual facts from the listing title and seller-written description.
 
+CRITICAL — IGNORE TEXT INSIDE SELLER-UPLOADED SCREENSHOTS:
+
+The Marketplace seller may upload screenshots as listing photos.
+
+Those screenshots may show:
+- another website's product listing;
+- Amazon, eBay, Google, Canon, Nikon, or another store page;
+- a product advertisement;
+- a search result;
+- a product specification/reference page;
+- another camera or lens model;
+- prices, ratings, reviews, or product names from another website.
+
+Do NOT treat information appearing inside one of those screenshots as
+seller-written evidence about what is actually included in the Marketplace listing.
+
+For example, if the OCR contains:
+
+"Visit the Canon Store"
+"Sponsored"
+"Canon EOS Rebel T6 DSLR Camera"
+"$749.95"
+"Price history"
+
+but the actual Marketplace listing is for a Canon EOS Rebel T6i,
+IGNORE the T6 information.
+
+Only use information that belongs to the actual Facebook Marketplace:
+- listing title;
+- seller-written description;
+- Details section;
+- explicit included/excluded item statements.
+
+A screenshot uploaded by the seller is reference material, not seller-written listing evidence.
+
 GOOGLE-EXTRACTED LISTING TEXT:
 
 ${listingText}
@@ -4169,6 +7686,22 @@ app.post(
           collageBuffer.length,
           "bytes"
         );
+const priorGallerySummary =
+  galleryResults.map(
+    gallery => ({
+      galleryIndex:
+        gallery.galleryIndex,
+
+      startingImageIndex:
+        gallery.startingImageIndex,
+
+      endingImageIndex:
+        gallery.endingImageIndex,
+
+      galleryAnalysis:
+        gallery.galleryAnalysis
+    })
+  );
 
 
         const prompt = `
@@ -4197,7 +7730,131 @@ The red borders separate the original listing images.
 
 YOUR JOB:
 
-Determine which PHYSICAL PRIMARY PRODUCTS appear in each image and track the SAME physical product across multiple images within this collage.
+YOUR JOB:
+
+Determine which PHYSICAL PRIMARY PRODUCTS appear in each image.
+
+PRODUCT IDS ARE GLOBAL ACROSS THE ENTIRE MARKETPLACE LISTING.
+
+You may be analyzing Gallery 2, Gallery 3, etc., but product numbering does NOT restart for each gallery.
+
+A product ID such as:
+
+camera_1
+camera_2
+lens_1
+lens_2
+flash_1
+
+refers to one specific physical object across ALL galleries in this listing.
+
+If a physical product in the CURRENT gallery is the same physical object previously assigned an ID in an earlier gallery, you MUST reuse that exact product ID.
+
+Example:
+
+Gallery 1:
+camera_1 appears in Images 1-6.
+
+Gallery 2:
+the same physical camera appears again in Image 7.
+
+Correct:
+Image 7 -> camera_1
+
+Incorrect:
+Image 7 -> a newly created camera_1 with separate meaning
+Image 7 -> camera_2
+
+camera_2 should ONLY be created when the current gallery contains a second physical camera that is visually distinct from the existing camera_1.
+
+Likewise:
+
+lens_1 always refers to the same physical lens across galleries.
+lens_2 means a different physical lens.
+flash_1 always refers to the same physical flash across galleries.
+
+Never restart product numbering when a new gallery begins.
+
+PREVIOUS GALLERY PRODUCT REGISTRY:
+
+${JSON.stringify(
+  priorGallerySummary,
+  null,
+  2
+)}
+
+The previous gallery registry represents product IDs that have already been assigned.
+
+Treat those IDs as persistent.
+
+When analyzing the current gallery:
+
+- Reuse an existing ID when the product is the same physical object.
+- Create a new ID only when there is sufficient visual evidence of a different physical object.
+- Never assign an existing product ID to a different physical object.
+- Never renumber an existing product.
+- Continue numbering from existing products.
+
+Example:
+
+If previous galleries already contain:
+
+camera_1
+lens_1
+lens_2
+
+and the current gallery contains:
+- the same camera
+- the same first lens
+- one completely different lens
+
+then use:
+
+camera_1
+lens_1
+lens_3
+
+Do NOT restart at lens_1.
+
+CRITICAL — PRODUCTS SHOWN INSIDE SCREENSHOTS ARE NOT PHYSICAL PRODUCTS:
+
+Some Marketplace gallery images may themselves be screenshots.
+
+For example, an uploaded image may show:
+- an Amazon product page;
+- an eBay listing;
+- another website's camera listing;
+- a Google search result;
+- an advertisement;
+- a manufacturer's product page;
+- a reference/specification page.
+
+A camera or lens shown INSIDE such a screenshot is NOT a physical
+Marketplace product.
+
+Do NOT create camera_*, lens_*, flash_*, or any other productId for
+products that exist only as images inside screenshots, webpages,
+advertisements, packaging artwork, manuals, or reference material.
+
+Only create a productId when the Marketplace photograph directly shows
+the actual physical object being sold.
+
+Strong indications that the image is a screenshot/reference page include:
+- browser or website UI;
+- "Sponsored";
+- "Visit the ... Store";
+- star ratings or review counts;
+- "Price history";
+- web prices;
+- search bars;
+- Buy/Add to Cart controls;
+- product-page layouts.
+
+If an entire Marketplace image is just such a screenshot, return:
+
+"visibleProducts": []
+
+for that image.
 
 For this application, primary products include:
 - camera bodies
@@ -4352,7 +8009,11 @@ Rules:
 - visibleInImages must contain every image where that product appears.
 - Use the GLOBAL image numbers described above.
 - Do NOT reset image numbering back to 1 for later collages.
-- product IDs must remain consistent within this collage.
+- Product IDs are GLOBAL across the entire listing.
+- Product numbering must NEVER restart for a later gallery.
+- The same physical product must use the same productId in every gallery where it appears.
+- A new productId may only be created for a genuinely different physical product.
+- Products from previous galleries that are NOT visible in the current gallery should NOT be repeated in the current gallery's products array.
 - modelReadabilityScore must be an integer from 1 through 10.
 - Do not return exact model names.
 - Do not guess model names.
@@ -4362,6 +8023,40 @@ Rules:
 - Return valid JSON only.
         `.trim();
 
+const priorGalleryImageContent =
+  [];
+
+for (
+  const priorGallery of galleryResults
+) {
+  if (
+    !priorGallery
+      ?.debugCollageDataUrl
+  ) {
+    continue;
+  }
+
+  priorGalleryImageContent.push(
+    {
+      type:
+        "input_text",
+
+      text:
+        `REFERENCE ONLY — Prior Gallery ${priorGallery.galleryIndex}, Marketplace Images ${priorGallery.startingImageIndex}-${priorGallery.endingImageIndex}. Use this image only to determine whether products in the CURRENT gallery are the same physical products previously assigned IDs.`
+    },
+    {
+      type:
+        "input_image",
+
+      image_url:
+        priorGallery
+          .debugCollageDataUrl,
+
+      detail:
+        "high"
+    }
+  );
+}
 
       const response =
   await createLoggedOpenAiResponse({
@@ -4377,26 +8072,36 @@ Rules:
           role:
             "user",
 
-          content: [
-            {
-              type:
-                "input_text",
+content: [
+  {
+    type:
+      "input_text",
 
-              text:
-                prompt
-            },
+    text:
+      prompt
+  },
 
-            {
-              type:
-                "input_image",
+  ...priorGalleryImageContent,
 
-              image_url:
-                collageDataUrl,
+  {
+    type:
+      "input_text",
 
-              detail:
-                "high"
-            }
-          ]
+    text:
+      `CURRENT GALLERY ${groupIndex + 1}: Marketplace Images ${startingImageIndex}-${endingImageIndex}. Analyze THIS gallery and return products/images for THIS gallery only. Prior gallery images above are reference material for maintaining global physical-product IDs.`
+  },
+
+  {
+    type:
+      "input_image",
+
+    image_url:
+      collageDataUrl,
+
+    detail:
+      "high"
+  }
+]
         }
       ]
     }
@@ -4569,12 +8274,429 @@ app.post(
           ? req.body.bestGoogleTargets
           : [];
 
+          const preDataForSeoLensfunCandidates =
+  Array.isArray(
+    req.body
+      ?.preDataForSeoLensfunCandidates
+  )
+    ? req.body
+        .preDataForSeoLensfunCandidates
+    : [];
+
+
+function getPreDataForSeoLensfunCandidates(
+  productId
+) {
+  const cleanProductId =
+    String(
+      productId ||
+      ""
+    ).trim();
+
+
+  const entry =
+    preDataForSeoLensfunCandidates.find(
+      item =>
+        String(
+          item?.productId ||
+          ""
+        ).trim() ===
+        cleanProductId
+    );
+
+
+  return Array.isArray(
+    entry?.candidates
+  )
+    ? entry.candidates
+    : [];
+}
+
+const preDataForSeoPrimaryProducts =
+  Array.isArray(
+    req.body
+      ?.preDataForSeoPrimaryProducts
+  )
+    ? req.body
+        .preDataForSeoPrimaryProducts
+    : [];
+
       const googleLensResults =
         Array.isArray(
           req.body?.googleLensResults
         )
           ? req.body.googleLensResults
           : [];
+
+          /*
+  ============================================================
+  VISUAL FALLBACK ATTEMPT TRACKING
+
+  Once DataForSEO has already been attempted for a physical
+  product during this reconciliation run, do not ask the caller
+  to run the visual fallback again.
+
+  Group results count as an attempt for every same-type product
+  represented by that result.
+  ============================================================
+*/
+
+function getDataForSeoResultForProduct(
+  productId
+) {
+  const cleanProductId =
+    String(
+      productId || ""
+    ).trim();
+
+
+  if (!cleanProductId) {
+    return null;
+  }
+
+
+  return (
+    googleLensResults.find(
+      result =>
+        String(
+          result?.targetProductId ||
+          ""
+        ).trim() ===
+          cleanProductId &&
+
+        result?.identificationMode !==
+          "group" &&
+
+        result?.ambiguityResolved !==
+          false
+    ) ||
+    null
+  );
+}
+
+
+function getStrongDataForSeoIdentity(
+  productId
+) {
+  const result =
+    getDataForSeoResultForProduct(
+      productId
+    );
+
+
+  if (!result) {
+    return "";
+  }
+
+
+  const confidence =
+    String(
+      result
+        ?.dataForSeoEvidence
+        ?.confidence ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  const consensus =
+    String(
+      result
+        ?.dataForSeoEvidence
+        ?.consensus ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  /*
+    BOTH conditions are required.
+  */
+/*
+  Accepted DataForSEO confidence levels:
+
+  HIGH + STRONG
+    → authoritative
+
+  MEDIUM + MIXED
+    → also authoritative for the scanner
+
+  Anything weaker
+    → unresolved / retain fallback behavior
+*/
+const acceptedDataForSeoIdentity =
+  (
+    confidence === "high" &&
+    consensus === "strong"
+  ) ||
+  (
+    confidence === "medium" &&
+    consensus === "mixed"
+  );
+
+if (
+  !acceptedDataForSeoIdentity
+) {
+  return "";
+}
+
+
+  const recommendedIdentification =
+    String(
+      result
+        ?.dataForSeoEvidence
+        ?.recommendedIdentification ||
+      result?.identifiedModel ||
+      ""
+    ).trim();
+
+
+  if (
+    !recommendedIdentification ||
+    recommendedIdentification
+      .toLowerCase() ===
+        "unknown"
+  ) {
+    return "";
+  }
+
+
+  return recommendedIdentification;
+}
+
+function getLensfunCorroboratedDataForSeoCandidate(
+  productId
+) {
+  const dataForSeoResult =
+    getDataForSeoResultForProduct(
+      productId
+    );
+
+
+  if (!dataForSeoResult) {
+    return null;
+  }
+
+
+  /*
+    HIGH + STRONG is handled by the existing
+    authoritative DataForSEO path.
+
+    This helper is specifically for weaker results.
+  */
+  const confidence =
+    String(
+      dataForSeoResult
+        ?.dataForSeoEvidence
+        ?.confidence ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  const consensus =
+    String(
+      dataForSeoResult
+        ?.dataForSeoEvidence
+        ?.consensus ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  const isAuthoritativeDataForSeo =
+  (
+    confidence === "high" &&
+    consensus === "strong"
+  ) ||
+  (
+    confidence === "medium" &&
+    consensus === "mixed"
+  );
+
+if (
+  isAuthoritativeDataForSeo
+) {
+  return null;
+}
+
+
+  const recommendedIdentification =
+    String(
+      dataForSeoResult
+        ?.dataForSeoEvidence
+        ?.recommendedIdentification ||
+      dataForSeoResult?.identifiedModel ||
+      ""
+    ).trim();
+
+
+  if (
+    !recommendedIdentification ||
+    recommendedIdentification
+      .toLowerCase() ===
+        "unknown"
+  ) {
+    return null;
+  }
+
+
+  const lensfunCandidates =
+    getPreDataForSeoLensfunCandidates(
+      productId
+    );
+
+
+  /*
+    This rule only matters when Lensfun had
+    multiple possible exact models.
+  */
+  if (
+    !Array.isArray(
+      lensfunCandidates
+    ) ||
+    lensfunCandidates.length < 2
+  ) {
+    return null;
+  }
+
+
+  const matchingCandidate =
+    findMatchingLensfunCandidate(
+      recommendedIdentification,
+      lensfunCandidates
+    );
+
+
+  if (!matchingCandidate) {
+    console.log(
+      "[DATAFORSEO + LENSFUN] Weak visual result did not match Lensfun candidate set:",
+      {
+        productId,
+
+        recommendedIdentification,
+
+        confidence,
+
+        consensus,
+
+        allowedModels:
+          lensfunCandidates.map(
+            candidate =>
+              candidate?.model
+          )
+      }
+    );
+
+    return null;
+  }
+
+
+  console.log(
+    "[DATAFORSEO + LENSFUN] Weak visual result corroborated a Lensfun candidate:",
+    {
+      productId,
+
+      recommendedIdentification,
+
+      matchedLensfunModel:
+        matchingCandidate.model,
+
+      confidence,
+
+      consensus
+    }
+  );
+
+
+  return matchingCandidate;
+}
+
+
+function getPreDataForSeoProduct(
+  productId
+) {
+  const cleanProductId =
+    String(
+      productId || ""
+    ).trim();
+
+
+  return (
+    preDataForSeoPrimaryProducts.find(
+      product =>
+        String(
+          product?.productId ||
+          ""
+        ).trim() ===
+        cleanProductId
+    ) ||
+    null
+  );
+}
+
+function wasVisualFallbackAttemptedForProduct(
+  productId
+) {
+  const cleanProductId =
+    String(
+      productId || ""
+    ).trim();
+
+  if (
+    !cleanProductId ||
+    !Array.isArray(
+      googleLensResults
+    )
+  ) {
+    return false;
+  }
+
+
+  return googleLensResults.some(
+    result => {
+      const targetProductId =
+        String(
+          result?.targetProductId ||
+          ""
+        ).trim();
+
+
+      if (
+        targetProductId ===
+        cleanProductId
+      ) {
+        return true;
+      }
+
+
+      const sameTypeProductIds =
+        Array.isArray(
+          result?.sameTypeProductIds
+        )
+          ? result.sameTypeProductIds
+              .map(
+                value =>
+                  String(
+                    value || ""
+                  ).trim()
+              )
+              .filter(Boolean)
+          : [];
+
+
+      return (
+        sameTypeProductIds.includes(
+          cleanProductId
+        )
+      );
+    }
+  );
+}
 
 
       const prompt = `
@@ -4683,9 +8805,91 @@ Rules for Source B:
 - Higher readability means that image is stronger evidence for identifying that particular product.
 - Gallery analysis did NOT intentionally identify exact models.
 
-IMPORTANT:
-If multiple separate gallery batches exist, product IDs are only guaranteed to be consistent WITHIN a gallery batch.
-Do not automatically assume camera_1 from Gallery 1 is the same physical object as camera_1 from Gallery 2 unless the evidence supports that conclusion.
+IMPORTANT GLOBAL PRODUCT-ID RULE:
+
+Gallery product IDs are GLOBAL across the entire Marketplace listing.
+
+The same productId always represents the same physical product regardless
+of which gallery contains it.
+
+For example:
+
+Gallery 1 camera_1
+Gallery 2 camera_1
+
+are the SAME physical camera.
+
+They must produce exactly ONE final primary product.
+
+Gallery numbers indicate which collage contained an observation.
+They are NOT part of the product's identity.
+
+Do NOT create separate final products because the same productId appears
+in multiple gallery batches.
+
+camera_2, lens_2, etc. represent genuinely separate physical products
+that were assigned those distinct IDs during gallery analysis.
+
+==================================================
+CRITICAL PHYSICAL PRODUCT PRESERVATION RULE
+==================================================
+
+Every distinct physical primary product represented by a unique gallery
+productId must remain a distinct final primary product unless there is
+strong evidence that the seller explicitly excludes that physical item.
+
+Examples:
+
+camera_1 + lens_1
+means TWO physical primary products.
+
+Even if lens_1 is physically mounted on camera_1, lens_1 is still a
+separate sellable primary product and MUST appear separately in
+primaryProducts.
+
+Correct:
+
+camera_1 -> Canon EOS Rebel T3 camera body
+lens_1   -> Sigma 18-250mm camera lens
+
+Incorrect:
+
+camera_1 -> Canon EOS Rebel T3 with the Sigma lens identity embedded
+inside camera_1
+
+Incorrect:
+
+camera_1 only, with lens_1 omitted
+
+A mounted lens does NOT become part of the camera-body product identity.
+
+Likewise:
+
+camera_1
+lens_1
+lens_2
+
+must normally produce THREE final primaryProducts.
+
+For every unique gallery productId:
+
+- preserve that productId in primaryProducts exactly once;
+- identify THAT physical product using the evidence associated with it;
+- never transfer the identity of one productId into another productId;
+- never delete a gallery-visible lens merely because it is attached to a camera;
+- never place lensIdentity on a camera body or camera;
+- lensIdentity belongs ONLY to a product whose productType is "camera lens".
+
+The only reasons a gallery product may be omitted are:
+
+1. seller evidence explicitly states that physical product is NOT included; or
+2. the gallery clearly misclassified a non-primary accessory as a primary product.
+
+Uncertainty about exact model identity is NOT a reason to remove the
+physical product.
+
+If the exact model cannot be established, preserve the physical product
+with null identity fields and add it to needsGoogleLens.
 
 ==================================================
 SOURCE C — SELECTED GOOGLE TARGETS
@@ -4717,7 +8921,9 @@ Rules for Source D:
 - Therefore, not every OCR string necessarily belongs to target productId.
 - Use productType, gallery mapping, seller evidence, and surrounding evidence to determine which markings belong to which physical product.
 - OCR can contain mistakes, missing characters, duplicated words, or incorrect spacing.
-- Prefer combinations of markings that form a known coherent product identity.
+- Combine OCR markings only when those markings are actually present in the
+  supplied evidence. Do not add missing components merely because they would
+  form a known or common product identity.
 - Do NOT invent missing model components.
 - A highly readable OCR result such as:
   "Canon / EOS / 60D"
@@ -4727,7 +8933,7 @@ Rules for Source D:
   can support the normalized Canon EF-S 18-55mm f/3.5-5.6 IS II identity.
 
 ==================================================
-SOURCE E GOOGLE LENS / AI RESULTS
+SOURCE E — GOOGLE SEARCH-BY-IMAGE / DATAFORSEO EVIDENCE
 ==================================================
 
 ${JSON.stringify(
@@ -4743,6 +8949,52 @@ Rules for Source E:
 - Do not assume every model mentioned by Google corresponds to the target product.
 - Use targetProductId and targetProductType to understand what the Google search was intended to identify.
 - Preserve awareness that another product may also be visible in the same image.
+DATAFORSEO CLEANING RULES:
+
+- dataForSeoEvidence is an intermediary AI-cleaned summary of raw Google
+  Search By Image results.
+
+- DataForSEO may ESTABLISH a new exact commercially-distinct model ONLY when:
+
+  confidence = "high"
+
+  AND
+
+  consensus = "strong"
+
+- BOTH conditions are mandatory.
+
+- If confidence is medium or low, DataForSEO is supporting evidence only.
+
+- If consensus is mixed, weak, or none, DataForSEO is supporting evidence only.
+
+- Supporting DataForSEO evidence MUST NOT change a previously supported
+  specification such as:
+  focal length,
+  aperture,
+  stabilization designation,
+  mount series,
+  generation,
+  STM,
+  USM,
+  IS,
+  VR,
+  II,
+  III,
+  G2,
+  or other commercially meaningful suffixes.
+
+- In particular, do NOT replace an existing seller/OCR-supported fact merely
+  because a medium-confidence or mixed-consensus Search By Image result
+  contains a different specification.
+
+- When DataForSEO confidence = high AND consensus = strong, its exact model
+  may be used as strong evidence for the targeted physical product.
+
+- candidateModels remain observations and do not themselves establish identity.
+
+- Seller evidence, product OCR, and other objective evidence can still reject
+  a high/strong DataForSEO result if there is a direct contradiction.
 
 GROUP IDENTIFICATION RULES:
 
@@ -4810,63 +9062,140 @@ Only create *_text_* products when seller evidence establishes that
 additional physical products are included BEYOND the products already
 accounted for by the gallery evidence.
 
-LENS NORMALIZATION RULES:
+LENS OBJECTIVE-EVIDENCE RULES:
 
-For every product whose productType is "camera lens", DO NOT return a free-form lens model string.
+For a camera lens, your role in THIS STEP is ONLY to organize and
+structure information that has already been objectively established.
 
-Instead, break the lens identity into these exact fields:
+You are NOT identifying the lens from general knowledge.
 
-- brand
-- mountSeries
-- focalLength
-- maxAperture
-- featureModelCodes
-- generation
+You are NOT trying to determine what lens is most likely present.
 
-Use null for any field that is not supported by the evidence.
+A later dedicated lens-resolution pipeline will use Lensfun when the
+objective evidence is sufficiently specific. If the evidence is
+insufficient or Lensfun cannot establish a canonical identity, the
+product will be routed to Google Lens using the actual Marketplace image.
 
-Field definitions:
+For every non-null lensIdentity field, the exact information must be
+traceable to objective evidence supplied to this prompt.
 
-brand:
-- The lens manufacturer/brand only.
-- Examples: "Canon", "Nikon", "Sony", "Sigma", "Tamron", "Olympus".
-- Do not include the brand again in any other lens field.
+Objective evidence includes:
 
-mountSeries:
-- The mount, system, series, or manufacturer designation used to distinguish the lens family.
-- Examples: "EF", "EF-S", "RF", "RF-S", "FE", "E", "Z", "F", "DX", "FX", "Micro Four Thirds".
-- When a manufacturer commonly uses a combined family designation that is necessary to distinguish the lens, keep that combined designation here.
-- Do not include focal length, aperture, feature codes, or generation here.
+- seller-written listing text;
+- OCR text read from the physical product image;
+- an already-supplied Google Lens identification result.
 
-focalLength:
-- Return only the focal length or zoom range.
-- Normalize examples to: "50mm", "18-55mm", "70-200mm".
-- Do not add spaces around the hyphen.
+For each camera lens:
 
-maxAperture:
-- Return only the maximum aperture.
-- Normalize examples to: "f/1.8", "f/2.8", "f/3.5-5.6".
-- Convert equivalent markings such as "1:1.8" into "f/1.8" when the evidence clearly supports it.
+- brand may be populated ONLY when the manufacturer is directly supported;
+- focalLength may be populated ONLY when the focal length or focal-length
+  range is directly present in the evidence;
+- maxAperture may be populated ONLY when the aperture is directly present
+  in the evidence;
+- featureModelCodes may be populated ONLY when those markings are directly
+  present in the evidence;
+- generation may be populated ONLY when the generation/version is directly
+  present in the evidence;
+- mountSeries may be populated ONLY when the mount/series is directly
+  present in seller text, OCR, or an already-supplied identification result.
 
-featureModelCodes:
-- Return the remaining manufacturer feature/model codes that distinguish the lens, in normal manufacturer naming order.
-- Examples: "IS STM", "USM", "VR", "OSS", "G OSS", "DG DN Art", "ED VR".
-- Do NOT put a generation marker such as "II" or "III" here when it clearly represents the lens generation.
-- If there are no supported feature/model codes, return null.
+CRITICAL:
 
-generation:
-- Return only an explicit model generation/revision marker.
-- Examples: "II", "III", "G2".
-- If no generation is supported, return null.
+Do NOT infer ANY missing lens specification from:
 
-CRITICAL LENS RULES:
-- Do not invent a missing lens component just to make the name look complete.
-- If a component is unknown or ambiguous, return null for that field.
-- Do not put the word "lens" into any lensIdentity field.
-- Do not repeat information across lensIdentity fields.
-- The application code, NOT you, will assemble the final lens name in this exact order:
-  brand + mountSeries + focalLength + maxAperture + featureModelCodes + generation + "lens"
-- Therefore, field placement must be consistent.
+- the attached camera body;
+- the camera model in the listing;
+- camera/lens compatibility;
+- the mount used by the camera;
+- common kit-lens combinations;
+- what lens normally ships with that camera;
+- what lens is statistically likely to be shown;
+- visual appearance alone unless an upstream identification result explicitly
+  established that information;
+- your general knowledge of camera equipment.
+
+Do NOT use one supported specification to guess another.
+
+For example:
+
+If OCR says:
+
+Canon
+Canon
+Canon
+
+and the listing contains a Canon EOS Rebel T3i,
+
+the ONLY supported lens identity may be:
+
+{
+  "brand": "Canon",
+  "mountSeries": null,
+  "focalLength": null,
+  "maxAperture": null,
+  "featureModelCodes": null,
+  "generation": null
+}
+
+You MUST NOT infer:
+
+{
+  "brand": "Canon",
+  "mountSeries": "EF-S",
+  "focalLength": "18-55mm",
+  "maxAperture": "f/3.5-5.6",
+  "featureModelCodes": "IS",
+  "generation": null
+}
+
+merely because an 18-55mm EF-S lens is commonly paired with that camera.
+
+UNKNOWN INFORMATION MUST REMAIN NULL.
+
+Before outputting every non-null lens identity field, verify that the exact
+information appears in or is directly established by the supplied evidence.
+
+If you cannot point to supporting evidence for a field, output null.
+
+It is always preferable to return an incomplete lensIdentity than to return
+a plausible but inferred identity.
+
+Do NOT infer mount from the attached camera.
+Do NOT fill missing specifications using general product knowledge.
+Do NOT change an OCR-supported aperture into a different aperture.
+Do NOT guess a likely lens revision.
+
+Example:
+
+OCR:
+SIGMA DC 18-250mm 1:3.5-6.3
+
+Correct:
+
+{
+  "brand": "Sigma",
+  "mountSeries": null,
+  "focalLength": "18-250mm",
+  "maxAperture": "f/3.5-6.3",
+  "featureModelCodes": "DC",
+  "generation": null
+}
+
+Incorrect:
+
+{
+  "brand": "Sigma",
+  "mountSeries": "EF-S",
+  "focalLength": "18-250mm",
+  "maxAperture": "f/3.5-5.6"
+}
+
+The latter invents information not present in the objective evidence.
+
+Use null whenever a field is not directly supported.
+
+The dedicated lens-resolution layer will canonicalize the lens AFTER
+this reconciliation step.
 
 Return exactly this JSON structure:
 
@@ -4955,6 +9284,29 @@ Requirements:
 - Return valid JSON only.
 - Do not use Markdown.
 - Do not use code fences.
+
+CRITICAL:
+
+A camera body may NEVER contain information about an attached lens in
+its lensIdentity field.
+
+For example, this is INVALID:
+
+{
+  "productId": "camera_1",
+  "productType": "camera body",
+  "brand": "Canon",
+  "model": "EOS Rebel T3",
+  "lensIdentity": {
+    "brand": "Sigma",
+    "focalLength": "18-250mm"
+  }
+}
+
+The correct representation is TWO objects:
+
+camera_1 = Canon EOS Rebel T3 camera body
+lens_1   = Sigma 18-250mm camera lens
       `.trim();
 
 
@@ -5022,15 +9374,517 @@ const response =
           });
       }
 
+/*
+  ============================================================
+  STEP 5 STRUCTURAL VALIDATION
+  ============================================================
 
-      const primaryProducts =
-        Array.isArray(
-          parsed?.primaryProducts
+  Gallery product IDs represent physical primary products.
+
+  Do not silently allow reconciliation to:
+  - drop a gallery product;
+  - merge a lens into a camera;
+  - attach lensIdentity to a non-lens product.
+*/
+
+const galleryPhysicalProducts =
+  [];
+
+for (
+  const gallery of galleryResults
+) {
+  const products =
+    Array.isArray(
+      gallery?.galleryAnalysis?.products
+    )
+      ? gallery.galleryAnalysis.products
+      : [];
+
+  for (
+    const product of products
+  ) {
+    const productId =
+      String(
+        product?.productId || ""
+      ).trim();
+
+    const productType =
+      String(
+        product?.productType || ""
+      ).trim();
+
+    if (
+      !productId ||
+      !productType
+    ) {
+      continue;
+    }
+
+    /*
+      IDs are global across galleries now,
+      so only keep one registry entry per productId.
+    */
+    if (
+      galleryPhysicalProducts.some(
+        existing =>
+          existing.productId ===
+          productId
+      )
+    ) {
+      continue;
+    }
+
+    galleryPhysicalProducts.push({
+      productId,
+      productType
+    });
+  }
+}
+
+
+const parsedPrimaryProducts =
+  Array.isArray(
+    parsed?.primaryProducts
+  )
+    ? parsed.primaryProducts
+    : [];
+
+
+/*
+  Detect gallery-visible physical products
+  that vanished during reconciliation.
+*/
+const missingGalleryProducts =
+  galleryPhysicalProducts.filter(
+    galleryProduct =>
+      !parsedPrimaryProducts.some(
+        finalProduct =>
+          String(
+            finalProduct?.productId || ""
+          ).trim() ===
+            galleryProduct.productId
+      )
+  );
+
+
+/*
+  Detect lens identity incorrectly attached
+  to a camera body / camera / flash.
+*/
+const invalidLensIdentityProducts =
+  parsedPrimaryProducts.filter(
+    product => {
+      const productType =
+        String(
+          product?.productType || ""
         )
-          ? parsed.primaryProducts
-          : [];
+          .trim()
+          .toLowerCase();
 
-          const needsGoogleLens =
+      return (
+        productType !==
+          "camera lens" &&
+        product?.lensIdentity &&
+        typeof product.lensIdentity ===
+          "object"
+      );
+    }
+  );
+
+
+/*
+  ============================================================
+  STEP 5 PHYSICAL PRODUCT RECOVERY
+  ============================================================
+
+  Step 5 is allowed to organize / refine identities.
+
+  It is NOT allowed to make a physical product that the
+  gallery already detected disappear.
+
+  Previously this condition returned HTTP 502 and caused the
+  entire Marketplace listing analysis to fail/retry.
+
+  Instead:
+
+    1. preserve every gallery product ID;
+    2. restore a missing product from the pre-DataForSEO
+       baseline when available;
+    3. otherwise create a minimal unresolved physical-product
+       placeholder from the gallery registry;
+    4. strip invalid lensIdentity objects from non-lens items.
+
+  Identity can remain unresolved. Physical existence cannot.
+*/
+if (
+  missingGalleryProducts.length ||
+  invalidLensIdentityProducts.length
+) {
+  console.warn(
+    "[STEP 5] Reconciliation structure required recovery:",
+    {
+      missingGalleryProducts,
+
+      invalidLensIdentityProducts:
+        invalidLensIdentityProducts.map(
+          product => ({
+            productId:
+              product?.productId,
+
+            productType:
+              product?.productType
+          })
+        )
+    }
+  );
+}
+
+
+/*
+  Work from a mutable recovered copy rather than rejecting
+  the entire Step-5 response.
+*/
+let recoveredPrimaryProducts =
+  parsedPrimaryProducts.map(
+    product => {
+      const productType =
+        String(
+          product?.productType ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      /*
+        lensIdentity is only legal on physical camera lenses.
+      */
+      if (
+        productType !==
+          "camera lens" &&
+        product?.lensIdentity
+      ) {
+        console.warn(
+          "[STEP 5 RECOVERY] Removing invalid lensIdentity from non-lens product:",
+          {
+            productId:
+              product?.productId,
+
+            productType:
+              product?.productType
+          }
+        );
+
+        return {
+          ...product,
+
+          lensIdentity:
+            null
+        };
+      }
+
+      return product;
+    }
+  );
+
+
+/*
+  Restore every physical gallery product that Step 5 dropped.
+*/
+for (
+  const missingProduct of
+    missingGalleryProducts
+) {
+  const productId =
+    String(
+      missingProduct?.productId ||
+      ""
+    ).trim();
+
+  const productType =
+    String(
+      missingProduct?.productType ||
+      ""
+    ).trim();
+
+
+  if (!productId) {
+    continue;
+  }
+
+
+  /*
+    On the second reconciliation pass, this is the ideal
+    recovery source because it contains the exact state
+    immediately before DataForSEO was introduced.
+  */
+  const baseline =
+    preDataForSeoPrimaryProducts.find(
+      product =>
+        String(
+          product?.productId ||
+          ""
+        ).trim() ===
+          productId
+    );
+
+
+  if (baseline) {
+    console.warn(
+      "[STEP 5 RECOVERY] Restoring missing product from pre-DataForSEO baseline:",
+      {
+        productId,
+        productType
+      }
+    );
+
+    recoveredPrimaryProducts.push(
+      JSON.parse(
+        JSON.stringify(
+          baseline
+        )
+      )
+    );
+
+    continue;
+  }
+
+
+  /*
+    First-pass fallback:
+
+    We may not yet have a richer identity baseline.
+
+    Preserve the physical product as unresolved rather than
+    inventing an exact model or failing the listing.
+  */
+  console.warn(
+    "[STEP 5 RECOVERY] Restoring missing gallery product as unresolved:",
+    {
+      productId,
+      productType
+    }
+  );
+
+
+  recoveredPrimaryProducts.push({
+    productId,
+
+    galleryIndex:
+      null,
+
+    brand:
+      null,
+
+    model:
+      null,
+
+    productType,
+
+    lensIdentity:
+      productType
+        .toLowerCase() ===
+          "camera lens"
+        ? {
+            brand:
+              null,
+
+            canonicalModel:
+              null,
+
+            mountSeries:
+              null,
+
+            focalLength:
+              null,
+
+            maxAperture:
+              null,
+
+            featureModelCodes:
+              null,
+
+            generation:
+              null,
+
+            resolutionMode:
+              null
+          }
+        : null
+  });
+}
+
+    let primaryProducts =
+  recoveredPrimaryProducts;
+
+          /*
+  ============================================================
+  DATAFORSEO EVIDENCE GATE
+
+  If DataForSEO was attempted for a product but did NOT reach
+  high confidence + strong consensus, restore that product to
+  its exact pre-DataForSEO state.
+
+  The second Step-5 call exists only because DataForSEO added
+  new evidence. Weak evidence must therefore not rewrite facts
+  already established by the first reconciliation.
+  ============================================================
+*/
+
+if (
+  googleLensResults.length &&
+  preDataForSeoPrimaryProducts.length
+) {
+  primaryProducts =
+    primaryProducts.map(
+      product => {
+        const productId =
+          String(
+            product?.productId ||
+            ""
+          ).trim();
+
+
+        if (!productId) {
+          return product;
+        }
+
+
+        const dataForSeoResult =
+          getDataForSeoResultForProduct(
+            productId
+          );
+
+
+        /*
+          DataForSEO wasn't used on this product.
+        */
+        if (!dataForSeoResult) {
+          return product;
+        }
+
+
+        /*
+          HIGH + STRONG is handled later by the
+          authoritative DataForSEO lock.
+        */
+        const strongIdentity =
+          getStrongDataForSeoIdentity(
+            productId
+          );
+
+
+        if (strongIdentity) {
+          return product;
+        }
+
+
+        /*
+          ========================================================
+          WEAKER DATAFORSEO + LENSFUN CORROBORATION
+          ========================================================
+
+          DataForSEO itself isn't strong enough to establish
+          an arbitrary exact model.
+
+          But if its exact recommended model is one of the
+          deterministic Lensfun candidates, accept the actual
+          Lensfun candidate as canonical.
+        */
+
+        const corroboratedCandidate =
+          getLensfunCorroboratedDataForSeoCandidate(
+            productId
+          );
+
+
+        if (corroboratedCandidate) {
+          const canonicalIdentity =
+            lensfunCandidateToIdentity(
+              corroboratedCandidate
+            );
+
+
+          canonicalIdentity
+            .resolutionMode =
+            "lensfun-dataforseo-corroborated";
+
+
+          console.log(
+            "[DATAFORSEO GATE] Accepting Lensfun candidate corroborated by weaker visual search:",
+            {
+              productId,
+
+              canonicalModel:
+                canonicalIdentity
+                  ?.canonicalModel
+            }
+          );
+
+
+          return {
+            ...product,
+
+            brand:
+              canonicalIdentity.brand ||
+              product?.brand ||
+              null,
+
+            lensIdentity:
+              canonicalIdentity
+          };
+        }
+
+
+        /*
+          Otherwise DataForSEO was not authoritative
+          and did not corroborate one exact Lensfun candidate.
+
+          Restore the exact state from before DataForSEO.
+        */
+        const baseline =
+          getPreDataForSeoProduct(
+            productId
+          );
+
+
+        if (!baseline) {
+          return product;
+        }
+
+
+        console.log(
+          "[DATAFORSEO GATE] Restoring pre-DataForSEO identity:",
+          {
+            productId,
+
+            confidence:
+              dataForSeoResult
+                ?.dataForSeoEvidence
+                ?.confidence,
+
+            consensus:
+              dataForSeoResult
+                ?.dataForSeoEvidence
+                ?.consensus,
+
+            recommendedIdentification:
+              dataForSeoResult
+                ?.dataForSeoEvidence
+                ?.recommendedIdentification
+          }
+        );
+
+
+        return JSON.parse(
+          JSON.stringify(
+            baseline
+          )
+        );
+      }
+    );
+}
+
+          let needsGoogleLens =
   Array.isArray(
     parsed?.needsGoogleLens
   )
@@ -5061,39 +9915,480 @@ const response =
         )
     : [];
 
+/*
+  ============================================================
+  DEDICATED LENS SPECIFICATION RESOLUTION
+  ============================================================
+*/
 
-      const result = {
-  primaryProducts:
-    primaryProducts
-      .map(
-        product => {
-          const productId =
+const cameraContext =
+  primaryProducts
+    .filter(
+      product =>
+        String(
+          product?.productType || ""
+        )
+          .trim()
+          .toLowerCase() !==
+        "camera lens"
+    )
+    .map(
+      product => ({
+        productId:
+          String(
+            product?.productId || ""
+          ).trim(),
+
+        productType:
+          String(
+            product?.productType || ""
+          ).trim(),
+
+        brand:
+          cleanNullableIdentityField(
+            product?.brand
+          ),
+
+        model:
+          cleanNullableIdentityField(
+            product?.model
+          )
+      })
+    );
+
+    const isPostDataForSeoPass =
+  Array.isArray(
+    googleLensResults
+  ) &&
+  googleLensResults.length > 0;
+
+const lensfunCandidatesByProductId =
+  new Map(
+    preDataForSeoLensfunCandidates.map(
+      entry => [
+        String(
+          entry?.productId ||
+          ""
+        ).trim(),
+
+        Array.isArray(
+          entry?.candidates
+        )
+          ? entry.candidates
+          : []
+      ]
+    )
+  );
+
+for (
+  const product of primaryProducts
+) {
+  const productType =
+    String(
+      product?.productType || ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  if (
+    productType !==
+    "camera lens"
+  ) {
+    continue;
+  }
+
+  /*
+  ============================================================
+  AUTHORITATIVE CROPPED DATAFORSEO RESULT
+  ============================================================
+*/
+
+const strongDataForSeoIdentity =
+  getStrongDataForSeoIdentity(
+    product?.productId
+  );
+
+
+if (strongDataForSeoIdentity) {
+  const baseline =
+    getPreDataForSeoProduct(
+      product?.productId
+    );
+
+
+  const existingLensIdentity =
+    normalizeLensIdentity(
+      baseline?.lensIdentity ||
+      product?.lensIdentity ||
+      {}
+    );
+
+
+  /*
+    Preserve the ACTUAL DataForSEO confidence metadata.
+
+    getStrongDataForSeoIdentity() now means
+    "accepted / authoritative", not necessarily literally
+    high + strong.
+  */
+  const dataForSeoResult =
+    getDataForSeoResultForProduct(
+      product?.productId
+    );
+
+
+  const actualConfidence =
+    String(
+      dataForSeoResult
+        ?.dataForSeoEvidence
+        ?.confidence ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  const actualConsensus =
+    String(
+      dataForSeoResult
+        ?.dataForSeoEvidence
+        ?.consensus ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  const resolutionMode =
+    actualConfidence === "high" &&
+    actualConsensus === "strong"
+      ? "dataforseo-high-strong"
+      : actualConfidence === "medium" &&
+        actualConsensus === "mixed"
+        ? "dataforseo-medium-mixed"
+        : "dataforseo-accepted";
+
+
+  product.lensIdentity = {
+    ...existingLensIdentity,
+
+    brand:
+      existingLensIdentity
+        .brand ||
+      cleanNullableIdentityField(
+        product?.brand
+      ),
+
+    canonicalModel:
+      strongDataForSeoIdentity,
+
+    resolutionMode
+  };
+
+
+  console.log(
+    "[DATAFORSEO GATE] Exact lens identity accepted:",
+    {
+      productId:
+        product?.productId,
+
+      canonicalModel:
+        strongDataForSeoIdentity,
+
+      confidence:
+        actualConfidence,
+
+      consensus:
+        actualConsensus,
+
+      resolutionMode
+    }
+  );
+
+
+  /*
+    This identity is final for this pass.
+    Do NOT send it through Lensfun again.
+  */
+  needsGoogleLens =
+    needsGoogleLens.filter(
+      item =>
+        String(
+          item?.productId ||
+          ""
+        ).trim() !==
+        String(
+          product?.productId ||
+          ""
+        ).trim()
+    );
+
+
+  continue;
+}
+
+/*
+  ============================================================
+  SECOND PASS
+
+  Lensfun was already executed before DataForSEO.
+
+  The weak-result candidate constraint / baseline restoration
+  has already happened above.
+
+  Do NOT query Lensfun again.
+  ============================================================
+*/
+if (isPostDataForSeoPass) {
+  continue;
+}
+
+  try {
+    const resolution =
+      await resolveCanonicalLens({
+        product,
+
+        productOcrResults,
+
+        listingTitle,
+
+        listingDescription,
+
+        listingScreenshotOcr,
+
+        explicitFacts,
+
+        cameraContext
+      });
+
+      const resolvedProductId =
   String(
     product?.productId ||
     ""
   ).trim();
 
-const galleryIndex =
-  Number(
-    product?.galleryIndex
-  ) || 1;
 
-const productType =
+if (
+  resolvedProductId &&
+  Array.isArray(
+    resolution?.candidates
+  )
+) {
+  lensfunCandidatesByProductId.set(
+    resolvedProductId,
+
+    resolution.candidates.map(
+      candidate => ({
+        candidateId:
+          String(
+            candidate
+              ?.candidateId ||
+            ""
+          ).trim(),
+
+        maker:
+          String(
+            candidate
+              ?.maker ||
+            ""
+          ).trim(),
+
+        model:
+          String(
+            candidate
+              ?.model ||
+            ""
+          ).trim(),
+
+        mount:
+          String(
+            candidate
+              ?.mount ||
+            ""
+          ).trim()
+      })
+    )
+  );
+}
+
+
+    console.log(
+      "[LENS RESOLVER] Complete:",
+      {
+        productId:
+          product?.productId,
+
+        mode:
+          resolution?.mode,
+
+        identity:
+          resolution?.identity
+      }
+    );
+
+
+    if (
+      resolution?.identity
+    ) {
+      /*
+        Overwrite Step-5's provisional evidence identity
+        with the canonical dedicated-resolver identity.
+      */
+      product.lensIdentity =
+        resolution.identity;
+
+
+      /*
+        This lens no longer needs the old
+        Serper Images fallback.
+      */
+      needsGoogleLens =
+        needsGoogleLens.filter(
+          item =>
+            String(
+              item?.productId || ""
+            ).trim() !==
+            String(
+              product?.productId || ""
+            ).trim()
+        );
+    } else {
+      /*
+        Dedicated resolution failed.
+
+        Keep it eligible for the existing
+        visual Serper fallback as a final safety net.
+      */
+      const alreadyQueued =
+        needsGoogleLens.some(
+          item =>
+            String(
+              item?.productId || ""
+            ).trim() ===
+            String(
+              product?.productId || ""
+            ).trim()
+        );
+
+
+      if (!alreadyQueued) {
+        needsGoogleLens.push({
+          galleryIndex:
+            Number(
+              product?.galleryIndex
+            ) || 1,
+
+          productId:
+            String(
+              product?.productId || ""
+            ).trim(),
+
+         reason:
+  "OCR/Lensfun resolution could not establish a canonical lens identity, so Google Lens identification is required."
+        });
+      }
+    }
+
+  } catch (error) {
+    console.warn(
+      "[LENS RESOLVER] Failed:",
+      {
+        productId:
+          product?.productId,
+
+        error:
+          error?.message ||
+          String(error)
+      }
+    );
+
+
+    /*
+      Don't crash the entire Marketplace analysis.
+      Existing visual Serper fallback can still try.
+    */
+    const alreadyQueued =
+      needsGoogleLens.some(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim() ===
+          String(
+            product?.productId || ""
+          ).trim()
+      );
+
+
+    if (!alreadyQueued) {
+      needsGoogleLens.push({
+        galleryIndex:
+          Number(
+            product?.galleryIndex
+          ) || 1,
+
+        productId:
+          String(
+            product?.productId || ""
+          ).trim(),
+
+        reason:
+          "Dedicated lens resolver failed and visual fallback is required."
+      });
+    }
+  }
+}
+
+/*
+  ============================================================
+  REMOVE ALREADY-ATTEMPTED VISUAL FALLBACKS
+
+  DataForSEO is the final visual-search attempt for this run.
+  If it did not establish an exact model, preserve the unresolved
+  product instead of requesting DataForSEO again.
+  ============================================================
+*/
+
+needsGoogleLens =
+  needsGoogleLens.filter(
+    item =>
+      !wasVisualFallbackAttemptedForProduct(
+        item?.productId
+      )
+  );
+
+const result = {
+  primaryProducts:
+    primaryProducts
+      .map(
+        product => {
+          const productId =
+            String(
+              product?.productId ||
+              ""
+            ).trim();
+
+
+          const galleryIndex =
+            Number(
+              product?.galleryIndex
+            ) || 1;
+
+
+          const productType =
             String(
               product?.productType ||
               ""
             ).trim();
 
+
           const normalizedType =
             productType
               .toLowerCase();
 
-          /*
-            Camera lenses use the structured identity
-            returned by Step 5.
 
-            The AI does NOT determine the final word
-            ordering anymore. JavaScript does.
+          /*
+            Camera lenses use structured identity.
           */
           if (
             normalizedType ===
@@ -5105,18 +10400,20 @@ const productType =
                 {}
               );
 
+
             const model =
               buildNormalizedLensModel(
                 lensIdentity
               );
 
+
             return {
-  productId,
+              productId,
 
-  galleryIndex,
+              galleryIndex,
 
-  brand:
-    lensIdentity.brand,
+              brand:
+                lensIdentity.brand,
 
               model:
                 model || null,
@@ -5127,39 +10424,71 @@ const productType =
             };
           }
 
+
           /*
-            Cameras, flashes, etc. continue using
-            the existing brand/model system.
+            Cameras, flashes, etc.
           */
           return {
-  productId,
+            productId,
 
-  galleryIndex,
+            galleryIndex,
 
-  brand:
-    cleanNullableIdentityField(
-      product?.brand
-    ),
+            brand:
+              cleanNullableIdentityField(
+                product?.brand
+              ),
 
-  model:
-    cleanNullableIdentityField(
-      product?.model
-    ),
+            model:
+              cleanNullableIdentityField(
+                product?.model
+              ),
 
-  productType,
+            productType,
 
-  lensIdentity:
-    null
-};
+            lensIdentity:
+              null
+          };
         }
       )
-            .filter(
+      .filter(
         product =>
           product.productId &&
           product.productType
       ),
 
-  needsGoogleLens
+  needsGoogleLens,
+
+  lensfunCandidateConstraints:
+    Array.from(
+      lensfunCandidatesByProductId
+        .entries()
+    ).map(
+      (
+        [
+          productId,
+          candidates
+        ]
+      ) => ({
+        productId,
+
+        candidates:
+          candidates.map(
+            candidate => ({
+              candidateId:
+                candidate.candidateId,
+
+              maker:
+                candidate.maker,
+
+              model:
+                candidate.model,
+
+              mount:
+                candidate.mount
+            })
+          )
+      })
+    )
 };
 
 
@@ -5196,6 +10525,38 @@ const productType =
   }
 );
 
+function hasEnoughIdentityForEbaySearch(
+  item
+) {
+if (
+  item?.exactIdentityResolved ===
+  false
+) {
+  return false;
+}
+
+  const brand =
+    String(
+      item?.brand || ""
+    ).trim();
+
+  const model =
+    String(
+      item?.model || ""
+    ).trim();
+
+  const productType =
+    String(
+      item?.productType || ""
+    ).trim();
+
+
+  return Boolean(
+    brand &&
+    model &&
+    productType
+  );
+}
 function getOpenAiLogFilePath() {
   const date =
     new Date()
@@ -6193,6 +11554,585 @@ async function updateMarketplaceConversationFollowUpColumn({
   );
 }
 
+function mean(numbers) {
+  const values =
+    numbers
+      .map(Number)
+      .filter(
+        Number.isFinite
+      );
+
+
+  if (!values.length) {
+    return null;
+  }
+
+
+  return Number(
+    (
+      values.reduce(
+        (
+          sum,
+          value
+        ) =>
+          sum + value,
+        0
+      ) /
+      values.length
+    ).toFixed(2)
+  );
+}
+
+
+function percentile(
+  numbers,
+  percentileValue
+) {
+  const values =
+    numbers
+      .map(Number)
+      .filter(
+        Number.isFinite
+      )
+      .sort(
+        (a, b) =>
+          a - b
+      );
+
+
+  if (!values.length) {
+    return null;
+  }
+
+
+  if (
+    values.length === 1
+  ) {
+    return Number(
+      values[0].toFixed(2)
+    );
+  }
+
+
+  const position =
+    (
+      percentileValue /
+      100
+    ) *
+    (
+      values.length -
+      1
+    );
+
+
+  const lower =
+    Math.floor(
+      position
+    );
+
+  const upper =
+    Math.ceil(
+      position
+    );
+
+  const weight =
+    position -
+    lower;
+
+
+  const value =
+    values[lower] *
+      (1 - weight) +
+    values[upper] *
+      weight;
+
+
+  return Number(
+    value.toFixed(2)
+  );
+}
+
+
+function coefficientOfVariation(
+  numbers
+) {
+  const avg =
+    mean(numbers);
+
+  const std =
+    standardDeviation(
+      numbers
+    );
+
+
+  if (
+    avg == null ||
+    std == null ||
+    avg === 0
+  ) {
+    return null;
+  }
+
+
+  return Number(
+    (
+      std /
+      avg
+    ).toFixed(6)
+  );
+}
+
+
+function medianOfCheapestFraction(
+  numbers,
+  fraction
+) {
+  const sorted =
+    numbers
+      .map(Number)
+      .filter(
+        Number.isFinite
+      )
+      .sort(
+        (a, b) =>
+          a - b
+      );
+
+
+  if (!sorted.length) {
+    return null;
+  }
+
+
+  const count =
+    Math.max(
+      1,
+
+      Math.ceil(
+        sorted.length *
+        fraction
+      )
+    );
+
+
+  return median(
+    sorted.slice(
+      0,
+      count
+    )
+  );
+}
+
+function calculatePriceFeatures(
+  listings
+) {
+  const prices =
+    listings
+      .map(
+        listing =>
+          Number(
+            listing.price
+          )
+      )
+      .filter(
+        price =>
+          Number.isFinite(
+            price
+          ) &&
+          price > 0
+      );
+
+
+  if (!prices.length) {
+    return {
+      count: 0
+    };
+  }
+
+
+  const p25 =
+    percentile(
+      prices,
+      25
+    );
+
+  const p75 =
+    percentile(
+      prices,
+      75
+    );
+
+
+  return {
+    count:
+      prices.length,
+
+    mean:
+      mean(prices),
+
+    median:
+      median(prices),
+
+    p10:
+      percentile(
+        prices,
+        10
+      ),
+
+    p20:
+      percentile(
+        prices,
+        20
+      ),
+
+    p25,
+
+    p30:
+      percentile(
+        prices,
+        30
+      ),
+
+    p40:
+      percentile(
+        prices,
+        40
+      ),
+
+    p75,
+
+    p90:
+      percentile(
+        prices,
+        90
+      ),
+
+    stdDev:
+      standardDeviation(
+        prices
+      ),
+
+    cv:
+      coefficientOfVariation(
+        prices
+      ),
+
+    iqr:
+      (
+        p25 != null &&
+        p75 != null
+      )
+        ? Number(
+            (
+              p75 -
+              p25
+            ).toFixed(2)
+          )
+        : null,
+
+    low:
+      Math.min(
+        ...prices
+      ),
+
+    high:
+      Math.max(
+        ...prices
+      ),
+
+    cheapest20Median:
+      medianOfCheapestFraction(
+        prices,
+        0.20
+      ),
+
+    cheapest30Median:
+      medianOfCheapestFraction(
+        prices,
+        0.30
+      )
+  };
+}
+
+async function saveEbayTrainingData({
+  analysisRunId,
+
+  target,
+
+  soldValidListings,
+
+  soldMedian,
+  soldStdDev,
+  expectedSalePrice,
+
+  activeSearch,
+  validActiveListings
+}) {
+  const activeFeatures =
+    calculatePriceFeatures(
+      validActiveListings
+    );
+
+
+  const soldFeatures =
+    calculatePriceFeatures(
+      soldValidListings
+    );
+
+
+  const activeMedian =
+    activeFeatures
+      .median;
+
+
+  const soldToActiveMedianRatio =
+    (
+      expectedSalePrice != null &&
+      activeMedian != null &&
+      activeMedian > 0
+    )
+      ? Number(
+          (
+            Number(
+              expectedSalePrice
+            ) /
+            activeMedian
+          ).toFixed(6)
+        )
+      : null;
+
+
+  /*
+    This doesn't discard weak observations.
+    It merely marks which records have a strong
+    enough sold-side target to eventually train on.
+  */
+  const trainingEligible =
+    (
+      soldValidListings
+        .length >= 7 &&
+      expectedSalePrice != null &&
+      validActiveListings
+        .length >= 5
+    );
+
+
+  const canonicalName =
+    getCanonicalNameForItem(
+      target
+    );
+
+
+  const {
+    error
+  } =
+    await supabaseAdmin
+      .from(
+        "ebay_active_training_data"
+      )
+      .insert({
+        analysis_run_id:
+          analysisRunId ||
+          null,
+
+        canonical_name:
+          canonicalName ||
+          null,
+
+        ebay_search_query:
+          String(
+            target
+              ?.ebaySearchQuery ||
+            ""
+          ).trim(),
+
+        condition:
+          String(
+            target
+              ?.condition ||
+            ""
+          ).trim(),
+
+        product_type:
+          String(
+            target
+              ?.productType ||
+            ""
+          ).trim(),
+
+        brand:
+          String(
+            target
+              ?.brand ||
+            ""
+          ).trim(),
+
+        model:
+          String(
+            target
+              ?.model ||
+            ""
+          ).trim(),
+
+        negative_search_terms:
+          normalizeTrainingNegativeTerms(
+            target
+              ?.negativeSearchTerms
+          ),
+
+
+        /*
+          SOLD
+        */
+        sold_valid_count:
+          soldValidListings
+            .length,
+
+        sold_median:
+          soldMedian,
+
+        sold_mean:
+          soldFeatures.mean,
+
+        sold_std_dev:
+          soldStdDev,
+
+        sold_cv:
+          soldFeatures.cv,
+
+        sold_p25:
+          soldFeatures.p25,
+
+        sold_p75:
+          soldFeatures.p75,
+
+        sold_low:
+          soldFeatures.low,
+
+        sold_high:
+          soldFeatures.high,
+
+        expected_sale_price:
+          expectedSalePrice,
+
+
+        /*
+          ACTIVE
+        */
+        active_raw_count:
+          activeSearch
+            .rawCount,
+
+        active_valid_count:
+          validActiveListings
+            .length,
+
+        active_mean:
+          activeFeatures.mean,
+
+        active_median:
+          activeFeatures.median,
+
+        active_p10:
+          activeFeatures.p10,
+
+        active_p20:
+          activeFeatures.p20,
+
+        active_p25:
+          activeFeatures.p25,
+
+        active_p30:
+          activeFeatures.p30,
+
+        active_p40:
+          activeFeatures.p40,
+
+        active_p75:
+          activeFeatures.p75,
+
+        active_p90:
+          activeFeatures.p90,
+
+        active_std_dev:
+          activeFeatures.stdDev,
+
+        active_cv:
+          activeFeatures.cv,
+
+        active_iqr:
+          activeFeatures.iqr,
+
+        active_low:
+          activeFeatures.low,
+
+        active_high:
+          activeFeatures.high,
+
+        active_cheapest_20_median:
+          activeFeatures
+            .cheapest20Median,
+
+        active_cheapest_30_median:
+          activeFeatures
+            .cheapest30Median,
+
+        sold_to_active_median_ratio:
+          soldToActiveMedianRatio,
+
+        training_eligible:
+          trainingEligible,
+
+        active_api_total:
+          activeSearch
+            .apiTotal,
+
+        active_valid_listings:
+          validActiveListings,
+
+        sold_valid_listings:
+          soldValidListings
+      });
+
+
+  if (error) {
+    throw new Error(
+      `Could not save eBay training data: ${
+        error.message ||
+        String(error)
+      }`
+    );
+  }
+
+
+  console.log(
+    "[EBAY TRAINING] Saved:",
+    {
+      canonicalName,
+
+      soldCount:
+        soldValidListings
+          .length,
+
+      soldEstimate:
+        expectedSalePrice,
+
+      activeCount:
+        validActiveListings
+          .length,
+
+      activeMedian:
+        activeFeatures
+          .median,
+
+      ratio:
+        soldToActiveMedianRatio,
+
+      trainingEligible
+    }
+  );
+}
+
 function applyExpectedSalePriceBuffer(medianSoldPrice) {
   const price = Number(medianSoldPrice);
 
@@ -6292,7 +12232,21 @@ async function runAiJsonStep({
   );
 }
 
-async function aiCleanComps({ target, comps }) {
+async function aiCleanComps({
+  target,
+  comps,
+  compMode = "sold"
+}) {
+
+  const isActive =
+  compMode ===
+  "active";
+
+const compLabel =
+  isActive
+    ? "active listings"
+    : "sold listings";
+
   if (!comps.length) {
     return {
       validIndexes: [],
@@ -6300,9 +12254,21 @@ async function aiCleanComps({ target, comps }) {
     };
   }
 
- const compListText = comps.map((comp, index) => {
-  return `${index + 1}. ${comp.title} | $${comp.price} | ${comp.soldDate || "date unknown"}`;
-}).join("\n");
+const compListText =
+  comps
+    .map(
+      (
+        comp,
+        index
+      ) => {
+        return (
+          `${index + 1}. ` +
+          `${comp.title} | ` +
+          `$${comp.price}`
+        );
+      }
+    )
+    .join("\n");
 
 let parsed = await runAiJsonStep({
   step: "eBay comp cleanup",
@@ -6322,7 +12288,7 @@ let parsed = await runAiJsonStep({
             {
               type: "input_text",
 text: `
-You are cleaning eBay sold comps for a reseller.
+You are cleaning eBay ${compLabel} for a reseller.
 
 Target product:
 Brand: ${target.brand || ""}
@@ -6331,7 +12297,7 @@ Product type: ${target.productType || ""}
 Condition: already filtered by eBay search; ignore condition during cleanup.
 Search query: ${target.ebaySearchQuery || ""}
 
-Candidate sold listings:
+Candidate ${compLabel}:
 ${compListText}
 
 Return ONLY raw JSON:
@@ -6514,46 +12480,1080 @@ return {
 };
 }
 
-function makeDealDecision({ expectedSalePrice, facebookPrice, validSoldCount }) {
-  if (!expectedSalePrice || !facebookPrice || !validSoldCount) {
+function makeDealDecision({
+  expectedSalePrice,
+  facebookPrice,
+  validCompCount,
+  valuationLabel =
+    "comp-based resale estimate"
+}) {
+  if (
+    !expectedSalePrice ||
+    !facebookPrice ||
+    !validCompCount
+  ) {
     return {
-      recommendation: "Pass",
-      reason: "Not enough valid data to calculate a deal."
+      recommendation:
+        "Pass",
+
+      reason:
+        "Not enough valid data to calculate a deal."
     };
   }
 
-  const targetProfit = 85;
- const negotiatedPrice15 = Number((facebookPrice * 0.85).toFixed(2));
 
-const marginAtAsk = Number((expectedSalePrice - facebookPrice).toFixed(2));
-const marginAt15 = Number((expectedSalePrice - negotiatedPrice15).toFixed(2));
+  const targetProfit =
+    85;
 
-  if (marginAtAsk >= targetProfit) {
+  const negotiatedPrice15 =
+    Number(
+      (
+        facebookPrice *
+        0.85
+      ).toFixed(
+        2
+      )
+    );
+
+
+  const marginAtAsk =
+    Number(
+      (
+        expectedSalePrice -
+        facebookPrice
+      ).toFixed(
+        2
+      )
+    );
+
+
+  const marginAt15 =
+    Number(
+      (
+        expectedSalePrice -
+        negotiatedPrice15
+      ).toFixed(
+        2
+      )
+    );
+
+
+  if (
+    marginAtAsk >=
+    targetProfit
+  ) {
     return {
-      recommendation: "Buy Now",
-      reason: `Meets target using median sold price: ${validSoldCount} valid sold comps in the last 90 days and $${marginAtAsk} spread at asking price.`
+      recommendation:
+        "Buy Now",
+
+      reason:
+        `Meets target using ${valuationLabel}: ` +
+        `${validCompCount} valid comps and ` +
+        `$${marginAtAsk} spread at asking price.`
     };
   }
 
-  if (marginAt15 >= targetProfit) {
+
+  if (
+    marginAt15 >=
+    targetProfit
+  ) {
     return {
-      recommendation: "Negotiate",
-      reason: `Does not meet target at asking price, but reaches $${marginAt15} spread if bought around 15% below ask.`
+      recommendation:
+        "Negotiate",
+
+      reason:
+        `Using ${valuationLabel}, the listing reaches ` +
+        `$${marginAt15} spread at 15% below ask.`
     };
   }
+
 
   return {
-    recommendation: "Pass",
-    reason: `Using median sold price, this does not meet the $85 spread target.`
+    recommendation:
+      "Pass",
+
+    reason:
+      `Using ${valuationLabel}, this does not meet the $85 spread target.`
   };
 }
 
+/*
+  ============================================================
+  EBAY OFFICIAL API — ACTIVE LISTING TRAINING DATA
+  ============================================================
+*/
+
+const EBAY_CLIENT_ID =
+  String(
+    process.env.EBAY_CLIENT_ID ||
+    ""
+  ).trim();
+
+const EBAY_CLIENT_SECRET =
+  String(
+    process.env.EBAY_CLIENT_SECRET ||
+    ""
+  ).trim();
+
+
+let ebayApplicationToken = null;
+let ebayApplicationTokenExpiresAt = 0;
+
+
+async function getEbayApplicationToken() {
+  /*
+    Re-use the existing token until shortly before
+    expiration instead of requesting one for every search.
+  */
+  if (
+    ebayApplicationToken &&
+    Date.now() <
+      ebayApplicationTokenExpiresAt -
+        60 * 1000
+  ) {
+    return ebayApplicationToken;
+  }
+
+
+  if (
+    !EBAY_CLIENT_ID ||
+    !EBAY_CLIENT_SECRET
+  ) {
+    throw new Error(
+      "Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET."
+    );
+  }
+
+
+  const basicAuth =
+    Buffer
+      .from(
+        `${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`
+      )
+      .toString("base64");
+
+
+  const response =
+    await fetch(
+      "https://api.ebay.com/identity/v1/oauth2/token",
+      {
+        method:
+          "POST",
+
+        headers: {
+          Authorization:
+            `Basic ${basicAuth}`,
+
+          "Content-Type":
+            "application/x-www-form-urlencoded"
+        },
+
+        body:
+          new URLSearchParams({
+            grant_type:
+              "client_credentials",
+
+            scope:
+              "https://api.ebay.com/oauth/api_scope"
+          })
+      }
+    );
+
+
+  const data =
+    await response.json();
+
+
+  if (
+    !response.ok ||
+    !data?.access_token
+  ) {
+    throw new Error(
+      `Could not get eBay application token: ${
+        JSON.stringify(data)
+      }`
+    );
+  }
+
+
+  ebayApplicationToken =
+    data.access_token;
+
+  ebayApplicationTokenExpiresAt =
+    Date.now() +
+    Number(
+      data.expires_in || 7200
+    ) * 1000;
+
+
+  return ebayApplicationToken;
+}
+
+function normalizeConditionForEbayApi(
+  condition
+) {
+  const c =
+    String(
+      condition || ""
+    ).toLowerCase();
+
+
+  if (
+    c.includes(
+      "open box"
+    )
+  ) {
+    return "1500";
+  }
+
+
+  if (
+    c.includes(
+      "new"
+    )
+  ) {
+    return "1000";
+  }
+
+
+  if (
+    c.includes("parts") ||
+    c.includes("repair")
+  ) {
+    return "7000";
+  }
+
+
+  if (
+    c.includes(
+      "used"
+    )
+  ) {
+    return "3000";
+  }
+
+
+  return "3000";
+}
+
+function normalizeTrainingNegativeTerms(
+  terms
+) {
+  if (
+    !Array.isArray(
+      terms
+    )
+  ) {
+    return [];
+  }
+
+
+  return [
+    ...new Set(
+      terms
+        .map(term =>
+          String(
+            term || ""
+          ).trim()
+        )
+        .filter(Boolean)
+    )
+  ];
+}
+
+
+function buildEbayApiTrainingQuery(
+  query,
+  negativeSearchTerms = []
+) {
+  const cleanQuery =
+    String(
+      query || ""
+    ).trim();
+
+
+  const negatives =
+    normalizeTrainingNegativeTerms(
+      negativeSearchTerms
+    )
+      .map(term => {
+        /*
+          Same basic syntax as your browser search.
+        */
+        if (
+          /\s/.test(term)
+        ) {
+          return `-"${term.replaceAll(
+            '"',
+            ""
+          )}"`;
+        }
+
+        return `-${term}`;
+      });
+
+
+  return [
+    cleanQuery,
+    ...negatives
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+async function searchEbayActiveListings({
+  query,
+  condition,
+  negativeSearchTerms = []
+}) {
+  const token =
+    await getEbayApplicationToken();
+
+
+const finalQuery =
+  buildEbayApiTrainingQuery(
+    query,
+    negativeSearchTerms
+  );
+
+
+  const conditionId =
+    normalizeConditionForEbayApi(
+      condition
+    );
+
+
+  const params =
+    new URLSearchParams();
+
+  params.set(
+    "q",
+    finalQuery
+  );
+
+  /*
+    Pull a fairly large sample.
+
+    One search call can return many listings, so there
+    is no reason to train on only 10 results.
+  */
+  params.set(
+    "limit",
+    "100"
+  );
+
+  params.set(
+    "filter",
+    `conditionIds:{${conditionId}}`
+  );
+
+
+  const url =
+    "https://api.ebay.com/buy/browse/v1/item_summary/search?" +
+    params.toString();
+
+
+  console.log(
+    "[EBAY ACTIVE TRAINING] Searching:",
+    {
+      query,
+      finalQuery,
+      condition,
+      conditionId
+    }
+  );
+
+
+  const response =
+    await fetch(
+      url,
+      {
+        headers: {
+          Authorization:
+            `Bearer ${token}`,
+
+          "X-EBAY-C-MARKETPLACE-ID":
+            "EBAY_US"
+        }
+      }
+    );
+
+
+  const data =
+    await response.json();
+
+
+  if (!response.ok) {
+    throw new Error(
+      `eBay Browse API failed ${response.status}: ${
+        JSON.stringify(data)
+      }`
+    );
+  }
+
+
+  const rawItems =
+    Array.isArray(
+      data.itemSummaries
+    )
+      ? data.itemSummaries
+      : [];
+
+
+  const listings =
+    rawItems
+      .map(item => {
+        const price =
+          Number(
+            item?.price?.value
+          );
+
+
+        return {
+          title:
+            String(
+              item?.title ||
+              ""
+            ).trim(),
+
+          price:
+            Number.isFinite(price)
+              ? price
+              : null,
+
+          currency:
+            item?.price?.currency ||
+            "USD",
+
+          condition:
+            item?.condition ||
+            "",
+
+          conditionId:
+            item?.conditionId ||
+            "",
+
+          itemId:
+            item?.itemId ||
+            "",
+
+          url:
+            item?.itemWebUrl ||
+            "",
+
+          buyingOptions:
+            Array.isArray(
+              item?.buyingOptions
+            )
+              ? item.buyingOptions
+              : [],
+
+          seller:
+            item?.seller ||
+            null,
+
+          itemEndDate:
+            item?.itemEndDate ||
+            null
+        };
+      })
+      /*
+        A live auction's current bid is NOT equivalent
+        to an asking/listed price.
+
+        Keep fixed-price and Best Offer inventory.
+      */
+      .filter(item => {
+        const options =
+          new Set(
+            item.buyingOptions
+          );
+
+
+        return (
+          options.has(
+            "FIXED_PRICE"
+          ) ||
+          options.has(
+            "BEST_OFFER"
+          )
+        );
+      })
+      .filter(item =>
+        Number.isFinite(
+          item.price
+        ) &&
+        item.price > 0
+      );
+
+
+  console.log(
+    "[EBAY ACTIVE TRAINING] Results:",
+    {
+      apiTotal:
+        Number(
+          data.total || 0
+        ),
+
+      returned:
+        rawItems.length,
+
+      usablePriceListings:
+        listings.length
+    }
+  );
+
+
+  return {
+    query:
+      finalQuery,
+
+    apiTotal:
+      Number(
+        data.total || 0
+      ),
+
+    rawCount:
+      rawItems.length,
+
+    listings
+  };
+}
+
+app.post(
+  "/evaluate-active-comps",
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const target =
+        req.body?.target ||
+        {};
+
+      /*
+        Same hard identity gate as sold comps.
+      */
+      if (
+        !hasEnoughIdentityForEbaySearch(
+          target
+        )
+      ) {
+        return res.json({
+          ok:
+            true,
+
+          skipped:
+            true,
+
+          source:
+            "active-p15",
+
+          expectedSalePrice:
+            null,
+
+          activeP15:
+            null,
+
+          validActiveCount:
+            0,
+
+          validSoldCount:
+            0,
+
+          medianSoldPrice:
+            null,
+
+          reason:
+            "Product was not identified specifically enough for an eBay search."
+        });
+      }
+
+
+      const facebookPrice =
+        target.facebookPrice;
+
+
+      /*
+        Start with any existing exclusions.
+      */
+      let negativeSearchTerms =
+        normalizeTrainingNegativeTerms(
+          target
+            .negativeSearchTerms ||
+          []
+        );
+
+
+      let activeSearch =
+        null;
+
+      let activeCleanup =
+        null;
+
+      let validActiveListings =
+        [];
+
+
+      /*
+        Maximum two attempts:
+          1. normal query
+          2. pollution-cleaned query
+      */
+      for (
+        let attempt = 0;
+        attempt < 2;
+        attempt += 1
+      ) {
+        activeSearch =
+          await searchEbayActiveListings({
+            query:
+              target
+                .ebaySearchQuery,
+
+            condition:
+              target.condition,
+
+            negativeSearchTerms
+          });
+
+
+        activeCleanup =
+          await aiCleanComps({
+            target,
+
+            comps:
+              activeSearch
+                .listings,
+
+            compMode:
+              "active"
+          });
+
+
+        const validIndexes =
+          Array.isArray(
+            activeCleanup
+              ?.validIndexes
+          )
+            ? activeCleanup
+                .validIndexes
+            : [];
+
+
+        validActiveListings =
+          validIndexes
+            .map(Number)
+            .map(
+              index =>
+                activeSearch
+                  .listings[
+                    index - 1
+                  ]
+            )
+            .filter(Boolean)
+            .filter(
+              listing =>
+                Number.isFinite(
+                  Number(
+                    listing.price
+                  )
+                ) &&
+                Number(
+                  listing.price
+                ) > 0
+            );
+
+
+        const rerunTerms =
+          Array.isArray(
+            activeCleanup
+              ?.searchPollution
+              ?.negativeSearchTerms
+          )
+            ? activeCleanup
+                .searchPollution
+                .negativeSearchTerms
+            : [];
+
+
+        const shouldRerun =
+          attempt === 0 &&
+          activeCleanup
+            ?.searchPollution
+            ?.rerunRecommended ===
+            true &&
+          rerunTerms.length > 0;
+
+
+        if (
+          !shouldRerun
+        ) {
+          break;
+        }
+
+
+        negativeSearchTerms =
+          normalizeTrainingNegativeTerms([
+            ...negativeSearchTerms,
+            ...rerunTerms
+          ]);
+
+
+        console.log(
+          "[ACTIVE EBAY] Rerunning polluted search with exclusions:",
+          negativeSearchTerms
+        );
+      }
+
+
+      const activePrices =
+        validActiveListings
+          .map(
+            listing =>
+              Number(
+                listing.price
+              )
+          )
+          .filter(
+            price =>
+              Number.isFinite(
+                price
+              ) &&
+              price > 0
+          );
+
+
+      const validActiveCount =
+        activePrices.length;
+
+      const minimumValidActiveListings =
+        7;
+
+
+      /*
+        New production estimator.
+
+        Dataset testing showed approximately
+        9.6% MAPE using direct active-market P15.
+      */
+      const activeP15 =
+        percentile(
+          activePrices,
+          15
+        );
+
+
+      const priceStandardDeviation =
+        standardDeviation(
+          activePrices
+        );
+
+
+      if (
+        validActiveCount <
+          minimumValidActiveListings ||
+        activeP15 == null
+      ) {
+        return res.json({
+          source:
+            "active-p15",
+
+          targetProduct:
+            `${target.brand || ""} ${target.model || ""} ${target.productType || ""}`
+              .trim(),
+
+          condition:
+            target.condition,
+
+          facebookPrice,
+
+          validActiveCount,
+
+          validSoldCount:
+            0,
+
+          medianSoldPrice:
+            null,
+
+          activeP15,
+
+          expectedSalePrice:
+            null,
+
+          priceStandardDeviation,
+
+          recommendation:
+            "Pass",
+
+          reason:
+            `Only ${validActiveCount} reliable active eBay comp(s) remained after cleanup. Minimum required is ${minimumValidActiveListings}.`,
+
+          validComps:
+            validActiveListings
+              .slice(
+                0,
+                20
+              ),
+
+          searchPollution:
+            activeCleanup
+              ?.searchPollution ||
+            null,
+
+          negativeSearchTerms
+        });
+      }
+
+
+      /*
+        Direct P15.
+
+        No additional multiplier.
+      */
+      const expectedSalePrice =
+        Number(
+          activeP15.toFixed(
+            2
+          )
+        );
+
+
+      const maxBuyPrice =
+        Number(
+          (
+            expectedSalePrice -
+            85
+          ).toFixed(
+            2
+          )
+        );
+
+
+      const negotiatedPrice15 =
+        facebookPrice
+          ? Number(
+              (
+                facebookPrice *
+                0.85
+              ).toFixed(
+                2
+              )
+            )
+          : null;
+
+
+      const decision =
+        makeDealDecision({
+          expectedSalePrice,
+
+          facebookPrice,
+
+          validCompCount:
+            validActiveCount,
+
+          valuationLabel:
+            "active-listing 15th percentile"
+        });
+
+
+      /*
+        PRODUCTION MODE ONLY reaches this endpoint.
+
+        Save/update this newly learned resale value
+        in the global product database.
+      */
+      await saveProductToDatabase({
+        item:
+          target,
+
+        estimatedResalePrice:
+          expectedSalePrice
+      });
+
+
+      return res.json({
+        source:
+          "active-p15",
+
+        targetProduct:
+          `${target.brand || ""} ${target.model || ""} ${target.productType || ""}`
+            .trim(),
+
+        condition:
+          target.condition,
+
+        facebookPrice,
+
+        validActiveCount,
+
+        /*
+          Compatibility with existing UI/context.
+        */
+        validSoldCount:
+          0,
+
+        medianSoldPrice:
+          null,
+
+        activeP15,
+
+        expectedSalePrice,
+
+        priceStandardDeviation,
+
+        lowPrice:
+          activePrices.length
+            ? Math.min(
+                ...activePrices
+              )
+            : null,
+
+        highPrice:
+          activePrices.length
+            ? Math.max(
+                ...activePrices
+              )
+            : null,
+
+        maxBuyPrice,
+
+        negotiatedPrice15,
+
+        recommendation:
+          decision.recommendation,
+
+        reason:
+          decision.reason,
+
+        validComps:
+          validActiveListings
+            .slice(
+              0,
+              20
+            ),
+
+        searchPollution:
+          activeCleanup
+            ?.searchPollution ||
+          null,
+
+        negativeSearchTerms
+      });
+
+    } catch (error) {
+      console.error(
+        "[ACTIVE EBAY] Evaluation failed:",
+        error
+      );
+
+      return sendServerError(
+        res,
+        error,
+        "Could not evaluate active eBay comps."
+      );
+    }
+  }
+);
+
 app.post("/evaluate-comps", async (req, res) => {
   try {
-    const { target, listings = [] } = req.body;
-    const facebookPrice = target.facebookPrice;
+    const {
+      target,
+      listings = []
+    } = req.body;
 
-    console.log("Received eBay listings:", listings.length);
+
+    /*
+      HARD SAFETY CHECK
+
+      Never evaluate or run downstream eBay logic for
+      a product that lacks a specific identity.
+    */
+    if (
+      !hasEnoughIdentityForEbaySearch(
+        target
+      )
+    ) {
+      console.warn(
+        "[EBAY] Skipping insufficiently identified product:",
+        {
+          productId:
+            target?.productId ||
+            null,
+
+          brand:
+            target?.brand ||
+            null,
+
+          model:
+            target?.model ||
+            null,
+
+          productType:
+            target?.productType ||
+            null
+        }
+      );
+
+
+      return res.json({
+        ok:
+          true,
+
+        skipped:
+          true,
+
+        reason:
+          "Product was not identified specifically enough for an eBay search.",
+
+        expectedSalePrice:
+          null,
+
+        estimatedResaleValue:
+          null,
+
+        median:
+          null,
+
+        priceStandardDeviation:
+          null,
+
+        validSoldCount:
+          0,
+
+        searchPollution: {
+          pollutedByRelatedModels:
+            false,
+
+          validExactModelCount:
+            0,
+
+          relatedWrongModelCount:
+            0,
+
+          rerunRecommended:
+            false,
+
+          negativeSearchTerms:
+            [],
+
+          reason:
+            ""
+        }
+      });
+    }
+
+
+    const facebookPrice =
+      target.facebookPrice;
+
+
+    console.log(
+      "Received eBay listings:",
+      listings.length
+    );
 
     const recentListings = listings
       .filter(item => isWithinLast90Days(item.soldDate))
@@ -6598,6 +13598,124 @@ const lowPrice = prices.length ? Math.min(...prices) : null;
 const highPrice = prices.length ? Math.max(...prices) : null;
     const bestOfferExcludedCount = validComps.length - medianEligibleCount;
     const removedByAiFilter = recentListings.length - validComps.length;
+
+    /*
+  ============================================================
+  ACTIVE EBAY TRAINING COLLECTION
+
+  Only collect/save the FINAL search variant.
+
+  If the sold search is about to be rerun because of
+  related-model pollution, that rerun will come back through
+  /evaluate-comps again with the improved negative terms.
+  ============================================================
+*/
+
+if (
+  !searchPollution
+    .rerunRecommended
+) {
+  try {
+    const activeSearch =
+      await searchEbayActiveListings({
+        query:
+          target
+            .ebaySearchQuery,
+
+        condition:
+          target
+            .condition,
+
+        negativeSearchTerms:
+          target
+            .negativeSearchTerms ||
+          []
+      });
+
+
+    const activeCleanup =
+      await aiCleanComps({
+        target,
+
+        comps:
+          activeSearch
+            .listings,
+
+        compMode:
+          "active"
+      });
+
+
+    const activeValidIndexes =
+      Array.isArray(
+        activeCleanup
+          .validIndexes
+      )
+        ? activeCleanup
+            .validIndexes
+        : [];
+
+
+    const validActiveListings =
+      activeValidIndexes
+        .map(Number)
+        .map(
+          index =>
+            activeSearch
+              .listings[
+                index - 1
+            ]
+        )
+        .filter(Boolean)
+        .filter(
+          listing =>
+            Number.isFinite(
+              Number(
+                listing.price
+              )
+            )
+        );
+
+
+    await saveEbayTrainingData({
+      analysisRunId:
+        String(
+          req.get(
+            "X-Analysis-Run-Id"
+          ) ||
+          ""
+        ).trim(),
+
+      target,
+
+      soldValidListings:
+        medianEligibleComps,
+
+      soldMedian:
+        medianSoldPrice,
+
+      soldStdDev:
+        priceStandardDeviation,
+
+      expectedSalePrice,
+
+      activeSearch,
+
+      validActiveListings
+    });
+
+
+  } catch (error) {
+    /*
+      TRAINING COLLECTION MUST NEVER BREAK
+      THE REAL SCANNER.
+    */
+    console.error(
+      "[EBAY TRAINING] Collection failed:",
+      error
+    );
+  }
+}
 
 if (validSoldCount < minimumRelevantSales90Days) {
  return res.json({
@@ -6651,25 +13769,18 @@ if (validSoldCount < minimumRelevantSales90Days) {
       ? Number((facebookPrice * 0.85).toFixed(2))
       : null;
 
-    const decision = makeDealDecision({
-      expectedSalePrice,
-      facebookPrice,
-      validSoldCount
-    });
+const decision =
+  makeDealDecision({
+    expectedSalePrice,
 
-if (
-  expectedSalePrice != null &&
-  validSoldCount >=
-    minimumRelevantSales90Days
-) {
-  await saveProductToDatabase({
-    item:
-      target,
+    facebookPrice,
 
-    estimatedResalePrice:
-      expectedSalePrice
+    validCompCount:
+      validSoldCount,
+
+    valuationLabel:
+      "median sold price"
   });
-}
 
   res.json({
   targetProduct: `${target.brand || ""} ${target.model || ""} ${target.productType || ""}`.trim(),
@@ -6791,7 +13902,7 @@ function makeLotDecision({
     return {
       recommendation: "Buy Now",
       reason:
-        `Using median sold price, the lot clears the ` +
+        `Using the estimated resale values, the lot clears the ` +
         `$85 target at asking price with a $${profitAtAsk} ` +
         `estimated profit.`,
       scamFlag: false,
@@ -6803,7 +13914,7 @@ function makeLotDecision({
     return {
       recommendation: "Negotiate",
       reason:
-        `Using median sold price, the lot does not clear the ` +
+        `Using the estimated resale values, the lot does not clear the ` +
         `$85 target at asking price, but it reaches a ` +
         `$${profitAt15} estimated profit at 15% below ask.`,
       scamFlag: false,
@@ -6814,7 +13925,7 @@ function makeLotDecision({
   return {
     recommendation: "Pass",
     reason:
-      `Using median sold price, even buying 15% below asking ` +
+      `Using the estimated resale values, even buying 15% below asking ` +
       `price does not clear the $85 target.`,
     scamFlag: false,
     resaleToAskRatio
@@ -6835,28 +13946,64 @@ app.post("/evaluate-lot", async (req, res) => {
 const items = itemResults.map(entry => {
   const item = entry.item || {};
   const result = entry.result || {};
+const median =
+  result.medianSoldPrice;
 
-  const median = result.medianSoldPrice;
-const expectedSalePrice = result.expectedSalePrice ?? null;
-const validSoldCount = result.validSoldCount || 0;
-const minimumRelevantSales90Days = 7;
+const expectedSalePrice =
+  result.expectedSalePrice ??
+  null;
+
+const validSoldCount =
+  Number(
+    result.validSoldCount ||
+    0
+  );
+
+const validActiveCount =
+  Number(
+    result.validActiveCount ||
+    0
+  );
+
+const minimumReliableComps =
+  7;
 
 const fromDatabase =
-  result.source === "database";
+  result.source ===
+  "database";
+
+const fromActiveP15 =
+  result.source ===
+  "active-p15";
+
+const fromSoldComps =
+  !fromDatabase &&
+  !fromActiveP15;
+
 
 const include =
   expectedSalePrice != null &&
   (
     fromDatabase ||
+
     (
+      fromActiveP15 &&
+      validActiveCount >=
+        minimumReliableComps
+    ) ||
+
+    (
+      fromSoldComps &&
       median != null &&
       validSoldCount >=
-        minimumRelevantSales90Days
+        minimumReliableComps
     )
   );
 
   return {
     ...item,
+
+validActiveCount,
 
     result: {
       ...result,
@@ -6876,19 +14023,23 @@ const include =
     priceStandardDeviation: result.priceStandardDeviation ?? null,
 
     validSoldCount,
-   status:
+  status:
   include
     ? fromDatabase
       ? "Included from database"
-      : "Included"
+      : fromActiveP15
+        ? "Included from active P15"
+        : "Included from sold comps"
     : "Excluded",
 
 reason:
   include
     ? fromDatabase
-      ? "Included using stored product database resale value."
-      : "Included as a primary sellable item with valid comps."
-    : "Excluded because no reliable valid comps were found."
+      ? "Included using stored global product resale value."
+      : fromActiveP15
+        ? "Included using the 15th percentile of cleaned active eBay listings."
+        : "Included using valid sold comps."
+    : "Excluded because no reliable resale estimate was available."
   };
 });
 
@@ -8164,6 +15315,10 @@ app.get(
   }
 );
 
+loadLensfunDatabase();
+
 app.listen(3000, () => {
-  console.log("AI comp server running at http://localhost:3000");
+  console.log(
+    "AI comp server running at http://localhost:3000"
+  );
 });

@@ -1,0 +1,840 @@
+{
+  "version": "0.1.20260826",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "0.0205 sec.",
+  "cost": 0.0006,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "08301907-2415-0066-0000-7bec09b7cf1b",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "time": "0.0132 sec.",
+      "cost": 0.0006,
+      "result_count": 1,
+      "path": [
+        "v3",
+        "serp",
+        "google",
+        "search_by_image",
+        "task_get",
+        "advanced",
+        "08301907-2415-0066-0000-7bec09b7cf1b"
+      ],
+      "data": {
+        "api": "serp",
+        "function": "task_get",
+        "se": "google",
+        "se_type": "search_by_image",
+        "image_url": "https://scontent-sjc6-1.xx.fbcdn.net/v/t45.5328-4/715477899_3976700212466918_6698383827568511225_n.jpg?stp=dst-jpg_p720x720_tt6&_nc_cat=108&ccb=1-7&_nc_sid=247b10&_nc_ohc=fh_HDeQW35AQ7kNvwE7m5Xu&_nc_oc=AdrmbL0FdTgWOAo4UF2oTY0L5W8W3wvuSGvV71dAtjnVi09XMafFat3hOMuyJMoo1Js&_nc_zt=23&_nc_ht=scontent-sjc6-1.xx&_nc_gid=Qc3kIIKMgVEvbRTOYlU3sg&_nc_ss=7b2a8&oh=00_AQLxjT2JOPM487K6q7miIIgdQdXgjQQE8yHLRUV5tKXIIQ&oe=6A9A3C05",
+        "location_code": 2840,
+        "language_code": "en",
+        "priority": 1,
+        "device": "desktop",
+        "os": "windows"
+      },
+      "result": [
+        {
+          "image_url": "https://scontent-sjc6-1.xx.fbcdn.net/v/t45.5328-4/715477899_3976700212466918_6698383827568511225_n.jpg?stp=dst-jpg_p720x720_tt6&_nc_cat=108&ccb=1-7&_nc_sid=247b10&_nc_ohc=fh_HDeQW35AQ7kNvwE7m5Xu&_nc_oc=AdrmbL0FdTgWOAo4UF2oTY0L5W8W3wvuSGvV71dAtjnVi09XMafFat3hOMuyJMoo1Js&_nc_zt=23&_nc_ht=scontent-sjc6-1.xx&_nc_gid=Qc3kIIKMgVEvbRTOYlU3sg&_nc_ss=7b2a8&oh=00_AQLxjT2JOPM487K6q7miIIgdQdXgjQQE8yHLRUV5tKXIIQ&oe=6A9A3C05",
+          "keyword": null,
+          "type": "search_by_image",
+          "se_domain": "lens.google.com",
+          "location_code": 2840,
+          "language_code": "en",
+          "check_url": "https://lens.google.com/uploadbyurl?url=https%3A%2F%2Fscontent-sjc6-1.xx.fbcdn.net%2Fv%2Ft45.5328-4%2F715477899_3976700212466918_6698383827568511225_n.jpg%3Fstp%3Ddst-jpg_p720x720_tt6%26_nc_cat%3D108%26ccb%3D1-7%26_nc_sid%3D247b10%26_nc_ohc%3Dfh_HDeQW35AQ7kNvwE7m5Xu%26_nc_oc%3DAdrmbL0FdTgWOAo4UF2oTY0L5W8W3wvuSGvV71dAtjnVi09XMafFat3hOMuyJMoo1Js%26_nc_zt%3D23%26_nc_ht%3Dscontent-sjc6-1.xx%26_nc_gid%3DQc3kIIKMgVEvbRTOYlU3sg%26_nc_ss%3D7b2a8%26oh%3D00_AQLxjT2JOPM487K6q7miIIgdQdXgjQQE8yHLRUV5tKXIIQ%26oe%3D6A9A3C05&hl=en&gl=US&ie=UTF-8&oe=UTF-8&uule=w+CAIQIFISCQs2MuSEtepUEUK33kOSuTsc&ep=gisbubu",
+          "datetime": "2026-08-30 19:07:23 +00:00",
+          "spell": null,
+          "refinement_chips": null,
+          "item_types": [
+            "images",
+            "organic"
+          ],
+          "se_results_count": 159000,
+          "items_count": 10,
+          "items": [
+            {
+              "type": "images",
+              "rank_group": 1,
+              "rank_absolute": 1,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[2]/div[1]",
+              "title": "Visual matches",
+              "url": null,
+              "items": [
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:0"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:1"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:2"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:3"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:4"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:5"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:6"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:7"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:8"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:9"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://api.dataforseo.com/cdn/i/08301907-2415-0066-0000-7bec09b7cf1b:10"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcQD13QJNSdEnsgM7FWrygbSb55ircIpujFiqWDCohXKABIu2X6R"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTPizcQ8bXRO1FIKhkrHB7Upg97Yj3l2AWHfSLo57fcV4LvQRBM"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSFgbnk8x2G_rQ62XxRua6WmKABuweW9OpJrA_xyHWoaqPQYYla"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQSNAlYOZ5Y6MMgEDMBiDDY1A4SMboMy59ovJIz9WElh_0A-imd"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcQrCGkc2KBiFV2BT9bY1OGot9P4Yc4ETCYVrCkWuUIBDe4pn8ji"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcT43bpD_JzF47KFsDTtHKBBDZOdpAo4yZk6cyxPoDBQPiDoXChC"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcQdwcT8wUPFj-3uVHp3DgQHzggneAE_kYOJOQ6YrzS_PdizbW_F"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcS5G_Un6QhbNCoB3VbjvvytQ7sYbCdZ5xiRMqfBMAIgwgLKzNGi"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcRRhTrUyJ55FDq-OSNH3WXv4n3vNTVyvcRs9NDqhXM0El1CwWW8"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcRXq8La-WAUmiq4SwDz8Eg9bj7288_OAkoeZti8rZxGjtwwOmTQ"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcTwnxsqZVrAXSayHTnSncNno613b2uhj8NqenpCpuGaa7efLk5b"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ9GEifU_2-WYUWChq_sNg0aQF45vMorFpdovjZ4SqwJrdemxLR"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcR5fy1FftreW1DE2hUbK0woEFw9wX2vPtRkxj8pAMHnlM_6niag"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQXRXjVgl-pkY2Xfnfuizv_T9cZjjQxxBkVyYz4Rrk_4W48a8-4"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcTo__vUGV_He95WwyH_2IJhz_abcBh4lnrFI3zgAY_9oK-3SwOX"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcR72z89_8KjH9PkKAVgaRMSIoeQlEDYhYnpw0fR_qvtVf6NCHST"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcT6MI-8PzM1EEjKUCgiP6Yp19Dsui9MlLkCfcE63PuN6goqnaiG"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcSUMSBhHWg76yRn199SLCUCzRphVksSaIHRFn0PbiExW2XDtBut"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcRPSWh3kcGWPk14G_esK-Rj3meFGh0CoVaKC5DQesj-1pD4CHda"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcSwbhOUBvYZoTm21dQWyg-XIC5gjZIdcNtYIjZPIGfrjlaa76bx"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcT8pM1KxqnaNubzFf8X-UPTXnwRye2EJc07fuknUe52ZSAznt4m"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcThZ99Wo8HxsAh2WkudGwPlRc4ReIQYqbUgkBvm497Mj3CZWBiN"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQQ75LLyQhYYkso03i6HgMVM3kSgXaABAjFbMIUlgfKMHxlTYH0"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcS-svAyA7qxTnyjc1vMYLIv9jA2hZjn0vVIttbwjpoz6CAkaevz"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcQcrQam-ZqqRITkyFqQwIX2SRgwmDRYHZaPkzVeFEgYkGi3letL"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcSVCtgRGiJdIWfDIUr5pVllxkuzBsvGLOulQeWDIu6mDROL2uzu"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQa9UeYV1xQpa1mKKFXD_xKN0YEBae4oUvF9UA1rT9-k3MWSRiA"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcQMKCEtTBs3ErRSystCQs4RN_LEB-6sDM3cyRyd8lTI1O70XUrW"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcSfrdvBlmC0MgcIIEpv6fYYiFnHi0fDx25nUOamqlyCKIusfVYV"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcRJ4UXRU2QpZbezqDrBbMRm3weAEhgO20dtxHjvRos1xsSylcnF"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcTJamiS5avFsPxsIJ3eYG4kEt6AdCoqYjvIaV8kYUWn4LFx9s7D"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcSZQ8IH-8XeU5P_8P-FAvZey9hevkFZE_L9_s1EbjfRWY4WIcIW"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcTdTkSNNcjJFfc8UgV_UIwgXfhUWfw5fYWJxldtAHv-iYGSY-89"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcRmVFS428Nu-U8VaCQLWxwV7R0ksqRnM94ptWvBuTnLq8ZZWRrJ"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcR46BDzoF5nh5iNC9PZQU6ZTqGL4aAIV5J9i3F9FDkFth5zQHLD"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcTQ5dI4YSSdqNUCh_L3ceL_exuXwg9mMysdMmJVEQMTpIOBAxqz"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcSXXpV6FLqfP6onQonSCGAkX261mWCFMiaUmkq-T4yuzNWg-Dyg"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQGl3J1j-TUefodaswOhdM6SeXt1PzWXPgjNMG5kiGgznY-GY_i"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcQLvIQ3TL9ylFgxQxypmqJuXsPWfighFKj_ys34ng30xC895DZu"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcS5tbB-N3S1UReMugKgMH7T9lL8znqIbTsR9-rkCy0a104pvuDk"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcTsi5YZWzLQ-Mts_-dztQizQjFEWaRSyR4dHBq5WDoVoxW8Cjym"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcRkFjCkYOT-ZfYnbXGQJVrrjSWydcWf5USAb-cYFwmz0hvdc0hO"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcSFvhO8jeyIsMYjxEhj_fbuwvlHs03877299KNffglsVRcB32UD"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn1.gstatic.com/images?q=tbn:ANd9GcQzSavlKq9xXbyMdRaHT4HmKHeMZvfBQxGubv3x1_Yfp39hhgmq"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcSjEkMjvXtg28P7R7THh5iuS_V0fLRL0C1IckiiSJvoexz4B1ET"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcQD6soEiy9pwSD9W548K-wTtjSwsAzLmEc_MmkERutMt7Qrqrnv"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcRqmbts-L98ZCXIiwMXl6tMVAF3qqHgcQ6GeYj6Bu_Vu1WENu4X"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn2.gstatic.com/images?q=tbn:ANd9GcS-W8kvg7QuM-AUYSPp56uTst5mJPOJbq9Uxq1stt1yEQwadNB8"
+                }
+              ],
+              "related_image_searches": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 1,
+              "rank_absolute": 2,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[4]/div[1]",
+              "domain": "www.ebay.com",
+              "title": "Canon EOS Rebel T7 24.1 MP DSLR Camera",
+              "url": "https://www.ebay.com/itm/157840580115",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://www.ebay.com › itm",
+              "website_name": "eBay",
+              "is_image": true,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": [
+                "is_image"
+              ],
+              "description": "Black Canon EOS Rebel T7 with 24.1 MP, USB charging port, and control buttons. Black Canon EOS Rebel T7 DSLR body with 24.1 MP, shown with green 7.0Ah. Read more",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": [
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQqia4Me0Bd9qvKrrwicDBwab_iXqTAFqERjCySrCDiKZV9-fygaA8P&usqp=CAE&s"
+                }
+              ],
+              "amp_version": false,
+              "rating": {
+                "rating_type": "Max5",
+                "value": 4.9,
+                "votes_count": 8,
+                "rating_max": 5
+              },
+              "price": {
+                "current": 194.99,
+                "regular": null,
+                "max_value": null,
+                "currency": "USD",
+                "is_price_range": false,
+                "displayed_price": "$194.99"
+              },
+              "highlighted": [
+                "Black Canon EOS Rebel T7 with 24.1 MP"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 2,
+              "rank_absolute": 3,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[6]/div[1]",
+              "domain": "www.amazon.com",
+              "title": "Canon EOS Rebel T100 / 4000D DSLR Camera (w",
+              "url": "https://www.amazon.com/clp/B07PDJ3Y4N",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://www.amazon.com › clp",
+              "website_name": "Amazon.com",
+              "is_image": true,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": [
+                "is_image"
+              ],
+              "description": "Canon EOS 4000D / Rebel T100 DSLR Camera. Compact Systems Camera with 3.0-Inch LCD and EF- 18 MP CMOS Digital SLR Camera Body Only",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": [
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSfRuKk0aiPb_sigYDXC61FgrS81pf1l0cUfmMBxoE&usqp=CAE&s"
+                }
+              ],
+              "amp_version": false,
+              "rating": null,
+              "price": null,
+              "highlighted": [
+                "Canon EOS 4000D / Rebel T100 DSLR Camera"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 3,
+              "rank_absolute": 4,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[8]/div[1]",
+              "domain": "www.ebay.com",
+              "title": "Canon EOS Rebel T6 18.1MP Digital SLR Camera With 18 ...",
+              "url": "https://www.ebay.com/itm/168620871884",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://www.ebay.com › ... › Digital Cameras",
+              "website_name": "eBay",
+              "is_image": false,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": null,
+              "description": "GOOD CONDITION. USED CANON REBEL T6 CAMERA FOR SALE! -Item HAS NO RESERVE! -Save HUGE today!!!",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": null,
+              "amp_version": false,
+              "rating": null,
+              "price": null,
+              "highlighted": [
+                "USED CANON REBEL T6 CAMERA FOR SALE"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 4,
+              "rank_absolute": 5,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[10]/div[1]",
+              "domain": "www.tudorwatch.com",
+              "title": "TUDOR Watch Official Website | Swiss Luxury Watches since ...",
+              "url": "https://www.tudorwatch.com/en",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://www.tudorwatch.com › ...",
+              "website_name": "tudorwatch",
+              "is_image": false,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": null,
+              "description": "TUDOR Watches are rooted in exploration and innovation. Our philosophy extends beyond traditional watchmaking to embrace innovative technology, pioneering ... Read more",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": null,
+              "amp_version": false,
+              "rating": null,
+              "price": null,
+              "highlighted": [
+                "TUDOR Watches are rooted in exploration and innovation"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 5,
+              "rank_absolute": 6,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[12]/div[1]",
+              "domain": "www.amazon.com",
+              "title": "Canon EOS Rebel T6i Digital SLR with EF-S 18-55mm is ...",
+              "url": "https://www.amazon.com/clp/B00T3ER7QO",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://www.amazon.com › clp",
+              "website_name": "Amazon.com",
+              "is_image": true,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": [
+                "is_image"
+              ],
+              "description": "24.1MP Beginner Digital Camera Kit with Sandisk 128GB Memory Card, Camera Bag & Deco Essentials Photography",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": [
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ7-dn5SJhQm2bvi7ZHQ1lMY9-kq2Wqru1t2pm_vmOLowMCTFg697X3yPdSodpH_3D18HIr&s"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQiq2DMlt-5W1lbgUiM4hIT9wuM97eK9soIgmiOoTFm19YHFwjGvECumQ&s"
+                },
+                {
+                  "type": "images_element",
+                  "alt": null,
+                  "url": null,
+                  "image_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcR60Mnr4HtKVq4dLh1WSz3708h3YgqjY8vhRuOFex8RS-34YWq4ecczMw&s"
+                }
+              ],
+              "amp_version": false,
+              "rating": null,
+              "price": null,
+              "highlighted": [
+                "24.1MP Beginner Digital Camera Kit"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 6,
+              "rank_absolute": 7,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[14]/div[1]",
+              "domain": "mehlvillemedia.com",
+              "title": "Canon EOS Rebel T6: A Great Entry-Level Camera",
+              "url": "https://mehlvillemedia.com/14134/showcase/canon-eos-rebel-t6-a-great-entry-level-camera/",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://mehlvillemedia.com › showcase › canon-eos-rebel...",
+              "website_name": "Mehlville Media",
+              "is_image": false,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": null,
+              "description": "Mar 1, 2024 — Like the Canon Rebel T5 before it, the Canon T6 is a popular DSLR camera. Having been created as an beginner friendly photography camera, ...",
+              "pre_snippet": "03/01/2024 00:00:00",
+              "extended_snippet": null,
+              "images": null,
+              "amp_version": false,
+              "rating": null,
+              "price": null,
+              "highlighted": [
+                "Canon T6 is a popular DSLR camera"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": "2024-03-01 00:00:00 +00:00",
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 7,
+              "rank_absolute": 8,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[16]/div[1]",
+              "domain": "business.walmart.com",
+              "title": "Canon EOS Rebel T100 DSLR Camera EF-S 18-55mm ...",
+              "url": "https://business.walmart.com/ip/Canon-EOS-Rebel-T100-Digital-SLR-Camera-with-18-55mm-Lens-Kit-18-Megapixel-Sensor-Wi-Fi-DIGIC4-SanDisk-32GB-Memory-Card-and-Live-View-Shooting/771229626",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://business.walmart.com › ...",
+              "website_name": "Walmart Business",
+              "is_image": false,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": null,
+              "description": "18 Megapixel CMOS (APS-C) Sensor, Full HD Videos, Built-in Wi-Fi, Beginner Photographers, Digital Camera, Black … great for a beginner and extremely easy to ...",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": null,
+              "amp_version": false,
+              "rating": {
+                "rating_type": "Max5",
+                "value": 4.4,
+                "votes_count": 727,
+                "rating_max": 5
+              },
+              "price": {
+                "current": 448.86,
+                "regular": null,
+                "max_value": null,
+                "currency": "USD",
+                "is_price_range": false,
+                "displayed_price": "$448.86"
+              },
+              "highlighted": [
+                "18 Megapixel CMOS (APS-C) Sensor"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 8,
+              "rank_absolute": 9,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[18]/div[1]",
+              "domain": "www.thenorthface.com",
+              "title": "The North Face",
+              "url": "https://www.thenorthface.com/en-ca",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://www.thenorthface.com › en-ca",
+              "website_name": "The North Face",
+              "is_image": false,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": null,
+              "description": "Since 1966, The North Face has been a leader in outdoor performance clothing & gear for hiking, skiing, trail running, camping, and other adventures.",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": null,
+              "amp_version": false,
+              "rating": null,
+              "price": null,
+              "highlighted": null,
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            },
+            {
+              "type": "organic",
+              "rank_group": 9,
+              "rank_absolute": 10,
+              "page": 1,
+              "position": "left",
+              "xpath": "/html[1]/body[1]/div[3]/div[1]/div[12]/div[2]/div[1]/div[2]/div[1]/div[1]/div[20]/div[1]",
+              "domain": "us.louisvuitton.com",
+              "title": "Nano Speedy in Monogram",
+              "url": "https://us.louisvuitton.com/eng-us/products/nano-speedy-monogram-nvprod3430078v/M81085",
+              "cache_url": null,
+              "related_search_url": null,
+              "breadcrumb": "https://us.louisvuitton.com › home page › View All",
+              "website_name": "Louis Vuitton",
+              "is_image": false,
+              "is_video": false,
+              "is_featured_snippet": false,
+              "is_malicious": false,
+              "is_web_story": false,
+              "checks": null,
+              "description": "The Nano Speedy revamped in Monogram canvas is the perfect miniature version of Louis Vuitton's iconic Speedy bag, and the ideal way to carry essentials. This ... Read more",
+              "pre_snippet": null,
+              "extended_snippet": null,
+              "images": null,
+              "amp_version": false,
+              "rating": null,
+              "price": {
+                "current": 1960,
+                "regular": null,
+                "max_value": null,
+                "currency": "USD",
+                "is_price_range": false,
+                "displayed_price": "$1,960.00"
+              },
+              "highlighted": [
+                "miniature version of Louis Vuitton's iconic Speedy bag"
+              ],
+              "links": null,
+              "faq": null,
+              "extended_people_also_search": null,
+              "about_this_result": null,
+              "related_result": null,
+              "timestamp": null,
+              "rectangle": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

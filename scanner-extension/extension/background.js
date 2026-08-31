@@ -1926,164 +1926,286 @@ async function extractAiOverview() {
   const timeoutMs =
     45000;
 
+  const startMarker =
+    "AI Overview";
+
+  const endMarker =
+    "AI can make mistakes, so double-check responses";
+
+
   while (
     Date.now() - startedAt <
     timeoutMs
   ) {
-    const fullPageText =
-      String(
-        document.body?.innerText ||
-        ""
-      );
+    /*
+      ========================================
+      STEP 1
+      PHYSICALLY SELECT THE ENTIRE PAGE
+      ========================================
 
-    const lowerPageText =
-      fullPageText.toLowerCase();
+      This intentionally reproduces the old
+      visible Ctrl+A-style highlighting.
+    */
+    const selection =
+      window.getSelection();
+
+    if (!selection) {
+      await sleep(500);
+      continue;
+    }
+
+    selection.removeAllRanges();
+
+    const range =
+      document.createRange();
+
+    range.selectNodeContents(
+      document.body
+    );
+
+    selection.addRange(
+      range
+    );
+
 
     /*
-      Detect Google verification / blocking pages.
+      ========================================
+      STEP 2
+      PHYSICALLY COPY THE SELECTION
+      ========================================
+
+      This is the old-style browser copy path.
+
+      We still use selection.toString() as the
+      actual text source afterward so we do not
+      depend on clipboard-read permissions.
     */
+    let copiedSuccessfully =
+      false;
+
+    try {
+      copiedSuccessfully =
+        document.execCommand(
+          "copy"
+        );
+    } catch (error) {
+      copiedSuccessfully =
+        false;
+    }
+
+
+    /*
+      The selected text is effectively the same
+      page text that was copied to the clipboard.
+    */
+    const copiedPageText =
+      String(
+        selection.toString() ||
+        ""
+      ).trim();
+
+
+    console.log(
+      "[GOOGLE PAGE COPY]",
+      {
+        copiedSuccessfully,
+        copiedTextLength:
+          copiedPageText.length
+      }
+    );
+
+
+    if (!copiedPageText) {
+      await sleep(500);
+      continue;
+    }
+
+
+    /*
+      Detect Google's challenge pages before
+      attempting extraction.
+    */
+    const lowerText =
+      copiedPageText
+        .toLowerCase();
+
     if (
-      lowerPageText.includes(
+      lowerText.includes(
         "our systems have detected unusual traffic"
       ) ||
-      lowerPageText.includes(
+      lowerText.includes(
         "i'm not a robot"
       ) ||
-      lowerPageText.includes(
+      lowerText.includes(
         "verify you're human"
       ) ||
-      lowerPageText.includes(
+      lowerText.includes(
         "verify you are human"
       )
     ) {
+      selection.removeAllRanges();
+
       return {
-        found: false,
+        found:
+          false,
+
         code:
           "GOOGLE_CHALLENGE",
+
         text:
           "Google displayed a human-verification or unusual-traffic page."
       };
     }
 
+
     /*
-      We deliberately scrape the ENTIRE visible page.
-
-      Then we snip out only the text between:
-
-        AI Overview
-
-      and:
-
-        AI responses may include mistakes.
+      ========================================
+      STEP 3
+      CUT EVERYTHING ABOVE AI OVERVIEW
+      ========================================
     */
-    const startMarker =
-      "AI Overview";
-
-    const endMarker =
-      "AI responses may include mistakes.";
-
     const startIndex =
-      fullPageText.indexOf(
+      copiedPageText.indexOf(
         startMarker
       );
 
     if (
-      startIndex !== -1
+      startIndex === -1
     ) {
-      const answerStart =
-        startIndex +
-        startMarker.length;
-
-      const endIndex =
-        fullPageText.indexOf(
-          endMarker,
-          answerStart
-        );
-
       /*
-        Only accept the answer once Google's normal
-        end marker has appeared.
+        AI Overview has not appeared yet.
 
-        This also prevents us from grabbing the AI
-        response while it is still being generated.
+        Leave the selection visible briefly,
+        then retry.
       */
-      if (
-        endIndex !== -1
-      ) {
-        const extractedText =
-          fullPageText
-            .slice(
-              answerStart,
-              endIndex
-            )
-            .trim();
-
-        console.log(
-          "[GOOGLE FULL PAGE EXTRACTION] Full page text length:",
-          fullPageText.length
-        );
-
-        console.log(
-          "[GOOGLE FULL PAGE EXTRACTION] Extracted AI text:",
-          extractedText
-        );
-
-        if (
-          extractedText
-        ) {
-          return {
-            found: true,
-            code:
-              "GOOGLE_AI_TEXT_EXTRACTED",
-            text:
-              extractedText
-          };
-        }
-      }
+      await sleep(500);
+      continue;
     }
 
-    await sleep(
-      500
+
+    const answerStart =
+      startIndex +
+      startMarker.length;
+
+
+    /*
+      ========================================
+      STEP 4
+      CUT EVERYTHING BELOW GOOGLE'S AI FOOTER
+      ========================================
+    */
+    const endIndex =
+      copiedPageText.indexOf(
+        endMarker,
+        answerStart
+      );
+
+
+    /*
+      Do NOT accept the answer until this marker
+      appears.
+
+      Its appearance is also a useful indication
+      that Google's AI response has finished.
+    */
+    if (
+      endIndex === -1
+    ) {
+      await sleep(500);
+      continue;
+    }
+
+
+    /*
+      ========================================
+      STEP 5
+      KEEP ONLY THE AI ANSWER
+      ========================================
+    */
+    let extractedText =
+      copiedPageText
+        .slice(
+          answerStart,
+          endIndex
+        )
+        .trim();
+
+
+    /*
+      Remove excessive blank lines while
+      preserving one-model-per-line output.
+    */
+    extractedText =
+      extractedText
+        .split("\n")
+        .map(
+          line =>
+            line.trim()
+        )
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+
+
+    console.log(
+      "[GOOGLE PAGE COPY] Extracted AI answer:"
     );
+
+    console.log(
+      extractedText
+    );
+
+
+    if (
+      extractedText
+    ) {
+      /*
+        Clear the visible selection only after
+        extraction succeeded.
+
+        If you WANT to visually keep the page
+        highlighted until the tab closes, delete
+        this removeAllRanges() call.
+      */
+      selection.removeAllRanges();
+
+      return {
+        found:
+          true,
+
+        code:
+          "GOOGLE_AI_TEXT_COPIED",
+
+        text:
+          extractedText
+      };
+    }
+
+
+    await sleep(500);
   }
 
+
   /*
-    Diagnostic information if extraction fails.
+    Timed out without finding a complete
+    AI Overview response.
   */
-  const finalPageText =
-    String(
-      document.body?.innerText ||
-      ""
-    );
+  try {
+    window
+      .getSelection()
+      ?.removeAllRanges();
+  } catch (error) {
+    // Non-fatal.
+  }
 
-  console.warn(
-    "[GOOGLE FULL PAGE EXTRACTION] Timed out.",
-    {
-      pageTextLength:
-        finalPageText.length,
-
-      hasAiOverview:
-        finalPageText.includes(
-          "AI Overview"
-        ),
-
-      hasEndMarker:
-        finalPageText.includes(
-          "AI responses may include mistakes."
-        ),
-
-      first2000Characters:
-        finalPageText.slice(
-          0,
-          2000
-        )
-    }
-  );
 
   return {
-    found: false,
+    found:
+      false,
+
     code:
       "GOOGLE_AI_RESULT_TIMEOUT",
+
     text:
       ""
   };
@@ -2279,254 +2401,158 @@ async function processSingleImage({
   imageUrl,
   imageIndex,
   totalImages,
-  promptText = GOOGLE_LENS_PROMPT
+  promptText = GOOGLE_LENS_PROMPT,
+  cropObjectPath = ""
 }) {
   console.log(
-    `[GOOGLE LENS TEST] Processing image ${imageIndex}/${totalImages}`
+    `[DATAFORSEO] Processing image ${imageIndex}/${totalImages}`
+  );
+
+
+  const response =
+    await fetch(
+      `${MARKETPLACE_CONVERSATION_SERVER}/dataforseo-identify-image`,
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+     body:
+  JSON.stringify({
+    imageUrl,
+    promptText,
+
+    cropObjectPath:
+      String(
+        cropObjectPath ||
+        ""
+      ).trim()
+  })
+      }
+    );
+
+
+  let data;
+
+
+  try {
+    data =
+      await response.json();
+
+  } catch (error) {
+    throw new Error(
+      "DataForSEO server returned malformed JSON."
+    );
+  }
+
+
+  if (
+    !response.ok ||
+    data?.ok !== true
+  ) {
+    throw new Error(
+      data?.error ||
+      "DataForSEO image identification failed."
+    );
+  }
+
+
+  console.log(
+    "[DATAFORSEO] Clean identification:",
+    {
+      imageIndex,
+
+      found:
+        data.found,
+
+      identification:
+        data.identification,
+
+      confidence:
+        data
+          ?.cleanedEvidence
+          ?.confidence,
+
+      consensus:
+        data
+          ?.cleanedEvidence
+          ?.consensus,
+
+      taskId:
+        data.dataForSeoTaskId,
+
+      cost:
+        data.dataForSeoCost
+    }
   );
 
 
   /*
-    Open a NORMAL ACTIVE tab.
+    IMPORTANT:
 
-    The user will actually see Google.
+    Preserve the SAME basic response shape
+    the existing Google-browser pipeline
+    returned.
+
+    The rest of background.js can continue
+    operating normally.
   */
-  const googleTab =
-    await chrome.tabs.create({
-      url:
-        "https://www.google.com/search?udm=49&udf=257",
-
-      active: true
-    });
-
-
-  if (!googleTab?.id) {
-    throw new Error(
-      "Could not create Google tab."
-    );
-  }
-
-
-let tabId =
-  googleTab.id;
-
-
-  try {
-    /*
-      -------------------------
-      STEP 1 — IMAGE SEARCH
-      -------------------------
-    */
-   
-const initialTab =
-  await waitForTabComplete(
-    tabId,
-    30000
-  );
-
-await sleep(750);
-
-const initialGoogleUrl =
-  String(
-    initialTab?.url || ""
-  ).trim();
-
-
-const isDataUrl =
-  String(
-    imageUrl || ""
-  ).startsWith(
-    "data:image/"
-  );
-
-console.log(
-  isDataUrl
-    ? `[GOOGLE LENS TEST] Image ${imageIndex}: uploading screenshot.`
-    : `[GOOGLE LENS TEST] Image ${imageIndex}: submitting image URL.`
-);
-
-
-await chrome.scripting
-  .executeScript({
-    target: {
-      tabId
-    },
-
-    func:
-      isDataUrl
-        ? submitDataUrlImageToGoogle
-        : submitImageToGoogle,
-
-    args: [
-      imageUrl
-    ]
-  });
-
-
-/*
-  Do NOT proceed merely because Chrome says
-  the tab is complete.
-
-  Wait until Google has actually generated
-  a Lens image-search session.
-*/
-const lensSessionUrl =
-  await waitForGoogleLensImageSession(
-    tabId,
-    initialGoogleUrl,
-    35000
-  );
-
-console.log(
-  `[GOOGLE LENS TEST] Image ${imageIndex}: Lens image session ready:`,
-  lensSessionUrl
-);
-
-
-/*
-  -------------------------
-  STEP 2 — TEXT QUERY
-  -------------------------
-*/
-console.log(
-  `[GOOGLE LENS TEST] Image ${imageIndex}: navigating existing Lens tab to text-query URL.`
-);
-
-
-/*
-  Convert the existing image-only Lens session
-  into the final image + text query in the SAME tab.
-*/
-const multimodalUrl =
-  await navigateLensWithTextPrompt(
-    tabId,
-    promptText
-  );
-
-
-console.log(
-  "[GOOGLE LENS TEST] Existing tab navigated to multimodal result:",
-  {
+  return {
     imageIndex,
-    tabId,
-    multimodalUrl
-  }
-);
 
+    imageUrl,
 
-/*
-  Small rendering grace period.
+    prompt:
+      promptText,
 
+    aiOverviewFound:
+      data.found === true,
 
-/*
-  Small rendering grace period.
+    aiOverviewText:
+      data.found === true
+        ? String(
+            data.identification ||
+            ""
+          ).trim()
+        : "UNKNOWN",
 
-  The document may be loaded before Google has
-  rendered the AI Overview contents.
-*/
-await sleep(
-  1500
-);
+    aiOverviewErrorCode:
+      data.found === true
+        ? ""
+        : "DATAFORSEO_NO_CONFIDENT_IDENTIFICATION",
 
     /*
-      -------------------------
-      STEP 3 — EXTRACT AI
-      -------------------------
+      New additional evidence.
+
+      We will preserve this in the result object
+      for Step 5.
     */
-    console.log(
-      `[GOOGLE LENS TEST] Image ${imageIndex}: waiting for AI Overview.`
-    );
+    dataForSeoEvidence:
+      data.cleanedEvidence ||
+      null,
 
+    dataForSeoTaskId:
+      String(
+        data.dataForSeoTaskId ||
+        ""
+      ),
 
-    const extraction =
-      await chrome.scripting
-        .executeScript({
-          target: {
-            tabId
-          },
+    dataForSeoCost:
+      Number(
+        data.dataForSeoCost ||
+        0
+      ),
 
-          func:
-            extractAiOverview
-        });
-
-
-    const extractedResult =
-      extraction?.[0]?.result ||
-      {
-        found: false,
-        text:
-          "No extraction result returned."
-      };
-
-
-    console.log(
-      `[GOOGLE LENS TEST] Image ${imageIndex} AI Overview:`
-    );
-
-
-    console.log(
-      extractedResult.text
-    );
-
-
-    return {
-      imageIndex,
-
-      imageUrl,
-
- prompt:
-  promptText,
-
-      aiOverviewFound:
-        extractedResult.found ===
-        true,
-
-aiOverviewText:
-  cleanGoogleLensAiText(
-    extractedResult.text
-  ),
-
-aiOverviewErrorCode:
-  String(
-    extractedResult.code ||
-    ""
-  ),
-
-      completedAt:
-        new Date()
-          .toISOString()
-    };
-
-  } finally {
-    /*
-      Close this Lens tab no matter whether
-      extraction succeeds or fails.
-
-      Short pause lets you visually see the
-      completed result before Chrome closes it.
-    */
-    await sleep(
-      1200
-    );
-
-
-    try {
-      await chrome.tabs.remove(
-        tabId
-      );
-
-      console.log(
-        `[GOOGLE LENS TEST] Closed Google tab for image ${imageIndex}.`
-      );
-
-    } catch (error) {
-      console.warn(
-        "[GOOGLE LENS TEST] Could not close Google tab:",
-        error
-      );
-    }
-  }
+    completedAt:
+      new Date()
+        .toISOString()
+  };
 }
+
 
 chrome.runtime.onMessage.addListener(
   (
@@ -2724,10 +2750,159 @@ chrome.runtime.onMessage.addListener(
       return true;
     }
 
-    if (
-      message.type ===
-      "CLOSE_MARKETPLACE_AUTO_EBAY_TABS"
-    ) {
+   if (
+  message.type ===
+  "OPEN_MARKETPLACE_LISTING_TAB"
+) {
+  const url =
+    String(
+      message.url ||
+      ""
+    ).trim();
+
+  if (
+    !/^https:\/\/www\.facebook\.com\/marketplace\/item\//i.test(
+      url
+    )
+  ) {
+    sendResponse({
+      ok:
+        false,
+
+      error:
+        "Invalid Marketplace listing URL."
+    });
+
+    return true;
+  }
+
+
+  chrome.tabs.create(
+    {
+      url,
+
+      /*
+        Make the listing visible while it is
+        being analyzed.
+
+        The browse tab remains immediately
+        underneath it.
+      */
+      active:
+        true,
+
+      /*
+        Keep it beside the browse tab.
+      */
+      index:
+        sender.tab?.index != null
+          ? sender.tab.index + 1
+          : undefined
+    },
+
+    tab => {
+      if (
+        chrome.runtime.lastError
+      ) {
+        sendResponse({
+          ok:
+            false,
+
+          error:
+            chrome.runtime
+              .lastError
+              .message
+        });
+
+        return;
+      }
+
+
+      console.log(
+        "[MARKETPLACE TAB] Opened listing tab:",
+        {
+          tabId:
+            tab?.id,
+
+          url
+        }
+      );
+
+
+      sendResponse({
+        ok:
+          true,
+
+        tabId:
+          tab?.id ?? null
+      });
+    }
+  );
+
+
+  return true;
+}
+
+if (
+  message.type ===
+  "CLOSE_CURRENT_MARKETPLACE_LISTING_TAB"
+) {
+  const tabId =
+    sender.tab?.id;
+
+  if (
+    !tabId
+  ) {
+    sendResponse({
+      ok:
+        false,
+
+      error:
+        "Could not determine current listing tab."
+    });
+
+    return true;
+  }
+
+
+  console.log(
+    "[MARKETPLACE TAB] Closing completed listing tab:",
+    tabId
+  );
+
+
+  /*
+    Respond before removing the sender's own tab.
+    Otherwise destroying the content script can
+    close the message port before its callback runs.
+  */
+  sendResponse({
+    ok:
+      true,
+
+    tabId
+  });
+
+
+  setTimeout(
+    () => {
+      chrome.tabs.remove(
+        tabId
+      ).catch(
+        () => {}
+      );
+    },
+    100
+  );
+
+
+  return true;
+}
+
+if (
+  message.type ===
+  "CLOSE_MARKETPLACE_AUTO_EBAY_TABS"
+) {
       chrome.tabs.query(
         {},
         tabs => {
@@ -2861,6 +3036,34 @@ chrome.runtime.onMessage.addListener(
                 imageUrl:
   String(
     target.imageUrl ||
+    ""
+  ).trim(),
+
+  cropPrepared:
+  target.cropPrepared ===
+  true,
+
+dataForSeoImageUrl:
+  String(
+    target
+      .dataForSeoImageUrl ||
+    ""
+  ).trim(),
+
+dataForSeoCropObjectPath:
+  String(
+    target
+      .dataForSeoCropObjectPath ||
+    ""
+  ).trim(),
+
+cropBoundingBox:
+  target.cropBoundingBox ||
+  null,
+
+cropError:
+  String(
+    target.cropError ||
     ""
   ).trim(),
 
@@ -3418,19 +3621,57 @@ try {
       }
     );
 
-    const baseResult =
-      await processSingleImage({
-        imageUrl:
-          target.imageUrl,
+    const dataForSeoImageUrl =
+  String(
+    target
+      ?.dataForSeoImageUrl ||
+    ""
+  ).trim();
 
-        imageIndex:
-          target.bestImageIndex,
 
-        totalImages:
-          targets.length,
+if (!dataForSeoImageUrl) {
+  throw new Error(
+    target?.cropError ||
+    `No isolated DataForSEO crop was prepared for ${target.productId}.`
+  );
+}
 
-        promptText
-      });
+
+console.log(
+  "[DATAFORSEO CROP] Using isolated crop:",
+  {
+    productId:
+      target.productId,
+
+    originalImage:
+      target.imageUrl,
+
+    cropImage:
+      dataForSeoImageUrl,
+
+    boundingBox:
+      target.cropBoundingBox
+  }
+);
+
+
+const baseResult =
+  await processSingleImage({
+    imageUrl:
+      dataForSeoImageUrl,
+
+    imageIndex:
+      target.bestImageIndex,
+
+    totalImages:
+      targets.length,
+
+    promptText,
+
+    cropObjectPath:
+      target
+        .dataForSeoCropObjectPath
+  });
 
       console.log(
   "[DEBUG STEP 4A] Raw processSingleImage result:",
@@ -3446,6 +3687,23 @@ try {
 
     imageIndex:
       target.bestImageIndex,
+
+      dataForSeoEvidence:
+  baseResult
+    .dataForSeoEvidence ||
+  null,
+
+dataForSeoTaskId:
+  baseResult
+    .dataForSeoTaskId ||
+  "",
+
+dataForSeoCost:
+  Number(
+    baseResult
+      .dataForSeoCost ||
+    0
+  ),
 
     identificationMode,
 
@@ -3558,6 +3816,23 @@ console.log(
     galleryIndex:
       target.galleryIndex,
 
+      dataForSeoEvidence:
+  baseResult
+    .dataForSeoEvidence ||
+  null,
+
+dataForSeoTaskId:
+  baseResult
+    .dataForSeoTaskId ||
+  "",
+
+dataForSeoCost:
+  Number(
+    baseResult
+      .dataForSeoCost ||
+    0
+  ),
+
     productId:
       target.productId,
 
@@ -3612,6 +3887,23 @@ if (
       galleryIndex:
         target.galleryIndex,
 
+        dataForSeoEvidence:
+  baseResult
+    .dataForSeoEvidence ||
+  null,
+
+dataForSeoTaskId:
+  baseResult
+    .dataForSeoTaskId ||
+  "",
+
+dataForSeoCost:
+  Number(
+    baseResult
+      .dataForSeoCost ||
+    0
+  ),
+
       targetProductId:
         target.productId,
 
@@ -3665,8 +3957,8 @@ excludedModels:
 } catch (error) {
 
 
-  console.error(
-  "[DEBUG STEP 4 ERROR] Google identification threw an exception:",
+ console.error(
+  "[DEBUG STEP 4 ERROR] DataForSEO identification threw an exception:",
   {
     galleryIndex:
       target.galleryIndex,
@@ -3703,50 +3995,59 @@ excludedModels:
   */
 
 
-  result = {
-    galleryIndex:
-      target.galleryIndex,
+result = {
+  galleryIndex:
+    target.galleryIndex,
 
-    targetProductId:
-      target.productId,
+  targetProductId:
+    target.productId,
 
-    targetProductType:
-      target.productType,
+  targetProductType:
+    target.productType,
 
-    targetImageIndex:
-      target.bestImageIndex,
+  targetImageIndex:
+    target.bestImageIndex,
 
-    targetModelReadabilityScore:
-      target.modelReadabilityScore,
+  targetModelReadabilityScore:
+    target.modelReadabilityScore,
 
-    imageUrl:
-      target.imageUrl,
+  imageUrl:
+    target.imageUrl,
 
-    prompt:
-      promptText,
+  prompt:
+    promptText,
 
-    aiOverviewFound:
-      false,
+  aiOverviewFound:
+    false,
 
-    aiOverviewText:
-      "",
+  aiOverviewText:
+    "",
 
-    identifiedModel:
-      null,
+  identifiedModel:
+    null,
 
-    ambiguityResolved:
-      identificationMode !== "group",
+  dataForSeoEvidence:
+    null,
 
-    excludedModels,
+  dataForSeoTaskId:
+    "",
 
-    error:
-      error?.message ||
-      String(error),
+  dataForSeoCost:
+    0,
 
-    completedAt:
-      new Date()
-        .toISOString()
-  };
+  ambiguityResolved:
+    identificationMode !== "group",
+
+  excludedModels,
+
+  error:
+    error?.message ||
+    String(error),
+
+  completedAt:
+    new Date()
+      .toISOString()
+};
 }
 
 console.log(

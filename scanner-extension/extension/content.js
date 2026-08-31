@@ -1,5 +1,512 @@
 console.log("eBay AI Comp Checker loaded on:", window.location.href);
 
+/*
+  ============================================================
+  EBAY TESTING MODE
+  ============================================================
+
+  false = NORMAL SCANNER
+    - use global Supabase product resale database
+    - database misses use ACTIVE eBay listings only
+    - estimate resale from active-listing P15
+    - save new estimates back to global product database
+    - do NOT write ebay_active_training_data
+
+  true = TRAINING MODE
+    - disable global product database lookup
+    - disable global product database writes
+    - use old SOLD eBay workflow
+    - server also collects ACTIVE listings
+    - write sold + active observations to
+      ebay_active_training_data
+*/
+const TESTING_MODE = false;
+
+const MAX_CONCURRENT_MARKETPLACE_ANALYSES =
+  2;
+
+const MARKETPLACE_ANALYSIS_JOBS_KEY =
+  "marketplaceAnalysisJobs";
+
+const MARKETPLACE_FINISH_LOCK_KEY =
+  "marketplaceAnalysisFinishLock";
+
+  async function getMarketplaceAnalysisJobs() {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_ANALYSIS_JOBS_KEY
+    );
+
+  return Array.isArray(
+    stored[
+      MARKETPLACE_ANALYSIS_JOBS_KEY
+    ]
+  )
+    ? stored[
+        MARKETPLACE_ANALYSIS_JOBS_KEY
+      ]
+    : [];
+}
+
+
+async function saveMarketplaceAnalysisJobs(
+  jobs
+) {
+  await chrome.storage.local.set({
+    [MARKETPLACE_ANALYSIS_JOBS_KEY]:
+      Array.isArray(jobs)
+        ? jobs
+        : []
+  });
+}
+
+
+function getCurrentMarketplaceAnalysisJobId() {
+  const listingId =
+    getFacebookMarketplaceItemId(
+      window.location.href
+    );
+
+  return listingId
+    ? `listing-${listingId}`
+    : null;
+}
+
+
+async function upsertMarketplaceAnalysisJob(
+  patch = {}
+) {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  if (!jobId) {
+    return null;
+  }
+
+  const jobs =
+    await getMarketplaceAnalysisJobs();
+
+  const existingIndex =
+    jobs.findIndex(
+      job =>
+        job?.jobId ===
+        jobId
+    );
+
+  const currentUrl =
+    window.location.href
+      .split("?")[0];
+
+  const existing =
+    existingIndex >= 0
+      ? jobs[
+          existingIndex
+        ]
+      : {
+          jobId,
+
+          listingId:
+            getFacebookMarketplaceItemId(
+              currentUrl
+            ),
+
+          url:
+            currentUrl,
+
+          createdAt:
+            Date.now()
+        };
+
+  const updated = {
+    ...existing,
+    ...patch,
+    jobId,
+    url:
+      existing.url ||
+      currentUrl,
+
+    updatedAt:
+      Date.now()
+  };
+
+  if (
+    existingIndex >= 0
+  ) {
+    jobs[
+      existingIndex
+    ] =
+      updated;
+  } else {
+    jobs.push(
+      updated
+    );
+  }
+
+  await saveMarketplaceAnalysisJobs(
+    jobs
+  );
+
+  return updated;
+}
+
+
+async function removeCurrentMarketplaceAnalysisJob() {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  if (!jobId) {
+    return;
+  }
+
+  const jobs =
+    await getMarketplaceAnalysisJobs();
+
+  await saveMarketplaceAnalysisJobs(
+    jobs.filter(
+      job =>
+        job?.jobId !==
+        jobId
+    )
+  );
+}
+
+
+async function countActiveMarketplaceAnalysisJobs() {
+  const jobs =
+    await getMarketplaceAnalysisJobs();
+
+  return jobs.filter(
+    job =>
+      ![
+        "complete",
+        "failed"
+      ].includes(
+        String(
+          job?.status ||
+          ""
+        )
+      )
+  ).length;
+}
+
+async function acquireMarketplaceFinishLock() {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  if (!jobId) {
+    return;
+  }
+
+  while (true) {
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+
+    const currentOwner =
+      String(
+        stored[
+          MARKETPLACE_FINISH_LOCK_KEY
+        ] ||
+        ""
+      ).trim();
+
+    if (
+      !currentOwner ||
+      currentOwner ===
+        jobId
+    ) {
+      await chrome.storage.local.set({
+        [MARKETPLACE_FINISH_LOCK_KEY]:
+          jobId
+      });
+
+      /*
+        Verify we actually won the lock.
+      */
+      const verify =
+        await chrome.storage.local.get(
+          MARKETPLACE_FINISH_LOCK_KEY
+        );
+
+      if (
+        verify[
+          MARKETPLACE_FINISH_LOCK_KEY
+        ] === jobId
+      ) {
+        console.log(
+          "[PIPELINE LOCK] Acquired finish lock:",
+          jobId
+        );
+
+        return;
+      }
+    }
+
+    console.log(
+      "[PIPELINE LOCK] Waiting for older listing to finish:",
+      {
+        jobId,
+        currentOwner
+      }
+    );
+
+    await sleep(
+      500
+    );
+  }
+}
+
+
+async function releaseMarketplaceFinishLock() {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_FINISH_LOCK_KEY
+    );
+
+  if (
+    stored[
+      MARKETPLACE_FINISH_LOCK_KEY
+    ] === jobId
+  ) {
+    await chrome.storage.local.remove(
+      MARKETPLACE_FINISH_LOCK_KEY
+    );
+
+    console.log(
+      "[PIPELINE LOCK] Released finish lock:",
+      jobId
+    );
+  }
+}
+
+async function runActiveEbayApiWorkflow(
+  button
+) {
+  const stored =
+    await chrome.storage.local.get(
+      "ebayCompContext"
+    );
+
+  let context =
+    stored.ebayCompContext;
+
+  if (!context) {
+    throw new Error(
+      "Active eBay workflow started without ebayCompContext."
+    );
+  }
+
+  const items =
+    Array.isArray(
+      context.items
+    )
+      ? context.items
+      : [];
+
+  let currentItemIndex =
+    Number(
+      context.currentItemIndex || 0
+    );
+
+
+  while (
+    currentItemIndex <
+    items.length
+  ) {
+    const currentItem =
+      items[
+        currentItemIndex
+      ];
+
+    button.innerText =
+      `Checking active eBay market ${currentItemIndex + 1}/${items.length}...`;
+
+    console.log(
+      "[ACTIVE EBAY] Evaluating:",
+      currentItem.ebaySearchQuery
+    );
+
+
+    const response =
+      await fetchLocalServer(
+        "/evaluate-active-comps",
+        {
+          method:
+            "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              target: {
+                ...currentItem,
+
+                facebookPrice:
+                  context.facebookPrice,
+
+                originalFacebookTitle:
+                  context.originalFacebookTitle,
+
+                facebookDescription:
+                  context.facebookDescription
+              }
+            })
+        }
+      );
+
+
+    const itemResult =
+      await readJsonSafely(
+        response
+      );
+
+
+    if (
+      !response.ok ||
+      itemResult.error
+    ) {
+      throw new LocalServerError(
+        itemResult,
+        "Active eBay valuation failed."
+      );
+    }
+
+
+    console.log(
+      "[ACTIVE EBAY] Result:",
+      itemResult
+    );
+
+
+    context = {
+      ...context,
+
+      results: [
+        ...(context.results || []),
+
+        {
+          item:
+            currentItem,
+
+          result:
+            itemResult
+        }
+      ],
+
+      currentItemIndex:
+        currentItemIndex + 1
+    };
+
+
+    await chrome.storage.local.set({
+      ebayCompContext:
+        context
+    });
+
+
+    currentItemIndex += 1;
+  }
+
+
+  /*
+    All database misses have now received
+    active-market valuations.
+
+    Run the existing final lot calculation.
+  */
+  const finalResponse =
+    await fetchLocalServer(
+      "/evaluate-lot",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            context
+          })
+      }
+    );
+
+
+  const finalResult =
+    await readJsonSafely(
+      finalResponse
+    );
+
+
+  if (
+    !finalResponse.ok ||
+    finalResult.error
+  ) {
+    throw new LocalServerError(
+      finalResult,
+      "Final active-market lot evaluation failed."
+    );
+  }
+
+
+  console.log(
+    "[ACTIVE EBAY] Final lot evaluation:",
+    finalResult
+  );
+
+
+  if (
+    String(
+      finalResult.recommendation ||
+      ""
+    )
+      .trim()
+      .toLowerCase() ===
+    "scam"
+  ) {
+    await saveScamListing({
+      context,
+      result:
+        finalResult
+    });
+  }
+
+
+  await saveDealToLibrary({
+    context,
+    result:
+      finalResult
+  });
+
+
+  if (
+    !isHitRecommendation(
+      finalResult
+    )
+  ) {
+    await markMarketplaceAnalysisRunCompleted();
+  }
+
+
+  await markMarketplaceAutoAnalysisComplete(
+    finalResult
+  );
+
+
+  showLotCompPanel(
+    finalResult
+  );
+}
+
 function getListingTitle() {
   const badTitles = [
     "notifications",
@@ -102,7 +609,7 @@ function getListingTitle() {
 */
 
 const REMOTE_EBAY_HANDOFF_ENABLED =
-  true
+  false;
 
 /*
   10 = approximately 1 out of every 10 listings that
@@ -659,7 +1166,7 @@ async function createRemoteGoogleLensJob({
 */
 
 const REMOTE_GOOGLE_LENS_HANDOFF_ENABLED =
-  true;
+  false;
 
 const REMOTE_GOOGLE_LENS_ONE_IN_N_LISTINGS =
   2;
@@ -797,6 +1304,225 @@ async function runRemoteGoogleLensTargets(
 
   return await waitForRemoteGoogleLensJob(
     job.jobId
+  );
+}
+
+async function prepareDataForSeoCrops(
+  targets,
+  initialIdentificationData,
+  productOcrResults
+) {
+  const primaryProducts =
+    Array.isArray(
+      initialIdentificationData
+        ?.primaryProducts
+    )
+      ? initialIdentificationData
+          .primaryProducts
+      : [];
+
+
+  const enrichedTargets =
+    targets.map(
+      target => {
+        const product =
+          primaryProducts.find(
+            item =>
+              String(
+                item?.productId ||
+                ""
+              ).trim() ===
+              String(
+                target?.productId ||
+                ""
+              ).trim()
+          );
+
+
+        const productOcr =
+          productOcrResults.find(
+            item =>
+              String(
+                item?.productId ||
+                ""
+              ).trim() ===
+              String(
+                target?.productId ||
+                ""
+              ).trim()
+          );
+
+
+        return {
+          ...target,
+
+          /*
+            Partial existing identity is ONLY a localization hint.
+
+            It is not a new identification step.
+          */
+          knownProduct:
+            product
+              ? {
+                  brand:
+                    product?.brand ||
+                    product
+                      ?.lensIdentity
+                      ?.brand ||
+                    null,
+
+                  model:
+                    product?.model ||
+                    null,
+
+                  productType:
+                    product?.productType ||
+                    target.productType,
+
+                  lensIdentity:
+                    product?.lensIdentity ||
+                    null
+                }
+              : null,
+
+          ocrText:
+            String(
+              productOcr?.ocrText ||
+              ""
+            ).trim()
+        };
+      }
+    );
+
+
+  console.log(
+    "[DATAFORSEO CROP] Requesting isolated product crops:",
+    enrichedTargets
+  );
+
+
+  const response =
+    await fetchLocalServer(
+      "/prepare-dataforseo-crops",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            targets:
+              enrichedTargets
+          })
+      }
+    );
+
+
+  const data =
+    await readJsonSafely(
+      response
+    );
+
+
+  if (
+    !response.ok ||
+    data?.ok !== true
+  ) {
+    throw new LocalServerError(
+      data,
+      "Could not prepare isolated DataForSEO product crops."
+    );
+  }
+
+
+  const prepared =
+    Array.isArray(
+      data?.targets
+    )
+      ? data.targets
+      : [];
+
+
+  const byProductId =
+    new Map(
+      prepared.map(
+        target => [
+          String(
+            target?.productId ||
+            ""
+          ).trim(),
+
+          target
+        ]
+      )
+    );
+
+
+  return targets.map(
+    target => {
+      const preparedTarget =
+        byProductId.get(
+          String(
+            target?.productId ||
+            ""
+          ).trim()
+        );
+
+
+      return {
+        ...target,
+
+        cropPrepared:
+          preparedTarget
+            ?.cropPrepared ===
+          true,
+
+        dataForSeoImageUrl:
+          String(
+            preparedTarget
+              ?.dataForSeoImageUrl ||
+            ""
+          ).trim(),
+
+        dataForSeoCropObjectPath:
+          String(
+            preparedTarget
+              ?.dataForSeoCropObjectPath ||
+            ""
+          ).trim(),
+
+        cropBoundingBox:
+          preparedTarget
+            ?.cropBoundingBox ||
+          null,
+
+        cropError:
+          String(
+            preparedTarget
+              ?.cropError ||
+            ""
+          ).trim(),
+
+        /*
+          CRITICAL:
+
+          DataForSEO now receives an ISOLATED PRODUCT crop.
+
+          Do NOT retain the old whole-image ambiguity state,
+          otherwise background.js may ask DataForSEO to identify
+          multiple lenses inside a crop containing only one lens.
+        */
+        sameTypeProductIds: [
+          String(
+            target.productId
+          ).trim()
+        ]
+      };
+    }
   );
 }
 
@@ -3100,6 +3826,22 @@ async function startMarketplaceAutoAnalyzer(
     return;
   }
 
+  /*
+  Start every scanner session with a clean
+  in-memory pipeline registry.
+
+  Jobs from a previous stopped/crashed session
+  must never block a new scan.
+*/
+await chrome.storage.local.remove([
+  MARKETPLACE_ANALYSIS_JOBS_KEY,
+  MARKETPLACE_FINISH_LOCK_KEY
+]);
+
+console.log(
+  "[PIPELINE] Cleared stale analysis jobs and finish lock."
+);
+
   const now = Date.now();
 
   const durationMinutes =
@@ -3421,6 +4163,22 @@ async function openNextMarketplaceListing() {
     stored[MARKETPLACE_AUTO_STATE_KEY];
 
   if (!state?.running) return;
+
+  const activeAnalysisJobCount =
+  await countActiveMarketplaceAnalysisJobs();
+
+
+if (
+  activeAnalysisJobCount >=
+  MAX_CONCURRENT_MARKETPLACE_ANALYSES
+) {
+  console.log(
+    "[MARKETPLACE BROWSE] Maximum concurrent listing jobs reached:",
+    activeAnalysisJobCount
+  );
+
+  return;
+}
 
   if (
     !(await isMarketplaceAutoAnalyzerRunning())
@@ -3888,8 +4646,213 @@ if (!claimed) {
   return;
 }
 
-window.location.href =
-  next.fullHref;
+const openResult =
+  await openMarketplaceListingInNewTab(
+    next.fullHref
+  );
+
+console.log(
+  "[MARKETPLACE TAB] Listing opened in independent tab:",
+  {
+    listingId:
+      next.listingId,
+
+    url:
+      next.fullHref,
+
+    tabId:
+      openResult?.tabId
+  }
+);
+
+
+/*
+  IMPORTANT:
+
+  The browse tab stays exactly where it is.
+
+  Wait here until the listing tab finishes and
+  clears currentListingUrl from shared auto state.
+*/
+await waitForMarketplaceChildListingToFinish();
+}
+
+async function waitForMarketplaceChildListingToFinish() {
+  console.log(
+    "[MARKETPLACE BROWSE] Watching active listing jobs..."
+  );
+
+  while (true) {
+    await sleep(
+      750
+    );
+
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_AUTO_STATE_KEY
+      );
+
+    const state =
+      stored[
+        MARKETPLACE_AUTO_STATE_KEY
+      ];
+
+
+    if (
+      !state?.running
+    ) {
+      console.log(
+        "[MARKETPLACE BROWSE] Scanner stopped."
+      );
+
+      return;
+    }
+
+
+    const jobs =
+      await getMarketplaceAnalysisJobs();
+
+
+    const activeJobs =
+      jobs.filter(
+        job =>
+          ![
+            "complete",
+            "failed"
+          ].includes(
+            String(
+              job?.status ||
+              ""
+            )
+          )
+      );
+
+
+    const parkedJobs =
+      activeJobs.filter(
+        job =>
+          job?.status ===
+            "waiting-dataforseo"
+      );
+
+
+    /*
+      CASE 1
+
+      A listing is parked in DataForSEO and we still have
+      capacity for one more listing.
+
+      Immediately continue browsing instead of waiting.
+    */
+    if (
+      parkedJobs.length > 0 &&
+      activeJobs.length <
+        MAX_CONCURRENT_MARKETPLACE_ANALYSES
+    ) {
+      console.log(
+        "[MARKETPLACE BROWSE] DataForSEO wait detected. Opening another listing.",
+        {
+          activeJobs:
+            activeJobs.length,
+
+          parkedJobs:
+            parkedJobs.length
+        }
+      );
+
+
+      const waitBeforeNextMs =
+        randomInt(
+          1000,
+          2500
+        );
+
+      await sleep(
+        waitBeforeNextMs
+      );
+
+
+      if (
+        !(await isMarketplaceAutoAnalyzerRunning())
+      ) {
+        return;
+      }
+
+
+      await openNextMarketplaceListing();
+
+      return;
+    }
+
+
+    /*
+      CASE 2
+
+      No active jobs remain.
+
+      Normal completed-listing behavior.
+    */
+    if (
+      activeJobs.length === 0
+    ) {
+      console.log(
+        "[MARKETPLACE BROWSE] All active listing jobs finished."
+      );
+
+
+      const waitBeforeNextMs =
+        randomInt(
+          5000,
+          10000
+        );
+
+      await sleep(
+        waitBeforeNextMs
+      );
+
+
+      if (
+        !(await isMarketplaceAutoAnalyzerRunning())
+      ) {
+        return;
+      }
+
+
+      await openNextMarketplaceListing();
+
+      return;
+    }
+
+
+    /*
+      CASE 3
+
+      Two listing jobs already exist.
+
+      Do not open a third.
+    */
+    if (
+      activeJobs.length >=
+      MAX_CONCURRENT_MARKETPLACE_ANALYSES
+    ) {
+      continue;
+    }
+
+
+    /*
+      CASE 4
+
+      One listing is still actively analyzing normally.
+    */
+    if (
+      String(
+        state.currentListingUrl ||
+        ""
+      ).trim()
+    ) {
+      continue;
+    }
+  }
 }
 
 async function resumeMarketplaceAutoAnalyzerIfNeeded() {
@@ -3999,6 +4962,91 @@ if (isFacebookMarketplaceListingPage()) {
   }
 }
 
+async function openMarketplaceListingInNewTab(
+  url
+) {
+  return new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+      chrome.runtime.sendMessage(
+        {
+          type:
+            "OPEN_MARKETPLACE_LISTING_TAB",
+
+          url
+        },
+
+        response => {
+          if (
+            chrome.runtime.lastError
+          ) {
+            reject(
+              new Error(
+                chrome.runtime
+                  .lastError
+                  .message
+              )
+            );
+
+            return;
+          }
+
+          if (
+            !response ||
+            response.ok !== true
+          ) {
+            reject(
+              new Error(
+                response?.error ||
+                "Could not open Marketplace listing tab."
+              )
+            );
+
+            return;
+          }
+
+          resolve(
+            response
+          );
+        }
+      );
+    }
+  );
+}
+
+
+async function closeCurrentMarketplaceListingTab() {
+  return new Promise(
+    resolve => {
+      chrome.runtime.sendMessage(
+        {
+          type:
+            "CLOSE_CURRENT_MARKETPLACE_LISTING_TAB"
+        },
+
+        response => {
+          if (
+            chrome.runtime.lastError
+          ) {
+            console.warn(
+              "[MARKETPLACE TAB] Could not close listing tab:",
+              chrome.runtime
+                .lastError
+                .message
+            );
+          }
+
+          resolve(
+            response || null
+          );
+        }
+      );
+    }
+  );
+}
+
 async function closeMarketplaceAutoEbayTabs() {
   return new Promise(resolve => {
     if (
@@ -4042,6 +5090,9 @@ function getRemainingMarketplaceAutoMinutes(state) {
 }
 
 async function waitForMarketplaceAnalysisToFinish() {
+
+  const analysisJobId =
+  getCurrentMarketplaceAnalysisJobId();
   const startedAt = Date.now();
   const maxWaitMs = 3 * 60 * 1000;
 
@@ -4051,7 +5102,29 @@ async function waitForMarketplaceAnalysisToFinish() {
 
     if (!state?.running) return;
 
-if (state.analysisDone) {
+const jobs =
+  await getMarketplaceAnalysisJobs();
+
+const currentJob =
+  jobs.find(
+    job =>
+      job?.jobId ===
+      analysisJobId
+  );
+
+if (
+  currentJob?.status ===
+    "complete"
+) {
+  const finalResult =
+    currentJob.finalResult ||
+    {
+      recommendation:
+        "Done",
+
+      reason:
+        "Analysis completed."
+    };
 
   if (USE_SEPARATE_OUTREACH_EXTENSION) {
     /*
@@ -4062,9 +5135,9 @@ if (state.analysisDone) {
       outreach extension can handle it later.
     */
     try {
-      await queueMarketplaceSellerForVerifiedHit(
-        state.lastResult
-      );
+await queueMarketplaceSellerForVerifiedHit(
+  finalResult
+);
 
     } catch (queueError) {
       console.warn(
@@ -4076,9 +5149,9 @@ if (state.analysisDone) {
         Never silently discard a verified hit.
       */
       if (
-        isHitRecommendation(
-          state.lastResult
-        )
+isHitRecommendation(
+  finalResult
+)
       ) {
         await stopMarketplaceAutoAnalyzer({
           reason:
@@ -4097,10 +5170,9 @@ if (state.analysisDone) {
     */
     try {
       const messageResult =
-        await messageMarketplaceSellerForVerifiedHit(
-          state.lastResult
-        );
-
+await messageMarketplaceSellerForVerifiedHit(
+  finalResult
+);
       console.log(
         "[DIRECT OUTREACH] Immediate outreach result:",
         messageResult
@@ -4132,46 +5204,67 @@ const latestStateAfterQueue =
   ] || state;
 
 const currentUrl =
-  window.location.href.split("?")[0];
+  window.location.href
+    .split("?")[0];
 
-const currentListingId =
-  getFacebookMarketplaceItemId(
-    currentUrl
-  );
 
-const processedListingUrls = [
-  ...(
+const sharedCurrentUrl =
+  String(
     latestStateAfterQueue
-      .processedListingUrls ||
-    []
-  ),
+      .currentListingUrl ||
+    ""
+  )
+    .split("?")[0];
 
-  latestStateAfterQueue
-    .currentListingUrl ||
-    currentUrl
-];
 
 const updatedState = {
   ...latestStateAfterQueue,
 
   processedListingUrls:
-    [...new Set(
-      processedListingUrls
-    )],
+    [
+      ...new Set([
+        ...(
+          latestStateAfterQueue
+            .processedListingUrls ||
+          []
+        ),
 
-  currentListingUrl: "",
-  waitingForAnalysis: false,
-  analysisDone: false
+        currentUrl
+      ])
+    ],
+
+  /*
+    Only clear the shared foreground URL if THIS
+    tab is still the foreground listing.
+
+    If Listing B has already replaced it, leave B alone.
+  */
+  currentListingUrl:
+    sharedCurrentUrl ===
+      currentUrl
+      ? ""
+      : latestStateAfterQueue
+          .currentListingUrl,
+
+  dataForSeoListingParked:
+    false
 };
 
       await chrome.storage.local.set({
         [MARKETPLACE_AUTO_STATE_KEY]: updatedState
       });
 
-      console.log("Analysis finished. Returning to Marketplace list/search page:", state.listUrl);
+    console.log(
+  "[MARKETPLACE TAB] Analysis finished. Closing independent listing tab."
+);
 
-      window.location.href = state.listUrl;
-      return;
+await sleep(
+  500
+);
+
+await closeCurrentMarketplaceListingTab();
+
+return;
     }
 
 if (Date.now() - startedAt > maxWaitMs) {
@@ -4332,8 +5425,17 @@ if (Date.now() - startedAt > maxWaitMs) {
     }
   });
 
-  window.location.href = state.listUrl;
-  return;
+console.log(
+  "[MARKETPLACE TAB] Listing failed after retry limit. Closing child tab."
+);
+
+await sleep(
+  500
+);
+
+await closeCurrentMarketplaceListingTab();
+
+return;
 }
   }
 }
@@ -5225,27 +6327,133 @@ async function skipAutoListingBecauseOverPriceLimit(price) {
     }
   });
 
-  console.log(
-    `Skipping listing because Facebook asking price $${price} is above $${MAX_FACEBOOK_ASK_PRICE}. Returning to list.`
-  );
+console.log(
+  `Skipping listing because Facebook asking price $${price} is above $${MAX_FACEBOOK_ASK_PRICE}. Closing listing tab.`
+);
 
-  window.location.href = state.listUrl;
-  return true;
+await sleep(
+  500
+);
+
+await closeCurrentMarketplaceListingTab();
+
+return true;
 }
 
 function getFacebookAskingPrice() {
-  const texts = Array.from(document.querySelectorAll("span, div"))
-    .map(el => el.innerText?.trim())
-    .filter(Boolean);
+  function parsePrice(text) {
+    const clean =
+      String(text || "").trim();
 
-  for (const text of texts) {
-    const match = text.match(/^\$[\d,]+(\.\d{2})?$/);
-
-    if (match) {
-      const price = Number(text.replace("$", "").replace(/,/g, ""));
-      if (price > 0 && price < 100000) return price;
+    if (
+      !/^\$[\d,]+(?:\.\d{2})?$/.test(clean)
+    ) {
+      return null;
     }
+
+    const value =
+      Number(
+        clean
+          .replace("$", "")
+          .replace(/,/g, "")
+      );
+
+    return (
+      Number.isFinite(value) &&
+      value > 0 &&
+      value < 100000
+    )
+      ? value
+      : null;
   }
+
+
+  const elements =
+    Array.from(
+      document.querySelectorAll(
+        "span, div"
+      )
+    );
+
+
+  for (const element of elements) {
+    const price =
+      parsePrice(
+        element.innerText ||
+        element.textContent
+      );
+
+    if (price == null) {
+      continue;
+    }
+
+
+    /*
+      Facebook discounted listings can show:
+
+        $350   $450
+
+      where $450 is the old crossed-out price.
+
+      Never use a struck-through price as the
+      current Marketplace asking price.
+    */
+    const style =
+      window.getComputedStyle(
+        element
+      );
+
+    const textDecoration =
+      String(
+        style.textDecoration ||
+        style.textDecorationLine ||
+        ""
+      ).toLowerCase();
+
+
+    if (
+      textDecoration.includes(
+        "line-through"
+      )
+    ) {
+      continue;
+    }
+
+
+    /*
+      Also check parent styling because Facebook
+      may apply the line-through to a wrapper
+      instead of the text element itself.
+    */
+    const parent =
+      element.parentElement;
+
+    if (parent) {
+      const parentStyle =
+        window.getComputedStyle(
+          parent
+        );
+
+      const parentDecoration =
+        String(
+          parentStyle.textDecoration ||
+          parentStyle.textDecorationLine ||
+          ""
+        ).toLowerCase();
+
+      if (
+        parentDecoration.includes(
+          "line-through"
+        )
+      ) {
+        continue;
+      }
+    }
+
+
+    return price;
+  }
+
 
   return null;
 }
@@ -6194,9 +7402,22 @@ function pickBestGoogleTargets(
   galleries,
   imageUrls
 ) {
-  const targets = [];
+  /*
+    productId is GLOBAL across galleries.
 
-  for (const gallery of galleries || []) {
+    camera_1 in Gallery 1 and camera_1 in Gallery 2
+    represent the same physical product.
+
+    Keep exactly ONE best OCR / image-search target
+    for each global productId.
+  */
+  const bestByProductId =
+    new Map();
+
+
+  for (
+    const gallery of galleries || []
+  ) {
     const analysis =
       gallery?.galleryAnalysis || {};
 
@@ -6214,10 +7435,23 @@ function pickBestGoogleTargets(
         ? analysis.images
         : [];
 
-    for (const product of products) {
-      let best = null;
 
-      for (const imageEntry of images) {
+    for (
+      const product of products
+    ) {
+      const productId =
+        String(
+          product?.productId || ""
+        ).trim();
+
+      if (!productId) {
+        continue;
+      }
+
+
+      for (
+        const imageEntry of images
+      ) {
         const visibleProducts =
           Array.isArray(
             imageEntry.visibleProducts
@@ -6225,16 +7459,21 @@ function pickBestGoogleTargets(
             ? imageEntry.visibleProducts
             : [];
 
+
         const match =
           visibleProducts.find(
             item =>
-              item.productId ===
-              product.productId
+              String(
+                item?.productId || ""
+              ).trim() ===
+              productId
           );
+
 
         if (!match) {
           continue;
         }
+
 
         const imageIndex =
           Number(
@@ -6251,81 +7490,96 @@ function pickBestGoogleTargets(
             imageIndex - 1
           ];
 
+
         if (!imageUrl) {
           continue;
         }
 
+
         const sameTypeProductIds =
-  visibleProducts
-    .filter(
-      item =>
-        String(
-          item?.productType || ""
-        )
-          .trim()
-          .toLowerCase() ===
-        String(
-          product?.productType || ""
-        )
-          .trim()
-          .toLowerCase()
-    )
-    .map(
-      item =>
-        String(
-          item?.productId || ""
-        ).trim()
-    )
-    .filter(Boolean);
+          visibleProducts
+            .filter(
+              item =>
+                String(
+                  item?.productType || ""
+                )
+                  .trim()
+                  .toLowerCase() ===
+                String(
+                  product?.productType || ""
+                )
+                  .trim()
+                  .toLowerCase()
+            )
+            .map(
+              item =>
+                String(
+                  item?.productId || ""
+                ).trim()
+            )
+            .filter(Boolean);
 
-const candidate = {
-  galleryIndex:
-    gallery.galleryIndex,
 
-  productId:
-    product.productId,
+        const candidate = {
+          galleryIndex:
+            gallery.galleryIndex,
 
-  productType:
-    product.productType,
+          productId,
 
-  bestImageIndex:
-    imageIndex,
+          productType:
+            product.productType,
 
-  modelReadabilityScore:
-    score,
+          bestImageIndex:
+            imageIndex,
 
-  imageUrl,
+          modelReadabilityScore:
+            score,
 
-  sameTypeProductIds
-};
+          imageUrl,
+
+          sameTypeProductIds
+        };
+
+
+        const existing =
+          bestByProductId.get(
+            productId
+          );
+
 
         /*
-          Higher score wins.
-          If tied, earlier image wins.
+          Pick the highest readability score
+          across ALL galleries.
+
+          On a tie, use the earlier Marketplace image.
         */
         if (
-          !best ||
+          !existing ||
           score >
-            best.modelReadabilityScore ||
+            existing
+              .modelReadabilityScore ||
           (
             score ===
-              best.modelReadabilityScore &&
+              existing
+                .modelReadabilityScore &&
             imageIndex <
-              best.bestImageIndex
+              existing
+                .bestImageIndex
           )
         ) {
-          best =
-            candidate;
+          bestByProductId.set(
+            productId,
+            candidate
+          );
         }
-      }
-
-      if (best) {
-        targets.push(best);
       }
     }
   }
 
-  return targets;
+
+  return Array.from(
+    bestByProductId.values()
+  );
 }
 
 function buildEbaySearchQueryFromPrimaryProduct(
@@ -6728,6 +7982,32 @@ async function aiCheckListing() {
   const analysisRun =
     await getOrCreateMarketplaceAnalysisRun();
 
+  const analysisJobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  await upsertMarketplaceAnalysisJob({
+    status:
+      "analyzing",
+
+    stage:
+      "starting",
+
+    analysisRunId:
+      analysisRun.id,
+
+    startedAt:
+      Date.now()
+  });
+
+  console.log(
+    "[PIPELINE JOB] Started:",
+    {
+      analysisJobId,
+      analysisRunId:
+        analysisRun.id
+    }
+  );
+
   console.log(
     "[IDENTIFICATION] Starting new Marketplace identification pipeline.",
     {
@@ -6750,7 +8030,7 @@ async function aiCheckListing() {
 
 
 
-  function getResolvedGoogleIdentity(
+function getResolvedGoogleIdentity(
   product,
   googleLensResults = []
 ) {
@@ -6759,10 +8039,6 @@ async function aiCheckListing() {
       product?.productId || ""
     ).trim();
 
-  const galleryIndex =
-    Number(
-      product?.galleryIndex
-    ) || 1;
 
   if (
     !productId ||
@@ -6773,6 +8049,7 @@ async function aiCheckListing() {
     return "";
   }
 
+
   const match =
     googleLensResults.find(
       result => {
@@ -6782,31 +8059,88 @@ async function aiCheckListing() {
             ""
           ).trim();
 
+
         if (!identifiedModel) {
           return false;
         }
 
-        return (
-          Number(
-            result?.galleryIndex
-          ) === galleryIndex &&
 
+        /*
+          Group results contain multiple physical products.
+
+          Do not turn the whole group answer into the
+          identity of one product.
+        */
+        if (
+          result?.identificationMode ===
+          "group"
+        ) {
+          return false;
+        }
+
+
+        if (
+          result?.ambiguityResolved ===
+          false
+        ) {
+          return false;
+        }
+
+
+        if (
           String(
             result?.targetProductId ||
             ""
-          ).trim() === productId &&
+          ).trim() !==
+          productId
+        ) {
+          return false;
+        }
 
-          result?.identificationMode !==
-            "group" &&
 
-          result?.ambiguityResolved !==
-            false
+        /*
+          NEW:
+
+          Only allow DataForSEO to bypass the final
+          reconciliation uncertainty when its own
+          intermediary cleaner was highly confident
+          AND strongly converged.
+
+          medium/mixed does NOT qualify.
+        */
+        const confidence =
+          String(
+            result
+              ?.dataForSeoEvidence
+              ?.confidence ||
+            ""
+          )
+            .trim()
+            .toLowerCase();
+
+
+        const consensus =
+          String(
+            result
+              ?.dataForSeoEvidence
+              ?.consensus ||
+            ""
+          )
+            .trim()
+            .toLowerCase();
+
+
+        return (
+          confidence === "high" &&
+          consensus === "strong"
         );
       }
     );
 
+
   return String(
-    match?.identifiedModel || ""
+    match?.identifiedModel ||
+    ""
   ).trim();
 }
 
@@ -6838,14 +8172,106 @@ function buildEbaySearchQuery(
       .trim()
       .toLowerCase();
 
+
+  const exactGoogleIdentity =
+    String(
+      fallbackGoogleIdentity || ""
+    ).trim();
+
+
   let identity = "";
 
-  /*
-    NORMAL PATH
 
-    Step 5 successfully produced a model.
+  /*
+    ============================================================
+    CAMERA LENS
+
+    A reconstructed/partial model such as:
+
+      Canon EF-S 18-55mm f/3.5-5.6 IS
+
+    is NOT automatically an exact identity.
+
+    For lenses we require either:
+
+      1. lensIdentity.canonicalModel from the dedicated resolver
+
+         OR
+
+      2. a high-confidence / strong-consensus DataForSEO identity
+         supplied through fallbackGoogleIdentity.
+
+    ============================================================
   */
-  if (model) {
+
+  if (
+    productType ===
+    "camera lens"
+  ) {
+    const canonicalLensModel =
+      String(
+        product
+          ?.lensIdentity
+          ?.canonicalModel ||
+        ""
+      ).trim();
+
+
+    const exactLensIdentity =
+      canonicalLensModel ||
+      exactGoogleIdentity;
+
+
+    if (!exactLensIdentity) {
+      console.log(
+        "[EBAY QUERY] Skipping unresolved lens:",
+        {
+          productId:
+            product?.productId,
+
+          partialModel:
+            model,
+
+          canonicalModel:
+            canonicalLensModel,
+
+          dataForSeoIdentity:
+            exactGoogleIdentity
+        }
+      );
+
+      return "";
+    }
+
+
+    const identityAlreadyContainsBrand =
+      brand &&
+      exactLensIdentity
+        .toLowerCase()
+        .startsWith(
+          brand.toLowerCase()
+        );
+
+
+    identity =
+      identityAlreadyContainsBrand
+        ? exactLensIdentity
+        : [
+            brand,
+            exactLensIdentity
+          ]
+            .filter(Boolean)
+            .join(" ");
+  }
+
+
+  /*
+    ============================================================
+    NON-LENS PRODUCTS
+    ============================================================
+  */
+
+  else if (model) {
     const modelAlreadyContainsBrand =
       brand &&
       model
@@ -6853,6 +8279,7 @@ function buildEbaySearchQuery(
         .startsWith(
           brand.toLowerCase()
         );
+
 
     identity =
       modelAlreadyContainsBrand
@@ -6865,29 +8292,21 @@ function buildEbaySearchQuery(
             .join(" ");
   }
 
-  /*
-    FALLBACK PATH
 
-    Step 5 lost/omitted the model, but Google Lens
-    already returned an exact identity for this
-    physical product.
+  /*
+    Strong DataForSEO fallback for a non-lens product.
   */
+
   else {
     identity =
-      String(
-        fallbackGoogleIdentity || ""
-      ).trim();
+      exactGoogleIdentity;
   }
 
-  /*
-    Still do NOT allow a generic model-less query.
 
-    If Step 5 AND Google both failed to identify it,
-    leave it unresolved as before.
-  */
   if (!identity) {
     return "";
   }
+
 
   identity =
     identity
@@ -6978,58 +8397,78 @@ function convertPrimaryProductToCompItem(
   condition,
   googleLensResults = []
 ) {
-    const productId =
-      String(
-        product?.productId ||
-        `product_${index + 1}`
-      ).trim();
+  const productId =
+    String(
+      product?.productId ||
+      `product_${index + 1}`
+    ).trim();
 
-    return {
-      itemId:
-        productId,
 
-      productId,
-
-      brand:
-        String(
-          product?.brand || ""
-        ).trim(),
-
-      model:
-        String(
-          product?.model || ""
-        ).trim(),
-
-      productType:
-        String(
-          product?.productType || ""
-        ).trim(),
-
-      condition:
-        condition || "Used",
-
-      confidence:
-        0,
-
-      isPrimarySellableItem:
-        true,
-
-      ebaySearchQuery:
-  buildEbaySearchQuery(
-    product,
+  const fallbackGoogleIdentity =
     getResolvedGoogleIdentity(
       product,
       googleLensResults
-    )
-  ),
+    );
 
-      negativeSearchTerms:
-        [],
 
-      reason:
-        "Identified by Marketplace gallery analysis, Google Lens, and final reconciliation."
-    };
-  }
+  const ebaySearchQuery =
+    buildEbaySearchQuery(
+      product,
+      fallbackGoogleIdentity
+    );
+
+
+  const exactIdentityResolved =
+    Boolean(
+      String(
+        ebaySearchQuery || ""
+      ).trim()
+    );
+
+
+  return {
+    itemId:
+      productId,
+
+    productId,
+
+    brand:
+      String(
+        product?.brand || ""
+      ).trim(),
+
+    model:
+      String(
+        product?.model || ""
+      ).trim(),
+
+    productType:
+      String(
+        product?.productType || ""
+      ).trim(),
+
+    condition:
+      condition || "Used",
+
+    confidence:
+      0,
+
+    isPrimarySellableItem:
+      true,
+
+    exactIdentityResolved,
+
+    ebaySearchQuery,
+
+    negativeSearchTerms:
+      [],
+
+    reason:
+      exactIdentityResolved
+        ? "Exact product identity resolved for valuation."
+        : "Physical product detected, but exact commercially distinct identity was not resolved."
+  };
+}
 
 
   button.innerText =
@@ -7704,13 +9143,6 @@ const lensFallbackTargets =
     target =>
       needsGoogleLens.some(
         unresolved =>
-          Number(
-            unresolved.galleryIndex
-          ) ===
-            Number(
-              target.galleryIndex
-            ) &&
-
           String(
             unresolved.productId
           ) ===
@@ -7748,43 +9180,188 @@ let finalIdentificationData =
 if (
   lensFallbackTargets.length
 ) {
-  const useRemoteGoogleLens =
-  shouldUseRemoteGoogleLensForListing();
+  button.innerText =
+    `Identifying ${lensFallbackTargets.length} product(s) with Google Lens...`;
+
+  console.log(
+    "[GOOGLE LENS ROUTING]",
+    {
+      targetCount:
+        lensFallbackTargets.length,
+
+      targets:
+        lensFallbackTargets
+    }
+  );
+
+button.innerText =
+  `Cropping ${lensFallbackTargets.length} unresolved product(s)...`;
+
+
+const croppedFallbackTargets =
+  await prepareDataForSeoCrops(
+    lensFallbackTargets,
+    initialIdentificationData,
+    productOcrResults
+  );
+
 
 console.log(
-  "[GOOGLE LENS ROUTING]",
-  {
-    mode:
-      useRemoteGoogleLens
-        ? "remote"
-        : "local",
+  "[DATAFORSEO CROP] Prepared fallback targets:"
+);
 
-    targetCount:
-      lensFallbackTargets.length
+console.dir(
+  croppedFallbackTargets,
+  {
+    depth:
+      null
   }
 );
 
 
-if (
-  useRemoteGoogleLens
-) {
-  button.innerText =
-    `Waiting for remote Google Lens worker for ${lensFallbackTargets.length} product(s)...`;
+button.innerText =
+  `Identifying ${croppedFallbackTargets.length} cropped product(s)...`;
 
-  googleLensResults =
-    await runRemoteGoogleLensTargets(
-      lensFallbackTargets
+
+/*
+  ============================================================
+  PARK THIS LISTING WHILE DATAFORSEO WAITS
+  ============================================================
+
+  Its tab remains alive and its Promise remains pending.
+
+  We simply mark it as safe for the browse page to open one
+  additional Marketplace listing.
+*/
+await upsertMarketplaceAnalysisJob({
+  status:
+    "waiting-dataforseo",
+
+  stage:
+    "dataforseo",
+
+  parkedAt:
+    Date.now()
+});
+
+
+console.log(
+  "[PIPELINE JOB] Listing parked for DataForSEO:",
+  {
+    analysisJobId:
+      getCurrentMarketplaceAnalysisJobId(),
+
+    targetCount:
+      croppedFallbackTargets.length
+  }
+);
+
+
+/*
+  Release the browse controller.
+
+  currentListingUrl is currently a SINGLE-listing flag,
+  so clear it while this tab remains alive.
+
+  The job registry now becomes the source of truth for
+  this parked listing.
+*/
+{
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
     );
 
-} else {
-  button.innerText =
-    `Running Google Lens locally for ${lensFallbackTargets.length} product(s)...`;
+  const state =
+    stored[
+      MARKETPLACE_AUTO_STATE_KEY
+    ];
 
-  googleLensResults =
-    await runLocalGoogleLensTargets(
-      lensFallbackTargets
-    );
+  if (state?.running) {
+    await chrome.storage.local.set({
+      [MARKETPLACE_AUTO_STATE_KEY]: {
+        ...state,
+
+        currentListingUrl:
+          "",
+
+        waitingForAnalysis:
+          false,
+
+        analysisDone:
+          false,
+
+        /*
+          Tell the browse page it may continue.
+        */
+        dataForSeoListingParked:
+          true,
+
+        dataForSeoListingParkedAt:
+          Date.now()
+      }
+    });
+  }
 }
+
+
+/*
+  THIS REQUEST STILL WAITS HERE.
+
+  But while it waits, the browse tab may open Listing B.
+*/
+googleLensResults =
+  await runLocalGoogleLensTargets(
+    croppedFallbackTargets
+  );
+
+
+console.log(
+  "[PIPELINE JOB] DataForSEO returned:",
+  {
+    analysisJobId:
+      getCurrentMarketplaceAnalysisJobId()
+  }
+);
+
+
+await upsertMarketplaceAnalysisJob({
+  status:
+    "resume-ready",
+
+  stage:
+    "post-dataforseo",
+
+  dataForSeoReturnedAt:
+    Date.now()
+});
+
+
+/*
+  Listing A now has priority over Listing B for the
+  final database/eBay/decision portion.
+*/
+await acquireMarketplaceFinishLock();
+
+
+await upsertMarketplaceAnalysisJob({
+  status:
+    "finishing",
+
+  stage:
+    "step-5b"
+});
+
+  console.log(
+    "[STEP 4B] Google Lens fallback results:"
+  );
+
+  console.dir(
+    googleLensResults,
+    {
+      depth: null
+    }
+  );
   
 
 
@@ -7841,9 +9418,34 @@ if (
             bestGoogleTargets:
               bestTargets,
 
-            productOcrResults,
+        productOcrResults,
 
-            googleLensResults
+/*
+  Preserve the exact state established BEFORE
+  DataForSEO ran.
+
+  The server uses this as the baseline so weak
+  visual-search evidence cannot mutate known facts.
+*/
+preDataForSeoPrimaryProducts:
+  Array.isArray(
+    initialIdentificationData
+      ?.primaryProducts
+  )
+    ? initialIdentificationData
+        .primaryProducts
+    : [],
+
+    preDataForSeoLensfunCandidates:
+  Array.isArray(
+    initialIdentificationData
+      ?.lensfunCandidateConstraints
+  )
+    ? initialIdentificationData
+        .lensfunCandidateConstraints
+    : [],
+
+googleLensResults
           })
       }
     );
@@ -8184,33 +9786,11 @@ const reconciledProducts =
           MARKETPLACE_AUTO_STATE_KEY
         );
 
-      const state =
-        stored[
-          MARKETPLACE_AUTO_STATE_KEY
-        ];
+      await markMarketplaceAutoAnalysisComplete(
+  passResult
+);
 
-      if (state?.running) {
-        await chrome.storage.local.set({
-          [MARKETPLACE_AUTO_STATE_KEY]:
-            {
-              ...state,
-
-              waitingForAnalysis:
-                false,
-
-              analysisDone:
-                true,
-
-              lastResult:
-                passResult,
-
-              lastResultAt:
-                Date.now()
-            }
-        });
-      }
-
-      return;
+return;
     }
 
 
@@ -8254,47 +9834,61 @@ const reconciledProducts =
     button.innerText =
       "Checking product database...";
 
-    const databaseResponse =
-      await fetchLocalServer(
-        "/lookup-product-values",
-        {
-          method:
-            "POST",
+   let databaseLookups = [];
 
-          headers: {
-            "Content-Type":
-              "application/json"
-          },
+if (
+  !TESTING_MODE
+) {
+  button.innerText =
+    "Checking product database...";
 
-          body:
-            JSON.stringify({
-              items:
-                primaryItems
-            })
-        }
-      );
+  const databaseResponse =
+    await fetchLocalServer(
+      "/lookup-product-values",
+      {
+        method:
+          "POST",
 
-    const databaseData =
-      await readJsonSafely(
-        databaseResponse
-      );
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
 
-    if (
-      !databaseResponse.ok ||
-      databaseData.error
-    ) {
-      throw new LocalServerError(
-        databaseData,
-        "Product database lookup failed."
-      );
-    }
+        body:
+          JSON.stringify({
+            items:
+              primaryItems
+          })
+      }
+    );
 
-    const databaseLookups =
-      Array.isArray(
-        databaseData.results
-      )
-        ? databaseData.results
-        : [];
+  const databaseData =
+    await readJsonSafely(
+      databaseResponse
+    );
+
+  if (
+    !databaseResponse.ok ||
+    databaseData.error
+  ) {
+    throw new LocalServerError(
+      databaseData,
+      "Product database lookup failed."
+    );
+  }
+
+  databaseLookups =
+    Array.isArray(
+      databaseData.results
+    )
+      ? databaseData.results
+      : [];
+
+}else {
+  console.log(
+    "[TEST MODE] Global product resale database disabled. Every resolved product will be tested through eBay."
+  );
+}
 
 const databaseResults = [];
 const itemsNeedingEbay = [];
@@ -8381,8 +9975,8 @@ console.log(
         recommendation:
           "Database Value",
 
-        reason:
-          "Estimated resale value loaded from local product database."
+       reason:
+  "Estimated resale value loaded from global Supabase product database."
       }
     });
 
@@ -8545,10 +10139,13 @@ console.log(
       getCurrentFacebookListingUrl()
         .split("?")[0];
 
-    const ebayExecutionMode =
-  shouldUseRemoteEbayForListing()
-    ? "remote"
-    : "local";
+const ebayExecutionMode =
+  !TESTING_MODE
+    ? "api-active"
+    : shouldUseRemoteEbayForListing()
+      ? "remote"
+      : "local";
+      
 
 console.log(
   "[EBAY ROUTING] Marketplace listing assigned:",
@@ -8574,6 +10171,9 @@ await chrome.storage.local.set({
       It stays fixed for the entire Marketplace listing.
     */
     ebayExecutionMode,
+
+      testingMode:
+      TESTING_MODE,
 
     originalFacebookTitle:
       title,
@@ -8844,6 +10444,27 @@ console.log(
     }
 
 
+/*
+  ============================================================
+  NORMAL MODE — ACTIVE EBAY API ONLY
+  ============================================================
+*/
+if (
+  !TESTING_MODE
+) {
+  console.log(
+    "[EBAY MODE] Normal scanner: active listings only."
+  );
+
+  button.innerText =
+    "Checking active eBay listings...";
+
+  await runActiveEbayApiWorkflow(
+    button
+  );
+
+  return;
+}
     /*
       ============================================================
       START EXISTING EBAY SOLD-COMP WORKFLOW
@@ -9010,34 +10631,22 @@ if (!opened) {
         MARKETPLACE_AUTO_STATE_KEY
       ];
 
-    if (state?.running) {
-      await chrome.storage.local.set({
-        [MARKETPLACE_AUTO_STATE_KEY]:
-          {
-            ...state,
+if (state?.running) {
+  const errorResult = {
+    recommendation:
+      "Error",
 
-            waitingForAnalysis:
-              false,
+    reason:
+      error.message ||
+      "Could not complete listing analysis."
+  };
 
-            analysisDone:
-              true,
+  await markMarketplaceAutoAnalysisComplete(
+    errorResult
+  );
 
-            lastResult: {
-              recommendation:
-                "Error",
-
-              reason:
-                error.message ||
-                "Could not complete listing analysis."
-            },
-
-            lastResultAt:
-              Date.now()
-          }
-      });
-
-      return;
-    }
+  return;
+}
 
     alert(
       error.message ||
@@ -9590,7 +11199,14 @@ function showLotCompPanel(result) {
       <div style="font-weight:700;">${index + 1}. ${escapeHtml(entry.itemName || "")}</div>
       <div><b>Condition:</b> ${escapeHtml(entry.condition || "")}</div>
      <div><b>Estimated resale value:</b> ${entry.includedExpectedSalePrice != null ? "$" + entry.includedExpectedSalePrice : "Excluded"}</div>
-      <div><b>Sold count 90d:</b> ${entry.validSoldCount || 0}</div>
+     <div>
+  <b>Comp count:</b>
+  ${
+    entry.validActiveCount ||
+    entry.validSoldCount ||
+    0
+  }
+</div>
       <div><b>Status:</b> ${escapeHtml(entry.status || "")}</div>
       <div style="font-size:11px; color:#555;">${escapeHtml(entry.reason || "")}</div>
     </div>
@@ -9862,11 +11478,11 @@ async function markMarketplaceAutoAnalysisComplete(
   const state = stored[MARKETPLACE_AUTO_STATE_KEY];
 
   if (options.preserveMalformedJsonRetryCount !== true) {
-    const facebookUrl = String(
-      state?.currentListingUrl ||
-      window.location.href ||
-      ""
-    ).split("?")[0];
+    const facebookUrl =
+  String(
+    window.location.href ||
+    ""
+  ).split("?")[0];
 
     const listingId =
       getFacebookMarketplaceItemId(facebookUrl);
@@ -9878,11 +11494,11 @@ async function markMarketplaceAutoAnalysisComplete(
 
 if (!state?.running) return;
 
-const completedFacebookUrl = String(
-  state.currentListingUrl ||
-  window.location.href ||
-  ""
-).split("?")[0];
+const completedFacebookUrl =
+  String(
+    window.location.href ||
+    ""
+  ).split("?")[0];
 
 const completedListingId =
   getFacebookMarketplaceItemId(
@@ -9897,22 +11513,39 @@ if (completedListingId) {
 
 await updateSessionListingResult(finalResult);
 
+await upsertMarketplaceAnalysisJob({
+  status:
+    "complete",
+
+  stage:
+    "complete",
+
+  finalResult,
+
+  completedAt:
+    Date.now()
+});
+
+/*
+  If this listing owns the serialized finishing
+  lock, its finishing work is now complete.
+*/
+await releaseMarketplaceFinishLock();
+
+
 await chrome.storage.local.set({
   [MARKETPLACE_AUTO_STATE_KEY]: {
     ...state,
 
     /*
-      The Facebook listing tab is still waiting to
-      consume the finished result.
-
-      waitForMarketplaceAnalysisToFinish() will clear
-      this only AFTER the seller-message step.
+      Shared state only keeps this for display/history.
+      Per-listing completion lives in the job registry.
     */
-    waitingForAnalysis: true,
+    lastResult:
+      finalResult,
 
-    analysisDone: true,
-    lastResult: finalResult,
-    lastResultAt: Date.now()
+    lastResultAt:
+      Date.now()
   }
 });
 
@@ -10677,51 +12310,41 @@ if (
     debugCounts: itemResult.debugCounts
   });
 
-  setTimeout(async () => {
-  const opened = openEbaySoldSearch(
-    currentItem.ebaySearchQuery,
-    currentItem.condition,
-    rerunTerms
-  );
+ setTimeout(
+  async () => {
+    const opened =
+      openEbaySoldSearch(
+        currentItem.ebaySearchQuery,
+        currentItem.condition,
+        rerunTerms
+      );
 
-  if (!opened) {
-    const unresolvedResult = {
-      recommendation: "Unresolved",
-      reason:
-        "Search-pollution rerun was skipped because the item had no resolved eBay query.",
-      item: currentItem
-    };
+    if (!opened) {
+      const unresolvedResult = {
+        recommendation:
+          "Unresolved",
 
-    await markMarketplaceAutoAnalysisComplete(
-      unresolvedResult
-    );
+        reason:
+          "Search-pollution rerun was skipped because the item had no resolved eBay query.",
 
-    const autoRunning =
-      await isMarketplaceAutoAnalyzerRunning();
+        item:
+          currentItem
+      };
 
-    if (autoRunning) {
-      setTimeout(() => {
-        window.close();
-      }, 800);
+      await markMarketplaceAutoAnalysisComplete(
+        unresolvedResult
+      );
+
+      return;
     }
+  },
+  1200
+);
 
-    return;
-  }
-
-  const autoRunning =
-    await isMarketplaceAutoAnalyzerRunning();
-
-  if (autoRunning) {
-    setTimeout(() => {
-      window.close();
-    }, 800);
-  }
-}, 1200);
-
-  return;
+return;
 }
 
-    const updatedResults = [
+const updatedResults = [
       ...(context.results || []),
       {
         item: currentItem,
@@ -10944,6 +12567,10 @@ if (autoRunning) {
     }, 1200);
   }
 }
+
+/*
+  Close runEbayCompAnalyzer()
+*/
 }
 
 function addAutoAnalyzerButtons() {
