@@ -4913,7 +4913,7 @@ next = finalLinks.find(link => {
     sourceText: next.text || ""
   });
 
- const claimed =
+const claimed =
   await claimMarketplaceListingId(
     next.listingId
   );
@@ -4929,10 +4929,79 @@ if (!claimed) {
   return;
 }
 
-const openResult =
-  await openMarketplaceListingInNewTab(
-    next.fullHref
+
+/*
+  Reserve the analysis slot BEFORE opening
+  the Marketplace child tab.
+
+  This prevents another browse-controller
+  invocation from seeing an empty slot during
+  the delay between tab creation and
+  aiCheckListing() starting.
+*/
+const reservedJobId =
+  `listing-${next.listingId}`;
+
+await patchMarketplaceAnalysisJobById(
+  reservedJobId,
+  {
+    listingId:
+      next.listingId,
+
+    url:
+      next.fullHref
+        .split("?")[0],
+
+    status:
+      "opening",
+
+    stage:
+      "reserved-before-tab-open",
+
+    startedAt:
+      Date.now()
+  },
+  {
+    currentUrl:
+      next.fullHref
+        .split("?")[0]
+  }
+);
+
+
+let openResult;
+
+try {
+  openResult =
+    await openMarketplaceListingInNewTab(
+      next.fullHref
+    );
+
+} catch (error) {
+  await failMarketplaceAnalysisJobById(
+    reservedJobId,
+    error?.message ||
+      "Marketplace listing tab failed to open.",
+    "tab-open-failed"
   );
+
+  throw error;
+}
+
+
+console.log(
+  "[MARKETPLACE TAB] Listing opened in independent tab:",
+  {
+    listingId:
+      next.listingId,
+
+    url:
+      next.fullHref,
+
+    tabId:
+      openResult?.tabId
+  }
+);
 
 console.log(
   "[MARKETPLACE TAB] Listing opened in independent tab:",
