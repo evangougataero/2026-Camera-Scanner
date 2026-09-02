@@ -22,6 +22,90 @@ console.log("eBay AI Comp Checker loaded on:", window.location.href);
 */
 const TESTING_MODE = false;
 
+const MARKETPLACE_OUTREACH_LOCK_KEY =
+  "marketplaceDirectOutreachLock";
+
+  async function acquireMarketplaceOutreachLock(
+  listingId
+) {
+  while (true) {
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_OUTREACH_LOCK_KEY
+      );
+
+    const lock =
+      stored[
+        MARKETPLACE_OUTREACH_LOCK_KEY
+      ];
+
+    const now =
+      Date.now();
+
+    /*
+      Recover from abandoned locks after 2 minutes.
+    */
+    if (
+      !lock ||
+      !lock.listingId ||
+      now - Number(lock.acquiredAt || 0) >
+        2 * 60 * 1000
+    ) {
+      await chrome.storage.local.set({
+        [MARKETPLACE_OUTREACH_LOCK_KEY]: {
+          listingId,
+          acquiredAt:
+            now
+        }
+      });
+
+      const verify =
+        await chrome.storage.local.get(
+          MARKETPLACE_OUTREACH_LOCK_KEY
+        );
+
+      if (
+        verify[
+          MARKETPLACE_OUTREACH_LOCK_KEY
+        ]?.listingId === listingId
+      ) {
+        console.log(
+          "[DIRECT OUTREACH] Acquired outreach lock:",
+          listingId
+        );
+
+        return;
+      }
+    }
+
+    await sleep(1000);
+  }
+}
+
+async function releaseMarketplaceOutreachLock(
+  listingId
+) {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_OUTREACH_LOCK_KEY
+    );
+
+  if (
+    stored[
+      MARKETPLACE_OUTREACH_LOCK_KEY
+    ]?.listingId === listingId
+  ) {
+    await chrome.storage.local.remove(
+      MARKETPLACE_OUTREACH_LOCK_KEY
+    );
+
+    console.log(
+      "[DIRECT OUTREACH] Released outreach lock:",
+      listingId
+    );
+  }
+}
+
 const MAX_CONCURRENT_MARKETPLACE_ANALYSES =
   2;
 
@@ -2938,11 +3022,44 @@ async function waitForMarketplaceMessageSendConfirmation({
       Successful sends normally clear the composer
       or restore Facebook's default message.
     */
-    if (
-      currentValue !== expected
-    ) {
-      return true;
-    }
+/*
+  A successful Facebook send normally:
+
+  1. removes/replaces the composer element, OR
+  2. clears the composer, OR
+  3. restores Facebook's stock "Is this available?"
+     style placeholder/default message.
+
+  Do not interpret an arbitrary text mutation as
+  proof that the message was sent.
+*/
+if (!currentValue) {
+  return true;
+}
+
+const normalizedCurrent =
+  currentValue
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+const normalizedExpected =
+  expected
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+const restoredDefaultMessage =
+  normalizedCurrent.includes(
+    "is this available"
+  ) &&
+  !normalizedExpected.includes(
+    "is this available"
+  );
+
+if (restoredDefaultMessage) {
+  return true;
+}
 
     await sleep(250);
   }
@@ -4205,6 +4322,7 @@ const state = {
   sessionId: outreachSessionId,
   startedAt: now,
   clickedListings: 0,
+  messagesSent: 0,
   hitsFound: 0,
   outreachQueued: 0
 }
@@ -5593,29 +5711,318 @@ isHitRecommendation(
       }
     }
 
-  } else {
-    /*
-      MODE 2:
-      Message the seller immediately using this
-      scanner extension.
-    */
-    try {
-      const messageResult =
-await messageMarketplaceSellerForVerifiedHit(
-  finalResult
-);
+} else {
+  /*
+    MODE 2:
+    Message seller directly.
+
+    Only ONE listing tab may interact with
+    Facebook's seller-message UI at a time.
+  */
+
+  const outreachListingId =
+    getFacebookMarketplaceItemId();
+
+  await acquireMarketplaceOutreachLock(
+    outreachListingId
+  );
+
+  try {
+    let messageResult = null;
+    let messageError = null;
+
+    const MAX_MESSAGE_ATTEMPTS = 3;
+
+    for (
+      let attempt = 1;
+      attempt <= MAX_MESSAGE_ATTEMPTS;
+      attempt += 1
+    ) {
       console.log(
-        "[DIRECT OUTREACH] Immediate outreach result:",
-        messageResult
+        `[DIRECT OUTREACH] Send attempt ${attempt}/${MAX_MESSAGE_ATTEMPTS}`
       );
 
-    } catch (messageError) {
+      try {
+        messageResult =
+          await messageMarketplaceSellerForVerifiedHit(
+            finalResult
+          );
+
+        console.log(
+          "[DIRECT OUTREACH] Immediate outreach result:",
+          messageResult
+        );
+
+        /*
+          Successful send.
+        */
+        if (messageResult?.sent === true) {
+          const freshStored =
+            await chrome.storage.local.get(
+              MARKETPLACE_AUTO_STATE_KEY
+            );
+
+          const freshState =
+            freshStored[
+              MARKETPLACE_AUTO_STATE_KEY
+            ];
+
+          const freshLog =
+            freshState?.sessionLog || {};
+
+          await updateMarketplaceSessionLog({
+            messagesSent:
+              Number(
+                freshLog.messagesSent || 0
+              ) + 1
+          });
+
+          break;
+        }
+
+        /*
+          This listing was previously messaged.
+          Do not retry it.
+        */
+        if (
+          messageResult?.reason ===
+          "Already messaged."
+        ) {
+          break;
+        }
+
+        console.warn(
+          "[DIRECT OUTREACH] Message was NOT sent:",
+          {
+            attempt,
+            reason:
+              messageResult?.reason ||
+              "Unknown reason"
+          }
+        );
+
+      } catch (error) {
+        messageError = error;
+
+        console.warn(
+          "[DIRECT OUTREACH] Message attempt threw:",
+          {
+            attempt,
+            error
+          }
+        );
+      }
+
+      /*
+        Allow Facebook's DOM to settle before
+        trying the composer again.
+      */
+      if (
+        attempt <
+        MAX_MESSAGE_ATTEMPTS
+      ) {
+        await sleep(
+          randomInt(3000, 6000)
+        );
+
+        window.scrollTo({
+          top: Math.max(
+            0,
+            document.body.scrollHeight *
+              0.35
+          ),
+          behavior: "smooth"
+        });
+
+        await sleep(1000);
+      }
+    }
+
+    const messageSucceeded =
+      messageResult?.sent === true;
+
+    const alreadyMessaged =
+      messageResult?.reason ===
+      "Already messaged.";
+
+    /*
+      CRITICAL:
+
+      Never silently discard a verified hit
+      whose outreach failed.
+    */
+    if (
+      isHitRecommendation(finalResult) &&
+      !messageSucceeded &&
+      !alreadyMessaged
+    ) {
+      console.error(
+        "[DIRECT OUTREACH] VERIFIED HIT OUTREACH FAILED AFTER RETRIES.",
+        {
+          listingId:
+            outreachListingId,
+
+          listingUrl:
+            window.location.href
+              .split("?")[0],
+
+          recommendation:
+            finalResult
+              ?.recommendation,
+
+          attempts:
+            MAX_MESSAGE_ATTEMPTS,
+
+          lastResult:
+            messageResult,
+
+          lastError:
+            messageError
+              ? String(
+                  messageError?.message ||
+                  messageError
+                )
+              : null
+        }
+      );
+
+      await stopMarketplaceAutoAnalyzer({
+        reason:
+          "Verified hit could not be messaged after 3 attempts."
+      });
+
+      return;
+    }
+
+  } finally {
+    /*
+      Always release the serialization lock,
+      including errors and scanner-stop cases.
+    */
+    await releaseMarketplaceOutreachLock(
+      outreachListingId
+    );
+  }
+}
+
+      /*
+        "Already messaged" is intentionally not retried.
+        It means our persistent message registry says
+        this listing was contacted previously.
+      */
+      if (
+        messageResult?.reason ===
+        "Already messaged."
+      ) {
+        break;
+      }
+
       console.warn(
-        "[DIRECT OUTREACH] Immediate seller message failed:",
-        messageError
+        "[DIRECT OUTREACH] Message was NOT sent:",
+        {
+          attempt,
+          reason:
+            messageResult?.reason ||
+            "Unknown reason"
+        }
+      );
+
+    } catch (error) {
+      messageError = error;
+
+      console.warn(
+        "[DIRECT OUTREACH] Message attempt threw:",
+        {
+          attempt,
+          error
+        }
       );
     }
+
+    /*
+      Give Facebook time to recover/re-render its
+      composer before another attempt.
+    */
+    if (attempt < MAX_MESSAGE_ATTEMPTS) {
+      await sleep(
+        randomInt(3000, 6000)
+      );
+
+      /*
+        Return toward the message area before retrying.
+      */
+      window.scrollTo({
+        top: Math.max(
+          0,
+          document.body.scrollHeight * 0.35
+        ),
+        behavior: "smooth"
+      });
+
+      await sleep(1000);
+    }
   }
+
+  const messageSucceeded =
+    messageResult?.sent === true;
+
+  const alreadyMessaged =
+    messageResult?.reason ===
+    "Already messaged.";
+
+  /*
+    CRITICAL FIX:
+
+    Do NOT mark this listing processed and do NOT
+    close the tab if a verified hit failed outreach.
+  */
+  if (
+    isHitRecommendation(finalResult) &&
+    !messageSucceeded &&
+    !alreadyMessaged
+  ) {
+    console.error(
+      "[DIRECT OUTREACH] VERIFIED HIT OUTREACH FAILED AFTER RETRIES.",
+      {
+        listingId:
+          getFacebookMarketplaceItemId(),
+        listingUrl:
+          window.location.href.split("?")[0],
+
+        recommendation:
+          finalResult?.recommendation,
+
+        attempts:
+          MAX_MESSAGE_ATTEMPTS,
+
+        lastResult:
+          messageResult,
+
+        lastError:
+          messageError
+            ? String(
+                messageError?.message ||
+                messageError
+              )
+            : null
+      }
+    );
+
+    /*
+      Stop instead of silently throwing away a hit.
+
+      The listing tab remains open, allowing the
+      message to be sent manually and making the
+      failure impossible to overlook.
+    */
+    await stopMarketplaceAutoAnalyzer({
+      reason:
+        "Verified hit could not be messaged after 3 attempts."
+    });
+
+    return;
+  }
+}
 
  /*
   queueMarketplaceSellerForVerifiedHit() may have
