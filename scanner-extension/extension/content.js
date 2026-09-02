@@ -5733,110 +5733,99 @@ isHitRecommendation(
 
     const MAX_MESSAGE_ATTEMPTS = 3;
 
-    for (
-      let attempt = 1;
-      attempt <= MAX_MESSAGE_ATTEMPTS;
-      attempt += 1
-    ) {
-      console.log(
-        `[DIRECT OUTREACH] Send attempt ${attempt}/${MAX_MESSAGE_ATTEMPTS}`
+for (
+  let attempt = 1;
+  attempt <= MAX_MESSAGE_ATTEMPTS;
+  attempt += 1
+) {
+  console.log(
+    `[DIRECT OUTREACH] Send attempt ${attempt}/${MAX_MESSAGE_ATTEMPTS}`
+  );
+
+  try {
+    messageResult =
+      await messageMarketplaceSellerForVerifiedHit(
+        finalResult
       );
 
-      try {
-        messageResult =
-          await messageMarketplaceSellerForVerifiedHit(
-            finalResult
-          );
+    console.log(
+      "[DIRECT OUTREACH] Immediate outreach result:",
+      messageResult
+    );
 
-        console.log(
-          "[DIRECT OUTREACH] Immediate outreach result:",
-          messageResult
+    if (messageResult?.sent === true) {
+      const freshStored =
+        await chrome.storage.local.get(
+          MARKETPLACE_AUTO_STATE_KEY
         );
 
-        /*
-          Successful send.
-        */
-        if (messageResult?.sent === true) {
-          const freshStored =
-            await chrome.storage.local.get(
-              MARKETPLACE_AUTO_STATE_KEY
-            );
+      const freshState =
+        freshStored[
+          MARKETPLACE_AUTO_STATE_KEY
+        ];
 
-          const freshState =
-            freshStored[
-              MARKETPLACE_AUTO_STATE_KEY
-            ];
+      const freshLog =
+        freshState?.sessionLog || {};
 
-          const freshLog =
-            freshState?.sessionLog || {};
+      await updateMarketplaceSessionLog({
+        messagesSent:
+          Number(
+            freshLog.messagesSent || 0
+          ) + 1
+      });
 
-          await updateMarketplaceSessionLog({
-            messagesSent:
-              Number(
-                freshLog.messagesSent || 0
-              ) + 1
-          });
-
-          break;
-        }
-
-        /*
-          This listing was previously messaged.
-          Do not retry it.
-        */
-        if (
-          messageResult?.reason ===
-          "Already messaged."
-        ) {
-          break;
-        }
-
-        console.warn(
-          "[DIRECT OUTREACH] Message was NOT sent:",
-          {
-            attempt,
-            reason:
-              messageResult?.reason ||
-              "Unknown reason"
-          }
-        );
-
-      } catch (error) {
-        messageError = error;
-
-        console.warn(
-          "[DIRECT OUTREACH] Message attempt threw:",
-          {
-            attempt,
-            error
-          }
-        );
-      }
-
-      /*
-        Allow Facebook's DOM to settle before
-        trying the composer again.
-      */
-      if (
-        attempt <
-        MAX_MESSAGE_ATTEMPTS
-      ) {
-        await sleep(
-          randomInt(3000, 6000)
-        );
-
-        window.scrollTo({
-          top: Math.max(
-            0,
-            document.body.scrollHeight *
-              0.35
-          ),
-          behavior: "smooth"
-        });
-
-        await sleep(1000);
-      }
+      break;
     }
+
+    if (
+      messageResult?.reason ===
+      "Already messaged."
+    ) {
+      break;
+    }
+
+    console.warn(
+      "[DIRECT OUTREACH] Message was NOT sent:",
+      {
+        attempt,
+        reason:
+          messageResult?.reason ||
+          "Unknown reason"
+      }
+    );
+
+  } catch (error) {
+    messageError = error;
+
+    console.warn(
+      "[DIRECT OUTREACH] Message attempt threw:",
+      {
+        attempt,
+        error
+      }
+    );
+  }
+
+  if (
+    attempt <
+    MAX_MESSAGE_ATTEMPTS
+  ) {
+    await sleep(
+      randomInt(3000, 6000)
+    );
+
+    window.scrollTo({
+      top: Math.max(
+        0,
+        document.body.scrollHeight *
+          0.35
+      ),
+      behavior: "smooth"
+    });
+
+    await sleep(1000);
+  }
+}
 
     const messageSucceeded =
       messageResult?.sent === true;
@@ -5905,124 +5894,6 @@ isHitRecommendation(
   }
 }
 
-      /*
-        "Already messaged" is intentionally not retried.
-        It means our persistent message registry says
-        this listing was contacted previously.
-      */
-      if (
-        messageResult?.reason ===
-        "Already messaged."
-      ) {
-        break;
-      }
-
-      console.warn(
-        "[DIRECT OUTREACH] Message was NOT sent:",
-        {
-          attempt,
-          reason:
-            messageResult?.reason ||
-            "Unknown reason"
-        }
-      );
-
-    } catch (error) {
-      messageError = error;
-
-      console.warn(
-        "[DIRECT OUTREACH] Message attempt threw:",
-        {
-          attempt,
-          error
-        }
-      );
-    }
-
-    /*
-      Give Facebook time to recover/re-render its
-      composer before another attempt.
-    */
-    if (attempt < MAX_MESSAGE_ATTEMPTS) {
-      await sleep(
-        randomInt(3000, 6000)
-      );
-
-      /*
-        Return toward the message area before retrying.
-      */
-      window.scrollTo({
-        top: Math.max(
-          0,
-          document.body.scrollHeight * 0.35
-        ),
-        behavior: "smooth"
-      });
-
-      await sleep(1000);
-    }
-  }
-
-  const messageSucceeded =
-    messageResult?.sent === true;
-
-  const alreadyMessaged =
-    messageResult?.reason ===
-    "Already messaged.";
-
-  /*
-    CRITICAL FIX:
-
-    Do NOT mark this listing processed and do NOT
-    close the tab if a verified hit failed outreach.
-  */
-  if (
-    isHitRecommendation(finalResult) &&
-    !messageSucceeded &&
-    !alreadyMessaged
-  ) {
-    console.error(
-      "[DIRECT OUTREACH] VERIFIED HIT OUTREACH FAILED AFTER RETRIES.",
-      {
-        listingId:
-          getFacebookMarketplaceItemId(),
-        listingUrl:
-          window.location.href.split("?")[0],
-
-        recommendation:
-          finalResult?.recommendation,
-
-        attempts:
-          MAX_MESSAGE_ATTEMPTS,
-
-        lastResult:
-          messageResult,
-
-        lastError:
-          messageError
-            ? String(
-                messageError?.message ||
-                messageError
-              )
-            : null
-      }
-    );
-
-    /*
-      Stop instead of silently throwing away a hit.
-
-      The listing tab remains open, allowing the
-      message to be sent manually and making the
-      failure impossible to overlook.
-    */
-    await stopMarketplaceAutoAnalyzer({
-      reason:
-        "Verified hit could not be messaged after 3 attempts."
-    });
-
-    return;
-  }
-}
 
  /*
   queueMarketplaceSellerForVerifiedHit() may have
