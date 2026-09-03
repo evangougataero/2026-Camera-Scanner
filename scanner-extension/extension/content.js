@@ -5841,47 +5841,63 @@ for (
       whose outreach failed.
     */
     if (
-      isHitRecommendation(finalResult) &&
-      !messageSucceeded &&
-      !alreadyMessaged
-    ) {
-      console.error(
-        "[DIRECT OUTREACH] VERIFIED HIT OUTREACH FAILED AFTER RETRIES.",
-        {
-          listingId:
-            outreachListingId,
+  isHitRecommendation(finalResult) &&
+  !messageSucceeded &&
+  !alreadyMessaged
+) {
+  console.error(
+    "[DIRECT OUTREACH] VERIFIED HIT OUTREACH FAILED AFTER RETRIES.",
+    {
+      listingId:
+        outreachListingId,
 
-          listingUrl:
-            window.location.href
-              .split("?")[0],
+      listingUrl:
+        window.location.href
+          .split("?")[0],
 
-          recommendation:
-            finalResult
-              ?.recommendation,
+      recommendation:
+        finalResult?.recommendation,
 
-          attempts:
-            MAX_MESSAGE_ATTEMPTS,
+      attempts:
+        MAX_MESSAGE_ATTEMPTS,
 
-          lastResult:
-            messageResult,
+      lastResult:
+        messageResult,
 
-          lastError:
-            messageError
-              ? String(
-                  messageError?.message ||
-                  messageError
-                )
-              : null
-        }
-      );
-
-      await stopMarketplaceAutoAnalyzer({
-        reason:
-          "Verified hit could not be messaged after 3 attempts."
-      });
-
-      return;
+      lastError:
+        messageError
+          ? String(
+              messageError?.message ||
+              messageError
+            )
+          : null
     }
+  );
+
+  /*
+    IMPORTANT:
+
+    The hit has already been recorded by the normal
+    hit-save path. A Facebook messaging failure should
+    not terminate the entire scanner session.
+
+    Leave this listing unmarked as messaged so it can
+    be inspected/retried separately, then allow the
+    scanner to continue.
+  */
+  console.warn(
+    "[DIRECT OUTREACH] Hit remains saved, but outreach failed. Continuing scanner.",
+    {
+      listingId:
+        outreachListingId,
+
+      reason:
+        messageResult?.reason ||
+        messageError?.message ||
+        "Unknown messaging failure"
+    }
+  );
+}
 
   } finally {
     /*

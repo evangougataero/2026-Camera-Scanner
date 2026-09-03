@@ -1077,12 +1077,6 @@ function collectObjectiveLensEvidence({
   listingScreenshotOcr,
   explicitFacts
 }) {
-
-  const provisionalLensIdentity =
-  normalizeLensIdentity(
-    product?.lensIdentity ||
-    {}
-  );
   const productId =
     String(
       product?.productId || ""
@@ -1090,9 +1084,21 @@ function collectObjectiveLensEvidence({
 
 
   /*
-    Product IDs are global now, so gallery index
-    is deliberately NOT part of this match.
+    IMPORTANT:
+
+    Lensfun lookup fields come ONLY from the
+    normalized + server-validated Step-5 structure.
+
+    Raw OCR remains available below strictly for
+    debugging/audit purposes.
   */
+  const normalizedIdentity =
+    normalizeLensIdentity(
+      product?.lensIdentity ||
+      {}
+    );
+
+
   const matchingOcrEntries =
     (productOcrResults || [])
       .filter(
@@ -1121,173 +1127,68 @@ function collectObjectiveLensEvidence({
       listingTitle,
       listingDescription,
 
-      ...(Array.isArray(
-        explicitFacts?.explicitlyIncluded
-      )
-        ? explicitFacts.explicitlyIncluded
-        : []),
-
-      ...(Array.isArray(
-        explicitFacts?.listingNotes
-      )
-        ? explicitFacts.listingNotes
-        : [])
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-
-  /*
-    Product OCR is considerably more important
-    for focal length / aperture than screenshot OCR.
-  */
-  const strongestText =
-    [
-      productOcrText,
-      sellerEvidence
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-
-const focalLength =
-  extractFocalLengthFromText(
-    productOcrText
-  ) ||
-  provisionalLensIdentity
-    .focalLength ||
-  extractFocalLengthFromText(
-    sellerEvidence
-  );
-
-
-const maxAperture =
-  extractMaxApertureFromText(
-    productOcrText
-  ) ||
-  provisionalLensIdentity
-    .maxAperture ||
-  extractMaxApertureFromText(
-    sellerEvidence
-  );
-
-
-  /*
-    Start with the Step-5 brand if supplied.
-
-    Unlike mount/aperture, manufacturer names
-    are generally safe for Step 5 to recognize.
-  */
-  let brand =
-    String(
-      product
-        ?.lensIdentity
-        ?.brand ||
-      ""
-    ).trim();
-
-
-  /*
-    If Step 5 did not establish a manufacturer,
-    look for a Lensfun manufacturer name literally
-    appearing in the objective evidence.
-  */
-  if (!brand) {
-const normalizedEvidence =
-  normalizeLensfunComparisonText(
-    productOcrText
-  );
-
-
-    const makers =
-      [
-        ...new Set(
-          lensfunDatabase.lenses
-            .map(
-              lens =>
-                String(
-                  lens?.maker || ""
-                ).trim()
-            )
-            .filter(Boolean)
+      ...(
+        Array.isArray(
+          explicitFacts?.explicitlyIncluded
         )
-      ]
-        .sort(
-          (a, b) =>
-            b.length -
-            a.length
-        );
+          ? explicitFacts.explicitlyIncluded
+          : []
+      ),
 
-
-    const matchedMaker =
-      makers.find(
-        maker =>
-          normalizedEvidence.includes(
-            normalizeLensfunComparisonText(
-              maker
-            )
-          )
-      );
-
-
-    brand =
-      matchedMaker || "";
-  }
-
-
-  /*
-    Only trust an alleged mount if that exact
-    text actually appears in objective evidence.
-  */
-  const step5Mount =
-    String(
-      product
-        ?.lensIdentity
-        ?.mountSeries ||
-      ""
-    ).trim();
-
-
-  const objectiveMount =
-  step5Mount &&
-  hasExactObjectiveEvidence(
-    strongestText,
-    step5Mount
-  )
-    ? step5Mount
-    : null;
+      ...(
+        Array.isArray(
+          explicitFacts?.listingNotes
+        )
+          ? explicitFacts.listingNotes
+          : []
+      )
+    ]
+      .filter(Boolean)
+      .join("\n");
 
 
   return {
-  productId,
+    productId,
 
-  brand:
-    brand || null,
+    /*
+      THESE are the Lensfun query fields.
+    */
+    brand:
+      normalizedIdentity.brand,
 
-  focalLength,
+    focalLength:
+      normalizedIdentity.focalLength,
 
-  maxAperture,
+    maxAperture:
+      normalizedIdentity.maxAperture,
 
-  featureModelCodes:
-    provisionalLensIdentity
-      .featureModelCodes,
+    modelCodes:
+      normalizedIdentity.modelCodes,
 
-  generation:
-    provisionalLensIdentity
-      .generation,
+    generation:
+      normalizedIdentity.generation,
 
-  explicitMount:
-    objectiveMount,
+    explicitMount:
+      normalizedIdentity.mountSeries,
 
-  productOcrText,
+    extractedEvidence:
+      normalizeStringArray(
+        product?.extracted_evidence
+      ),
 
-  sellerEvidence,
+    /*
+      Audit/debug fields only.
+      findLensfunCandidates() must not re-parse these.
+    */
+    productOcrText,
 
-  listingScreenshotOcr:
-    String(
-      listingScreenshotOcr || ""
-    ).trim()
-};
+    sellerEvidence,
+
+    listingScreenshotOcr:
+      String(
+        listingScreenshotOcr || ""
+      ).trim()
+  };
 }
 
 function expandLensfunCandidateVariants(
@@ -2640,6 +2541,204 @@ function clampNumber(
   );
 }
 
+function normalizeStringArray(
+  value
+) {
+  const values =
+    Array.isArray(value)
+      ? value
+      : value == null
+        ? []
+        : [value];
+
+  return [
+    ...new Set(
+      values
+        .map(
+          item =>
+            String(
+              item || ""
+            ).trim()
+        )
+        .filter(Boolean)
+    )
+  ];
+}
+
+
+function getStep5GroundingSources({
+  productId,
+  productOcrResults,
+  listingTitle,
+  listingDescription,
+  explicitFacts
+}) {
+  const matchingProductOcr =
+    (productOcrResults || [])
+      .filter(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim() ===
+          String(
+            productId || ""
+          ).trim()
+      )
+      .map(
+        item =>
+          String(
+            item?.ocrText || ""
+          ).trim()
+      )
+      .filter(Boolean);
+
+
+  const sellerSources = [
+    String(
+      listingTitle || ""
+    ).trim(),
+
+    String(
+      listingDescription || ""
+    ).trim(),
+
+    ...(
+      Array.isArray(
+        explicitFacts?.explicitlyIncluded
+      )
+        ? explicitFacts.explicitlyIncluded
+        : []
+    ),
+
+    ...(
+      Array.isArray(
+        explicitFacts?.listingNotes
+      )
+        ? explicitFacts.listingNotes
+        : []
+    )
+  ]
+    .map(
+      value =>
+        String(
+          value || ""
+        ).trim()
+    )
+    .filter(Boolean);
+
+
+  return [
+    ...matchingProductOcr,
+    ...sellerSources
+  ];
+}
+
+
+function keepOnlyVerbatimEvidence(
+  extractedEvidence,
+  groundingSources
+) {
+  return normalizeStringArray(
+    extractedEvidence
+  ).filter(
+    evidence =>
+      groundingSources.some(
+        source =>
+          String(source)
+            .includes(
+              evidence
+            )
+      )
+  );
+}
+
+
+function evidenceSupportsLiteral(
+  value,
+  evidence
+) {
+  const cleanValue =
+    String(
+      value || ""
+    ).trim();
+
+  if (!cleanValue) {
+    return false;
+  }
+
+
+  return evidence.some(
+    text =>
+      hasExactObjectiveEvidence(
+        text,
+        cleanValue
+      )
+  );
+}
+
+
+function evidenceSupportsFocalLength(
+  value,
+  evidence
+) {
+  const target =
+    normalizeFocalForComparison(
+      value
+    );
+
+  if (!target) {
+    return false;
+  }
+
+
+  return evidence.some(
+    text => {
+      const extracted =
+        extractFocalLengthFromText(
+          text
+        );
+
+      return (
+        normalizeFocalForComparison(
+          extracted
+        ) ===
+        target
+      );
+    }
+  );
+}
+
+
+function evidenceSupportsAperture(
+  value,
+  evidence
+) {
+  const target =
+    normalizeApertureForComparison(
+      value
+    );
+
+  if (!target) {
+    return false;
+  }
+
+
+  return evidence.some(
+    text => {
+      const extracted =
+        extractMaxApertureFromText(
+          text
+        );
+
+      return (
+        normalizeApertureForComparison(
+          extracted
+        ) ===
+        target
+      );
+    }
+  );
+}
 
 function normalizeLocalizerBoundingBox(
   boundingBox
@@ -4560,6 +4659,14 @@ function cleanNullableIdentityField(value) {
   return cleaned || null;
 }
 
+function normalizeLensModelCodes(
+  value
+) {
+  return normalizeStringArray(
+    value
+  );
+}
+
 function normalizeLensIdentity(
   lensIdentity = {}
 ) {
@@ -4589,8 +4696,9 @@ function normalizeLensIdentity(
         lensIdentity?.maxAperture
       ),
 
-    featureModelCodes:
-      cleanNullableIdentityField(
+    modelCodes:
+      normalizeLensModelCodes(
+        lensIdentity?.modelCodes ??
         lensIdentity?.featureModelCodes
       ),
 
@@ -4744,13 +4852,13 @@ if (
   /*
     Legacy/objective-evidence fallback.
   */
-  return [
-    normalized.mountSeries,
-    normalized.focalLength,
-    normalized.maxAperture,
-    normalized.featureModelCodes,
-    normalized.generation
-  ]
+return [
+  normalized.mountSeries,
+  normalized.focalLength,
+  normalized.maxAperture,
+  ...normalized.modelCodes,
+  normalized.generation
+]
     .filter(Boolean)
     .join(" ")
     .replace(/\s+/g, " ")
@@ -8211,6 +8319,211 @@ galleryResults.push({
   }
 );
 
+const STEP5_RECONCILIATION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+
+  properties: {
+    primaryProducts: {
+      type: "array",
+
+      items: {
+        type: "object",
+        additionalProperties: false,
+
+        properties: {
+          productId: {
+            type: "string"
+          },
+
+          galleryIndex: {
+            type: "integer"
+          },
+
+          productType: {
+            type: "string",
+            enum: [
+              "camera body",
+              "camera",
+              "camera lens",
+              "flash"
+            ]
+          },
+
+          /*
+            Non-lens models still need a model-name field,
+            but it is isolated from lens extraction.
+          */
+          nonLensIdentity: {
+            type: [
+              "object",
+              "null"
+            ],
+
+            additionalProperties: false,
+
+            properties: {
+              brand: {
+                type: [
+                  "string",
+                  "null"
+                ]
+              },
+
+              modelName: {
+                type: [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+
+            required: [
+              "brand",
+              "modelName"
+            ]
+          },
+
+          /*
+            IMPORTANT:
+
+            There is intentionally NO:
+              model
+              canonicalModel
+
+            inside the LLM-controlled lens structure.
+          */
+          lensIdentity: {
+            type: [
+              "object",
+              "null"
+            ],
+
+            additionalProperties: false,
+
+            properties: {
+              brand: {
+                type: [
+                  "string",
+                  "null"
+                ]
+              },
+
+              mountSeries: {
+                type: [
+                  "string",
+                  "null"
+                ]
+              },
+
+              focalLength: {
+                type: [
+                  "string",
+                  "null"
+                ]
+              },
+
+              maxAperture: {
+                type: [
+                  "string",
+                  "null"
+                ]
+              },
+
+              /*
+                Actual literal markings / model codes only.
+
+                Examples:
+                  H-FS14140
+                  H-FSA14140
+                  A006
+
+                Empty array if absent.
+              */
+              modelCodes: {
+                type: "array",
+                items: {
+                  type: "string"
+                }
+              },
+
+              generation: {
+                type: [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+
+            required: [
+              "brand",
+              "mountSeries",
+              "focalLength",
+              "maxAperture",
+              "modelCodes",
+              "generation"
+            ]
+          },
+
+          /*
+            These must be literal substrings copied from
+            the supplied Marketplace/OCR source.
+          */
+          extracted_evidence: {
+            type: "array",
+            items: {
+              type: "string"
+            }
+          }
+        },
+
+        required: [
+          "productId",
+          "galleryIndex",
+          "productType",
+          "nonLensIdentity",
+          "lensIdentity",
+          "extracted_evidence"
+        ]
+      }
+    },
+
+    needsGoogleLens: {
+      type: "array",
+
+      items: {
+        type: "object",
+        additionalProperties: false,
+
+        properties: {
+          galleryIndex: {
+            type: "integer"
+          },
+
+          productId: {
+            type: "string"
+          },
+
+          reason: {
+            type: "string"
+          }
+        },
+
+        required: [
+          "galleryIndex",
+          "productId",
+          "reason"
+        ]
+      }
+    }
+  },
+
+  required: [
+    "primaryProducts",
+    "needsGoogleLens"
+  ]
+};
+
 app.post(
   "/reconcile-primary-products",
   async (
@@ -8430,10 +8743,6 @@ const acceptedDataForSeoIdentity =
   (
     confidence === "high" &&
     consensus === "strong"
-  ) ||
-  (
-    confidence === "medium" &&
-    consensus === "mixed"
   );
 
 if (
@@ -8508,14 +8817,10 @@ function getLensfunCorroboratedDataForSeoCandidate(
       .toLowerCase();
 
 
-  const isAuthoritativeDataForSeo =
+const isAuthoritativeDataForSeo =
   (
     confidence === "high" &&
     consensus === "strong"
-  ) ||
-  (
-    confidence === "medium" &&
-    consensus === "mixed"
   );
 
 if (
@@ -9062,161 +9367,192 @@ Only create *_text_* products when seller evidence establishes that
 additional physical products are included BEYOND the products already
 accounted for by the gallery evidence.
 
-LENS OBJECTIVE-EVIDENCE RULES:
+LENS EXTRACTION — STRICT GROUNDING CONTRACT:
 
-For a camera lens, your role in THIS STEP is ONLY to organize and
-structure information that has already been objectively established.
+For camera lenses, this step is an EXTRACTION step only.
 
-You are NOT identifying the lens from general knowledge.
+You are NOT identifying a canonical commercial lens model.
+You are NOT choosing the most likely revision.
+You are NOT allowed to complete a partial lens identity using camera knowledge.
 
-You are NOT trying to determine what lens is most likely present.
+The dedicated Lensfun / visual-resolution pipeline runs AFTER this step.
 
-A later dedicated lens-resolution pipeline will use Lensfun when the
-objective evidence is sufficiently specific. If the evidence is
-insufficient or Lensfun cannot establish a canonical identity, the
-product will be routed to Google Lens using the actual Marketplace image.
+For every camera lens:
 
-For every non-null lensIdentity field, the exact information must be
-traceable to objective evidence supplied to this prompt.
+- nonLensIdentity MUST be null.
+- lensIdentity MUST contain only attributes supported by Marketplace source evidence.
+- extracted_evidence MUST contain exact verbatim substrings copied from the supplied source material.
 
-Objective evidence includes:
+AUTHORIZED SOURCES FOR extracted_evidence:
 
-- seller-written listing text;
-- OCR text read from the physical product image;
-- an already-supplied Google Lens identification result.
+1. Marketplace listing title.
+2. Marketplace listing description / seller-written text.
+3. OCR from the physical Marketplace product image.
+4. Explicit seller-written facts extracted from those sources.
 
-For each camera lens:
+Google Search By Image / DataForSEO evidence is NOT an authorized source
+for lensIdentity fields in this extraction step.
 
-- brand may be populated ONLY when the manufacturer is directly supported;
-- focalLength may be populated ONLY when the focal length or focal-length
-  range is directly present in the evidence;
-- maxAperture may be populated ONLY when the aperture is directly present
-  in the evidence;
-- featureModelCodes may be populated ONLY when those markings are directly
-  present in the evidence;
-- generation may be populated ONLY when the generation/version is directly
-  present in the evidence;
-- mountSeries may be populated ONLY when the mount/series is directly
-  present in seller text, OCR, or an already-supplied identification result.
+DataForSEO may be used later by the dedicated resolver, but must never
+be used here to rewrite or complete the structured Marketplace extraction.
 
-CRITICAL:
+EXTRACTED EVIDENCE RULE:
 
-Do NOT infer ANY missing lens specification from:
+Every string in extracted_evidence must be copied VERBATIM.
 
-- the attached camera body;
-- the camera model in the listing;
-- camera/lens compatibility;
-- the mount used by the camera;
-- common kit-lens combinations;
-- what lens normally ships with that camera;
-- what lens is statistically likely to be shown;
-- visual appearance alone unless an upstream identification result explicitly
-  established that information;
-- your general knowledge of camera equipment.
-
-Do NOT use one supported specification to guess another.
-
-For example:
-
-If OCR says:
-
-Canon
-Canon
-Canon
-
-and the listing contains a Canon EOS Rebel T3i,
-
-the ONLY supported lens identity may be:
-
-{
-  "brand": "Canon",
-  "mountSeries": null,
-  "focalLength": null,
-  "maxAperture": null,
-  "featureModelCodes": null,
-  "generation": null
-}
-
-You MUST NOT infer:
-
-{
-  "brand": "Canon",
-  "mountSeries": "EF-S",
-  "focalLength": "18-55mm",
-  "maxAperture": "f/3.5-5.6",
-  "featureModelCodes": "IS",
-  "generation": null
-}
-
-merely because an 18-55mm EF-S lens is commonly paired with that camera.
-
-UNKNOWN INFORMATION MUST REMAIN NULL.
-
-Before outputting every non-null lens identity field, verify that the exact
-information appears in or is directly established by the supplied evidence.
-
-If you cannot point to supporting evidence for a field, output null.
-
-It is always preferable to return an incomplete lensIdentity than to return
-a plausible but inferred identity.
-
-Do NOT infer mount from the attached camera.
-Do NOT fill missing specifications using general product knowledge.
-Do NOT change an OCR-supported aperture into a different aperture.
-Do NOT guess a likely lens revision.
+Do not paraphrase it.
+Do not normalize it.
+Do not correct OCR inside extracted_evidence.
+Do not manufacture a supporting quote.
 
 Example:
 
-OCR:
-SIGMA DC 18-250mm 1:3.5-6.3
+Source:
+"PANASONIC LUMIX G Vario Lens, 14-140MM, F3.5-5.6"
 
-Correct:
+Valid extracted_evidence:
+[
+  "PANASONIC LUMIX G Vario",
+  "14-140MM",
+  "F3.5-5.6"
+]
+
+Invalid extracted_evidence:
+[
+  "Panasonic H-FSA14140",
+  "Mark II",
+  "Version 2"
+]
+
+because none of those strings occur in the supplied Marketplace source.
+
+ATTRIBUTE RULES:
+
+brand:
+Populate only if manufacturer/brand wording is directly supported.
+
+mountSeries:
+Populate only if the mount/series is directly stated.
+
+focalLength:
+You may normalize directly stated text.
+
+Example:
+"14-140MM"
+may become:
+"14-140mm"
+
+maxAperture:
+You may normalize directly stated aperture notation.
+
+Example:
+"F3.5-5.6"
+or
+"1:3.5-5.6"
+
+may become:
+"f/3.5-5.6"
+
+modelCodes:
+Contains ONLY literal manufacturer model / SKU codes directly present
+in the Marketplace source.
+
+Examples:
+"H-FS14140"
+"H-FSA14140"
+"A006"
+
+Do NOT infer a model code from focal length, aperture, appearance,
+camera compatibility, product family, or general knowledge.
+
+generation:
+Populate ONLY if the generation/revision is explicitly present.
+
+Examples:
+"II"
+"III"
+"Mark II"
+"G2"
+
+If no generation is explicitly stated:
+generation MUST be null.
+
+Absence of "II" does NOT establish generation I.
+
+Do NOT assume:
+- the oldest version;
+- the newest version;
+- the most common version.
+
+Example source:
+
+"PANASONIC LUMIX G Vario Lens, 14-140MM, F3.5-5.6 ASPH"
+"Micro Four Thirds"
+
+Correct lensIdentity:
 
 {
-  "brand": "Sigma",
-  "mountSeries": null,
-  "focalLength": "18-250mm",
-  "maxAperture": "f/3.5-6.3",
-  "featureModelCodes": "DC",
+  "brand": "Panasonic",
+  "mountSeries": "Micro Four Thirds",
+  "focalLength": "14-140mm",
+  "maxAperture": "f/3.5-5.6",
+  "modelCodes": [],
   "generation": null
 }
 
-Incorrect:
+It is FORBIDDEN to output:
 
-{
-  "brand": "Sigma",
-  "mountSeries": "EF-S",
-  "focalLength": "18-250mm",
-  "maxAperture": "f/3.5-5.6"
-}
+"H-FSA14140"
+"II"
+"Mark II"
 
-The latter invents information not present in the objective evidence.
+unless those distinguishing facts are explicitly supported by the
+Marketplace source.
 
-Use null whenever a field is not directly supported.
+UNKNOWN INFORMATION MUST REMAIN UNKNOWN.
 
-The dedicated lens-resolution layer will canonicalize the lens AFTER
-this reconciliation step.
+The dedicated resolver owns canonical lens identification.
 
-Return exactly this JSON structure:
+Return objects matching this structure:
 
 {
   "primaryProducts": [
     {
       "productId": "camera_1",
       "galleryIndex": 1,
-      "brand": "Canon",
-      "model": "EOS 60D",
       "productType": "camera body",
-      "lensIdentity": null
+      "nonLensIdentity": {
+        "brand": "Canon",
+        "modelName": "EOS 60D"
+      },
+      "lensIdentity": null,
+      "extracted_evidence": [
+        "Canon EOS 60D"
+      ]
+    },
+    {
+      "productId": "lens_1",
+      "galleryIndex": 1,
+      "productType": "camera lens",
+      "nonLensIdentity": null,
+      "lensIdentity": {
+        "brand": "Panasonic",
+        "mountSeries": "Micro Four Thirds",
+        "focalLength": "14-140mm",
+        "maxAperture": "f/3.5-5.6",
+        "modelCodes": [],
+        "generation": null
+      },
+      "extracted_evidence": [
+        "PANASONIC LUMIX G Vario",
+        "14-140MM",
+        "F3.5-5.6",
+        "Micro Four Thirds"
+      ]
     }
   ],
-  "needsGoogleLens": [
-    {
-      "galleryIndex": 1,
-      "productId": "lens_1",
-      "reason": "OCR only establishes Canon 18-55mm and does not establish the exact lens revision."
-    }
-  ]
+
+  "needsGoogleLens": []
 }
 
 GOOGLE LENS FALLBACK RULE:
@@ -9263,27 +9599,24 @@ Requirements:
 - primaryProducts must be an array.
 - Each physical primary product should appear exactly once.
 - productId should reuse gallery product IDs when possible.
-- If a seller-explicit product was not successfully mapped to a gallery product, create a stable descriptive ID such as:
-  camera_text_1
-  lens_text_1
-  lens_text_2
-- For camera lenses:
-  - lensIdentity must be an object.
-  - top-level brand must be null.
-  - top-level model must be null.
-  - Put all supported lens identity information inside lensIdentity.
-- For non-lens products:
-  - lensIdentity must be null.
-  - brand may be null.
-  - model may be null.
-- productType must be one of:
-  "camera body"
-  "camera"
-  "camera lens"
-  "flash"
-- Return valid JSON only.
-- Do not use Markdown.
-- Do not use code fences.
+
+For camera lenses:
+- nonLensIdentity MUST be null.
+- lensIdentity MUST be an object.
+- Do not output a free-form model name.
+- Do not output canonicalModel.
+- Use modelCodes only for explicitly visible model/SKU codes.
+- extracted_evidence must contain verbatim Marketplace-source substrings.
+
+For non-lens products:
+- lensIdentity MUST be null.
+- nonLensIdentity contains brand and modelName.
+
+productType must be one of:
+"camera body"
+"camera"
+"camera lens"
+"flash"
 
 CRITICAL:
 
@@ -9316,26 +9649,42 @@ const response =
       "Step 5 primary product reconciliation",
 
     request: {
-      model:
-        "gpt-4o-mini",
+  model:
+    "gpt-4o-mini",
 
-      input: [
+  text: {
+    format: {
+      type:
+        "json_schema",
+
+      name:
+        "step5_primary_product_reconciliation",
+
+      strict:
+        true,
+
+      schema:
+        STEP5_RECONCILIATION_SCHEMA
+    }
+  },
+
+  input: [
+    {
+      role:
+        "user",
+
+      content: [
         {
-          role:
-            "user",
+          type:
+            "input_text",
 
-          content: [
-            {
-              type:
-                "input_text",
-
-              text:
-                prompt
-            }
-          ]
+          text:
+            prompt
         }
       ]
     }
+  ]
+}
   });
 
 
@@ -9373,6 +9722,198 @@ const response =
             rawText
           });
       }
+
+function sanitizeStep5Product(
+  rawProduct
+) {
+  const productId =
+    String(
+      rawProduct?.productId || ""
+    ).trim();
+
+  const productType =
+    String(
+      rawProduct?.productType || ""
+    ).trim();
+
+  const normalizedType =
+    productType.toLowerCase();
+
+  const galleryIndex =
+    Number(
+      rawProduct?.galleryIndex
+    ) || 1;
+
+
+  const groundingSources =
+    getStep5GroundingSources({
+      productId,
+      productOcrResults,
+      listingTitle,
+      listingDescription,
+      explicitFacts
+    });
+
+
+  /*
+    Never trust the model's claimed citations until
+    they have been proven to occur literally in source.
+  */
+  const extractedEvidence =
+    keepOnlyVerbatimEvidence(
+      rawProduct?.extracted_evidence,
+      groundingSources
+    );
+
+
+  if (
+    normalizedType ===
+    "camera lens"
+  ) {
+    const rawIdentity =
+      rawProduct?.lensIdentity &&
+      typeof rawProduct.lensIdentity ===
+        "object"
+        ? rawProduct.lensIdentity
+        : {};
+
+
+    const brand =
+      evidenceSupportsLiteral(
+        rawIdentity?.brand,
+        extractedEvidence
+      )
+        ? cleanNullableIdentityField(
+            rawIdentity.brand
+          )
+        : null;
+
+
+    const mountSeries =
+      evidenceSupportsLiteral(
+        rawIdentity?.mountSeries,
+        extractedEvidence
+      )
+        ? cleanNullableIdentityField(
+            rawIdentity.mountSeries
+          )
+        : null;
+
+
+    const focalLength =
+      evidenceSupportsFocalLength(
+        rawIdentity?.focalLength,
+        extractedEvidence
+      )
+        ? cleanNullableIdentityField(
+            rawIdentity.focalLength
+          )
+        : null;
+
+
+    const maxAperture =
+      evidenceSupportsAperture(
+        rawIdentity?.maxAperture,
+        extractedEvidence
+      )
+        ? cleanNullableIdentityField(
+            rawIdentity.maxAperture
+          )
+        : null;
+
+
+    const modelCodes =
+      normalizeStringArray(
+        rawIdentity?.modelCodes
+      ).filter(
+        code =>
+          evidenceSupportsLiteral(
+            code,
+            extractedEvidence
+          )
+      );
+
+
+    const generation =
+      evidenceSupportsLiteral(
+        rawIdentity?.generation,
+        extractedEvidence
+      )
+        ? cleanNullableIdentityField(
+            rawIdentity.generation
+          )
+        : null;
+
+
+    return {
+      productId,
+      galleryIndex,
+
+      /*
+        Step 5 cannot freely create a lens model.
+        The resolver does that later.
+      */
+      brand:
+        null,
+
+      model:
+        null,
+
+      productType,
+
+      lensIdentity: {
+        brand,
+
+        canonicalModel:
+          null,
+
+        mountSeries,
+        focalLength,
+        maxAperture,
+        modelCodes,
+        generation,
+
+        resolutionMode:
+          null
+      },
+
+      extracted_evidence:
+        extractedEvidence
+    };
+  }
+
+
+  const nonLensIdentity =
+    rawProduct?.nonLensIdentity &&
+    typeof rawProduct.nonLensIdentity ===
+      "object"
+      ? rawProduct.nonLensIdentity
+      : {};
+
+
+  return {
+    productId,
+    galleryIndex,
+
+    brand:
+      cleanNullableIdentityField(
+        nonLensIdentity?.brand
+      ),
+
+    model:
+      cleanNullableIdentityField(
+        nonLensIdentity?.modelName
+      ),
+
+    productType,
+
+    lensIdentity:
+      null,
+
+    extracted_evidence:
+      extractedEvidence
+  };
+}
 
 /*
   ============================================================
@@ -9447,6 +9988,9 @@ const parsedPrimaryProducts =
     parsed?.primaryProducts
   )
     ? parsed.primaryProducts
+        .map(
+          sanitizeStep5Product
+        )
     : [];
 
 
@@ -9700,8 +10244,8 @@ for (
             maxAperture:
               null,
 
-            featureModelCodes:
-              null,
+            modelCodes:
+  [],
 
             generation:
               null,
@@ -10825,12 +11369,84 @@ async function appendSavedDealToGoogleSheet(deal) {
 
   const sheetId = sheet.properties.sheetId;
 
+  /*
+    ============================================================
+    GOOGLE SHEETS APPEND PREPARATION
+    ============================================================
+
+    ORDER MATTERS:
+
+    1. Clear any active basic column filter.
+    2. Later determine the next row.
+    3. If the sheet is physically out of rows, add rows.
+    4. Write the hit.
+  */
+
+  let sheetRowCount =
+    Number(
+      sheet.properties?.gridProperties?.rowCount ||
+      0
+    );
+
+  /*
+    A normal Google Sheets column filter, like the green
+    filter icon shown in the screenshot, is represented
+    by sheet.basicFilter.
+
+    Remove it BEFORE calculating/writing the new hit rows.
+  */
+  if (sheet.basicFilter) {
+    console.log(
+      "[GOOGLE SHEETS] Active column filter detected. Clearing before hit append."
+    );
+
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+
+      requestBody: {
+        requests: [
+          {
+            clearBasicFilter: {
+              sheetId
+            }
+          }
+        ]
+      }
+    });
+
+    console.log(
+      "[GOOGLE SHEETS] Column filter cleared."
+    );
+  }
+
   const primaryItems = Array.isArray(deal.items) && deal.items.length
     ? deal.items.filter(item => item?.isPrimarySellableItem !== false)
     : [];
 
   const rowItems = primaryItems.length ? primaryItems : [deal];
   const listingRowCount = rowItems.length;
+
+  const rowItems =
+  primaryItems.length
+    ? primaryItems
+    : [deal];
+
+const listingRowCount =
+  rowItems.length;
+
+/*
+  True when this is the normal multi-product / itemized
+  lot-result format.
+
+  Listing-level resale/std-dev values must NEVER be used
+  as fallback values for individual rows in this case.
+*/
+const hasItemizedRows =
+  Array.isArray(
+    deal.items
+  ) &&
+  deal.items.length >
+    0;
 
 const recommendationText = deal.recommendation || "";
 
@@ -10883,19 +11499,68 @@ const analysisLogLink =
     const askPrice = index === 0 ? (deal.facebookPrice ?? "") : "";
 
     // Item-level / analytical values
-    const estimatedResale =
-      itemResult.expectedSalePrice ??
-      item.includedExpectedSalePrice ??
-      itemResult.estimatedResaleValue ??
-      item.estimatedResaleValue ??
-      deal.estimatedResaleValue ??
+      /*
+      ============================================================
+      ITEM-LEVEL ANALYTICAL VALUES
+      ============================================================
+
+      An excluded/invalid comp is still a real primary product,
+      so we keep its row in the Sheet.
+
+      However, it must NOT inherit the resale value or standard
+      deviation from another valid item in the listing.
+    */
+
+    const itemIsExcluded =
+      String(
+        item.status ||
+        ""
+      )
+        .trim()
+        .toLowerCase() ===
+      "excluded";
+
+
+    let estimatedResale =
       "";
 
-    const priceStdDev =
-      itemResult.priceStandardDeviation ??
-      item.priceStandardDeviation ??
-      deal.priceStandardDeviation ??
+    let priceStdDev =
       "";
+
+
+    if (!itemIsExcluded) {
+      /*
+        Prefer the value that /evaluate-lot explicitly
+        approved for inclusion.
+
+        Then use this item's own analytical values.
+
+        Only fall back to deal-level values for the old
+        non-itemized single-product format.
+      */
+      estimatedResale =
+        item.includedExpectedSalePrice ??
+        itemResult.expectedSalePrice ??
+        itemResult.estimatedResaleValue ??
+        item.estimatedResaleValue ??
+        (
+          !hasItemizedRows
+            ? deal.estimatedResaleValue
+            : null
+        ) ??
+        "";
+
+
+      priceStdDev =
+        itemResult.priceStandardDeviation ??
+        item.priceStandardDeviation ??
+        (
+          !hasItemizedRows
+            ? deal.priceStandardDeviation
+            : null
+        ) ??
+        "";
+    }
 
     // H:Q listing-level columns
     /*
@@ -10976,6 +11641,95 @@ const insertedEndRowNumber =
   insertedStartRowNumber +
   rows.length -
   1;
+
+
+/*
+  ============================================================
+  MAKE SURE THE SHEET HAS ENOUGH PHYSICAL ROWS
+  ============================================================
+
+  This happens AFTER the filter has been cleared.
+
+  Example:
+
+  Sheet currently contains rows 1-1119.
+  New listing requires rows 1120-1121.
+
+  sheetRowCount = 1119
+  insertedEndRowNumber = 1121
+
+  Therefore add 2 new rows before trying to write.
+*/
+if (
+  insertedEndRowNumber >
+  sheetRowCount
+) {
+  const rowsToAdd =
+    insertedEndRowNumber -
+    sheetRowCount;
+
+  console.log(
+    "[GOOGLE SHEETS] Sheet is out of rows. Adding rows:",
+    {
+      currentRowCount:
+        sheetRowCount,
+
+      requiredEndRow:
+        insertedEndRowNumber,
+
+      rowsToAdd
+    }
+  );
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+
+    requestBody: {
+      requests: [
+        {
+          insertDimension: {
+            range: {
+              sheetId,
+
+              dimension:
+                "ROWS",
+
+              /*
+                Google Sheets API indexes are zero-based.
+
+                sheetRowCount is therefore exactly the
+                insertion point immediately after the
+                existing final row.
+              */
+              startIndex:
+                sheetRowCount,
+
+              endIndex:
+                sheetRowCount +
+                rowsToAdd
+            },
+
+            /*
+              Preserve formatting/data-validation behavior
+              from the previous bottom row.
+            */
+            inheritFromBefore:
+              true
+          }
+        }
+      ]
+    }
+  });
+
+  sheetRowCount +=
+    rowsToAdd;
+
+  console.log(
+    "[GOOGLE SHEETS] Rows added successfully. New row count:",
+    sheetRowCount
+  );
+}
+
 
 await sheets.spreadsheets.values.update({
   spreadsheetId,
