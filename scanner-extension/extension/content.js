@@ -12314,6 +12314,15 @@ if (data.analysisLogUrl) {
   );
 }
 
+
+if (data.checklistUrl) {
+  console.log(
+    "Purchase checklist:",
+    data.checklistUrl
+  );
+}
+
+
 await markMarketplaceAnalysisRunCompleted();
 
 return true;

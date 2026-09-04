@@ -3592,6 +3592,922 @@ const supabaseAdmin =
     }
   );
 
+  /*
+  ============================================================
+  PURCHASE CHECKLIST
+  ============================================================
+
+  EDIT YOUR CHECKLIST ITEMS HERE.
+
+  key:
+    Permanent internal ID.
+    Do NOT change it after you've started using the item.
+
+  label:
+    Text displayed to you.
+    This CAN be changed whenever you want.
+
+  enabled:
+    true  = show item
+    false = hide item
+*/
+
+const DEAL_CHECKLIST_ITEMS = [
+  {
+    key: "everything_functional",
+    label: "Everything functional",
+    enabled: true
+  },
+
+  {
+    key: "seller_profile_ok",
+    label: "Nothing sketchy about seller profile / reviews",
+    enabled: true
+  },
+
+  {
+    key: "analysis_verified",
+    label: "Product analysis is correct",
+    enabled: true
+  },
+
+  {
+    key: "tradeshield_confirmation_sent",
+    label: "TradeShield confirmation sent",
+    enabled: true
+  },
+
+  {
+    key: "manual_estimate_complete",
+    label: "Listing manually estimated",
+    enabled: true
+  }
+];
+
+
+const DEAL_CHECKLIST_PUBLIC_BASE_URL =
+  String(
+    process.env.DEAL_CHECKLIST_PUBLIC_BASE_URL ||
+    "http://localhost:3000"
+  )
+    .trim()
+    .replace(/\/+$/, "");
+
+
+function getEnabledDealChecklistItems() {
+  return DEAL_CHECKLIST_ITEMS.filter(
+    item =>
+      item.enabled !== false
+  );
+}
+
+
+function getMarketplaceListingIdFromUrl(
+  value
+) {
+  const match =
+    String(
+      value || ""
+    ).match(
+      /\/marketplace\/item\/(\d+)/
+    );
+
+  return match?.[1] || "";
+}
+
+
+function getDealChecklistPublicUrl(
+  token
+) {
+  return (
+    `${DEAL_CHECKLIST_PUBLIC_BASE_URL}/` +
+    encodeURIComponent(
+      token
+    )
+  );
+}
+
+
+async function findDealChecklistBySourceKey(
+  sourceKey
+) {
+  const {
+    data,
+    error
+  } =
+    await supabaseAdmin
+      .from(
+        "deal_checklists"
+      )
+      .select("*")
+      .eq(
+        "source_key",
+        sourceKey
+      )
+      .maybeSingle();
+
+
+  if (error) {
+    throw error;
+  }
+
+
+  return data || null;
+}
+
+
+async function createOrGetDealChecklist({
+  deal,
+  analysisRunId
+}) {
+  const listingUrl =
+    String(
+      deal?.facebookUrl ||
+      ""
+    ).trim();
+
+
+  const listingId =
+    getMarketplaceListingIdFromUrl(
+      listingUrl
+    );
+
+
+  /*
+    Prefer Facebook listing ID.
+
+    That makes retries of the same listing
+    reuse the SAME checklist.
+  */
+  const sourceKey =
+    listingId
+      ? `facebook:${listingId}`
+      : `analysis:${analysisRunId}`;
+
+
+  let checklist =
+    await findDealChecklistBySourceKey(
+      sourceKey
+    );
+
+
+  if (!checklist) {
+    const newChecklist = {
+      id:
+        randomUUID(),
+
+      token:
+        randomUUID(),
+
+      source_key:
+        sourceKey,
+
+      analysis_run_id:
+        analysisRunId,
+
+      listing_id:
+        listingId ||
+        null,
+
+      listing_url:
+        listingUrl ||
+        null,
+
+      title:
+        String(
+          deal?.title ||
+          ""
+        ).trim() ||
+        null,
+
+      updated_at:
+        new Date()
+          .toISOString()
+    };
+
+
+    const {
+      data,
+      error
+    } =
+      await supabaseAdmin
+        .from(
+          "deal_checklists"
+        )
+        .insert(
+          newChecklist
+        )
+        .select("*")
+        .single();
+
+
+    /*
+      23505 = duplicate unique key.
+
+      This can happen if the same listing
+      gets saved twice at almost exactly
+      the same time.
+    */
+    if (error) {
+      if (
+        String(
+          error.code ||
+          ""
+        ) === "23505"
+      ) {
+        checklist =
+          await findDealChecklistBySourceKey(
+            sourceKey
+          );
+
+      } else {
+        throw error;
+      }
+
+    } else {
+      checklist =
+        data;
+    }
+  }
+
+
+  if (!checklist) {
+    throw new Error(
+      "Could not create purchase checklist."
+    );
+  }
+
+
+  return {
+    ...checklist,
+
+    url:
+      getDealChecklistPublicUrl(
+        checklist.token
+      )
+  };
+}
+
+
+async function loadDealChecklistByToken(
+  rawToken
+) {
+  const token =
+    String(
+      rawToken ||
+      ""
+    ).trim();
+
+
+  const {
+    data:
+      checklist,
+
+    error:
+      checklistError
+  } =
+    await supabaseAdmin
+      .from(
+        "deal_checklists"
+      )
+      .select("*")
+      .eq(
+        "token",
+        token
+      )
+      .maybeSingle();
+
+
+  if (checklistError) {
+    throw checklistError;
+  }
+
+
+  if (!checklist) {
+    return null;
+  }
+
+
+  const {
+    data:
+      savedStates,
+
+    error:
+      statesError
+  } =
+    await supabaseAdmin
+      .from(
+        "deal_checklist_states"
+      )
+      .select(
+        "item_key, checked"
+      )
+      .eq(
+        "checklist_id",
+        checklist.id
+      );
+
+
+  if (statesError) {
+    throw statesError;
+  }
+
+
+  const stateMap =
+    new Map(
+      (
+        savedStates ||
+        []
+      ).map(
+        row => [
+          row.item_key,
+          row.checked === true
+        ]
+      )
+    );
+
+
+  return {
+    ...checklist,
+
+    items:
+      getEnabledDealChecklistItems()
+        .map(
+          item => ({
+            key:
+              item.key,
+
+            label:
+              item.label,
+
+            checked:
+              stateMap.get(
+                item.key
+              ) === true
+          })
+        )
+  };
+}
+
+
+function escapeChecklistHtml(
+  value
+) {
+  return String(
+    value ?? ""
+  )
+    .replace(
+      /&/g,
+      "&amp;"
+    )
+    .replace(
+      /</g,
+      "&lt;"
+    )
+    .replace(
+      />/g,
+      "&gt;"
+    )
+    .replace(
+      /"/g,
+      "&quot;"
+    )
+    .replace(
+      /'/g,
+      "&#039;"
+    );
+}
+
+
+function renderDealChecklistPage(
+  checklist
+) {
+  const title =
+    escapeChecklistHtml(
+      checklist.title ||
+      "Marketplace Purchase"
+    );
+
+
+  const listingUrl =
+    escapeChecklistHtml(
+      checklist.listing_url ||
+      ""
+    );
+
+
+  const checklistHtml =
+    checklist.items
+      .map(
+        item => `
+          <label class="check-row">
+
+            <input
+              type="checkbox"
+              data-item-key="${escapeChecklistHtml(
+                item.key
+              )}"
+              ${item.checked ? "checked" : ""}
+            >
+
+            <span>
+              ${escapeChecklistHtml(
+                item.label
+              )}
+            </span>
+
+          </label>
+        `
+      )
+      .join("");
+
+
+  return `
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1"
+>
+
+<title>${title}</title>
+
+<style>
+
+body {
+  margin: 0;
+  background: #f5f5f5;
+  font-family: Arial, sans-serif;
+  color: #222;
+}
+
+.container {
+  max-width: 650px;
+  margin: 40px auto;
+  padding: 20px;
+}
+
+.card {
+  background: white;
+  border-radius: 14px;
+  padding: 26px;
+  box-shadow:
+    0 4px 20px
+    rgba(0, 0, 0, 0.08);
+}
+
+h1 {
+  margin-top: 0;
+  margin-bottom: 5px;
+}
+
+.subtitle {
+  color: #777;
+  margin-bottom: 22px;
+}
+
+.listing-link {
+  display: inline-block;
+  margin-bottom: 22px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+
+  padding: 15px;
+  margin-bottom: 10px;
+
+  border:
+    1px solid
+    #ddd;
+
+  border-radius: 9px;
+
+  cursor: pointer;
+}
+
+.check-row:hover {
+  background: #fafafa;
+}
+
+.check-row input {
+  width: 21px;
+  height: 21px;
+}
+
+.status {
+  margin-top: 18px;
+  font-size: 13px;
+  color: #666;
+}
+
+.progress {
+  font-weight: bold;
+  margin-bottom: 15px;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<div class="container">
+
+<div class="card">
+
+<h1>
+  ${title}
+</h1>
+
+<div class="subtitle">
+  Pre-purchase checklist
+</div>
+
+${
+  listingUrl
+    ? `
+      <a
+        class="listing-link"
+        href="${listingUrl}"
+        target="_blank"
+      >
+        Open Marketplace Listing
+      </a>
+    `
+    : ""
+}
+
+<div
+  class="progress"
+  id="progress"
+></div>
+
+
+<div>
+  ${checklistHtml}
+</div>
+
+
+<div
+  class="status"
+  id="status"
+>
+  Saved
+</div>
+
+</div>
+
+</div>
+
+
+<script>
+
+const checklistToken =
+  ${JSON.stringify(
+    checklist.token
+  )};
+
+
+const boxes =
+  Array.from(
+    document.querySelectorAll(
+      "input[data-item-key]"
+    )
+  );
+
+
+const statusElement =
+  document.getElementById(
+    "status"
+  );
+
+
+const progressElement =
+  document.getElementById(
+    "progress"
+  );
+
+
+function updateProgress() {
+  const completed =
+    boxes.filter(
+      box =>
+        box.checked
+    ).length;
+
+
+  progressElement.textContent =
+    completed +
+    " / " +
+    boxes.length +
+    " complete";
+}
+
+
+for (
+  const box of boxes
+) {
+  box.addEventListener(
+    "change",
+
+    async () => {
+      const intendedState =
+        box.checked;
+
+
+      updateProgress();
+
+
+      statusElement.textContent =
+        "Saving...";
+
+
+      box.disabled =
+        true;
+
+
+      try {
+        const response =
+          await fetch(
+            "/api/deal-checklists/" +
+            encodeURIComponent(
+              checklistToken
+            ) +
+            "/item",
+            {
+              method:
+                "PATCH",
+
+              headers: {
+                "Content-Type":
+                  "application/json"
+              },
+
+              body:
+                JSON.stringify({
+                  itemKey:
+                    box.dataset.itemKey,
+
+                  checked:
+                    intendedState
+                })
+            }
+          );
+
+
+        const data =
+          await response.json();
+
+
+        if (
+          !response.ok ||
+          data.ok !== true
+        ) {
+          throw new Error(
+            data.error ||
+            "Could not save."
+          );
+        }
+
+
+        statusElement.textContent =
+          "Saved";
+
+
+      } catch (error) {
+        /*
+          Put the checkbox back if saving fails.
+        */
+        box.checked =
+          !intendedState;
+
+
+        updateProgress();
+
+
+        statusElement.textContent =
+          "Save failed: " +
+          (
+            error.message ||
+            "Unknown error"
+          );
+
+
+      } finally {
+        box.disabled =
+          false;
+      }
+    }
+  );
+}
+
+
+updateProgress();
+
+</script>
+
+</body>
+
+</html>
+  `;
+}
+
+
+/*
+  ============================================================
+  PURCHASE CHECKLIST PAGE
+  ============================================================
+*/
+
+app.get(
+  "/deal-checklist/:token",
+
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const checklist =
+        await loadDealChecklistByToken(
+          req.params.token
+        );
+
+
+      if (!checklist) {
+        return res
+          .status(404)
+          .send(
+            "Checklist not found."
+          );
+      }
+
+
+      return res
+        .type("html")
+        .send(
+          renderDealChecklistPage(
+            checklist
+          )
+        );
+
+
+    } catch (error) {
+      console.error(
+        "[DEAL CHECKLIST] Load failed:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .send(
+          "Could not load checklist."
+        );
+    }
+  }
+);
+
+
+/*
+  ============================================================
+  PURCHASE CHECKLIST STATE UPDATE
+  ============================================================
+*/
+
+app.patch(
+  "/api/deal-checklists/:token/item",
+
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const itemKey =
+        String(
+          req.body?.itemKey ||
+          ""
+        ).trim();
+
+
+      const itemExists =
+        DEAL_CHECKLIST_ITEMS.some(
+          item =>
+            item.key ===
+            itemKey
+        );
+
+
+      if (!itemExists) {
+        return res
+          .status(400)
+          .json({
+            ok:
+              false,
+
+            error:
+              "Unknown checklist item."
+          });
+      }
+
+
+      const checklist =
+        await loadDealChecklistByToken(
+          req.params.token
+        );
+
+
+      if (!checklist) {
+        return res
+          .status(404)
+          .json({
+            ok:
+              false,
+
+            error:
+              "Checklist not found."
+          });
+      }
+
+
+      const checked =
+        req.body?.checked ===
+        true;
+
+
+      const {
+        error
+      } =
+        await supabaseAdmin
+          .from(
+            "deal_checklist_states"
+          )
+          .upsert(
+            {
+              checklist_id:
+                checklist.id,
+
+              item_key:
+                itemKey,
+
+              checked,
+
+              updated_at:
+                new Date()
+                  .toISOString()
+            },
+            {
+              onConflict:
+                "checklist_id,item_key"
+            }
+          );
+
+
+      if (error) {
+        throw error;
+      }
+
+
+      return res.json({
+        ok:
+          true,
+
+        itemKey,
+
+        checked
+      });
+
+
+    } catch (error) {
+      console.error(
+        "[DEAL CHECKLIST] Save failed:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          ok:
+            false,
+
+          error:
+            error?.message ||
+            "Could not save checklist."
+        });
+    }
+  }
+);
+
   const ANALYSIS_LOG_DIRECTORY =
   path.resolve(
     "marketplace-analysis-logs"
@@ -11473,12 +12389,28 @@ const analysisLogUrl =
     ""
   ).trim();
 
+
+const checklistUrl =
+  String(
+    deal.checklistUrl ||
+    ""
+  ).trim();
+
+
 const rows = rowItems.map((item, index) => {
 const analysisLogLink =
   index === 0 &&
   analysisLogUrl
     ? (
         `=HYPERLINK("${analysisLogUrl}","View Log")`
+      )
+    : "";
+
+    const checklistLink =
+  index === 0 &&
+  checklistUrl
+    ? (
+        `=HYPERLINK("${checklistUrl}","Checklist")`
       )
     : "";
 
@@ -11584,9 +12516,6 @@ const thresholdBuy =
   Never copy extension or analysis values into these columns.
 */
 const manualColumnJ = "";
-const manualColumnK = "";
-const manualColumnL = "";
-const manualColumnM = "";
 
 /*
   N is listing-level, so only the first row receives the date.
@@ -11617,7 +12546,7 @@ const relistedYN =
   manualColumnJ,   // J
   manualColumnK,   // K
   manualColumnL,   // L
-  manualColumnM,   // M
+  checklistColumnM, // M — Purchase Checklist
   hitDateColumnN,  // N
   manualColumnO,   // O
   manualColumnP,   // P
@@ -11853,21 +12782,34 @@ requests.push({
   date when the hit was recorded.
 */
 
-// Clear J:M.
-// Column I now contains the analysis log link.
+/*
+  Clear J:L.
+
+  Column I = Analysis Log
+  Column M = Purchase Checklist
+*/
+
 requests.push({
   repeatCell: {
     range: {
       sheetId,
       startRowIndex,
       endRowIndex,
-      startColumnIndex: 9,
-      endColumnIndex: 13
+
+      startColumnIndex:
+        9,
+
+      endColumnIndex:
+        12
     },
+
     cell: {
-      userEnteredValue: null
+      userEnteredValue:
+        null
     },
-    fields: "userEnteredValue"
+
+    fields:
+      "userEnteredValue"
   }
 });
 
@@ -12118,29 +13060,63 @@ app.post(
         }
       );
 
-      /*
-        Attach the permanent HTTPS link
-        before writing the Google Sheet.
-      */
-      const dealWithLog = {
-        ...deal,
+    /*
+  Create/recover a persistent purchase checklist.
 
-        analysisRunId,
+  Same Facebook listing = same checklist.
+*/
 
-        analysisLogUrl:
-          uploadedLog.publicUrl
-      };
+const checklist =
+  await createOrGetDealChecklist({
+    deal,
+    analysisRunId
+  });
 
-      await appendSavedDealToGoogleSheet(
-        dealWithLog
-      );
 
-      return res.json({
-        ok: true,
+console.log(
+  "[DEAL CHECKLIST] Ready:",
+  {
+    analysisRunId,
 
-        analysisLogUrl:
-          uploadedLog.publicUrl
-      });
+    checklistUrl:
+      checklist.url
+  }
+);
+
+
+/*
+  Attach both permanent URLs
+  before writing the Google Sheet.
+*/
+
+const dealWithLog = {
+  ...deal,
+
+  analysisRunId,
+
+  analysisLogUrl:
+    uploadedLog.publicUrl,
+
+  checklistUrl:
+    checklist.url
+};
+
+
+await appendSavedDealToGoogleSheet(
+  dealWithLog
+);
+
+
+return res.json({
+  ok:
+    true,
+
+  analysisLogUrl:
+    uploadedLog.publicUrl,
+
+  checklistUrl:
+    checklist.url
+});
 
     } catch (error) {
       console.error(
