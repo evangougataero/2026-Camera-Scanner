@@ -12339,9 +12339,6 @@ async function appendSavedDealToGoogleSheet(deal) {
     ? deal.items.filter(item => item?.isPrimarySellableItem !== false)
     : [];
 
-  const rowItems = primaryItems.length ? primaryItems : [deal];
-  const listingRowCount = rowItems.length;
-
   const rowItems =
   primaryItems.length
     ? primaryItems
