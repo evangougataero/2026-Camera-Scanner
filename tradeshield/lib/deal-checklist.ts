@@ -122,7 +122,7 @@ export const DEAL_CHECKLIST_ITEMS = [
     enabled:
       true
   }
-] as const;
+];
 
 
 export async function getDealChecklistByToken(
