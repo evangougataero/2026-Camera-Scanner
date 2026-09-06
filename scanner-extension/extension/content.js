@@ -7383,6 +7383,132 @@ function parsePriceValue(value) {
   return price;
 }
 
+/*
+  ============================================================
+  OCR-BASED FACEBOOK ASKING PRICE
+
+  getFacebookAskingPrice() scans the WHOLE page's <span>/<div>
+  elements and returns the first plausible, non-struck-through
+  dollar amount it finds. That is not scoped to the open
+  listing at all, so on any page where another listing tile
+  (sidebar recommendations, "Today's picks", "Just listed",
+  session listings, etc.) renders its own price earlier in the
+  DOM than the actual listing panel, this silently returns a
+  completely unrelated price. It is also brittle against
+  Facebook's frequent DOM/class churn.
+
+  We already run Vision OCR on the full-tab screenshot for
+  listing text (STEP 1). Marketplace listing pages consistently
+  render the asking price as its own line immediately below the
+  title, e.g.:
+
+    Canon EOS T7 Camera
+    $300 $350
+    Listed 9 weeks ago in Ellsworth Air Force Base, SD
+
+  where a second, higher amount on the same line is the
+  crossed-out "was" price. Since OCR has no notion of
+  strikethrough styling, we rely on ORDER instead: the current
+  ask is always the first dollar amount on that line, and the
+  "was" price (if present) is always second.
+
+  This anchors on the title text itself (most reliable), and
+  falls back to anchoring on the "Listed ... ago" line that
+  follows it, since both are stable across every listing layout
+  we've seen. Only if OCR anchoring fails entirely do we fall
+  back to the old whole-page DOM scrape.
+  ============================================================
+*/
+function extractFacebookAskingPriceFromOcr(ocrText, title) {
+  const lines =
+    String(ocrText || "")
+      .split("\n")
+      .map(line => line.trim())
+      .filter(Boolean);
+
+  /*
+    A "price line" is a line that contains NOTHING but one or
+    two dollar amounts - e.g. "$300 $350" or just "$300". This
+    intentionally excludes lines like "$4.7 rating-star" or
+    prose that happens to mention a dollar figure.
+  */
+  const priceLinePattern =
+    /^\$([\d,]+(?:\.\d{2})?)(?:\s+\$(?:[\d,]+(?:\.\d{2})?))?$/;
+
+  function parseAmount(str) {
+    const value =
+      Number(String(str).replace(/,/g, ""));
+
+    return (
+      Number.isFinite(value) &&
+      value > 0 &&
+      value < 100000
+    )
+      ? value
+      : null;
+  }
+
+  /*
+    PRIMARY: anchor on the listing title.
+
+    The current ask reliably appears within a line or two
+    directly below the title in Marketplace's rendered layout.
+  */
+  const normalizedTitle =
+    String(title || "").trim().toLowerCase();
+
+  if (normalizedTitle) {
+    const titleIndex =
+      lines.findIndex(
+        line => line.toLowerCase() === normalizedTitle
+      );
+
+    if (titleIndex !== -1) {
+      for (
+        let i = titleIndex + 1;
+        i < Math.min(titleIndex + 3, lines.length);
+        i++
+      ) {
+        const match =
+          lines[i].match(priceLinePattern);
+
+        if (match) {
+          return parseAmount(match[1]);
+        }
+      }
+    }
+  }
+
+  /*
+    FALLBACK: anchor on the "Listed ... ago" metadata line,
+    which consistently follows the price line even when the
+    title didn't match exactly (OCR noise, truncation, etc.).
+  */
+  for (let i = 0; i < lines.length; i++) {
+    const match =
+      lines[i].match(priceLinePattern);
+
+    if (!match) {
+      continue;
+    }
+
+    const nextFewLines =
+      lines
+        .slice(i + 1, i + 3)
+        .join(" ")
+        .toLowerCase();
+
+    if (
+      nextFewLines.includes("listed") ||
+      nextFewLines.includes(" ago")
+    ) {
+      return parseAmount(match[1]);
+    }
+  }
+
+  return null;
+}
+
 async function showSessionListingsLibrary() {
   const stored = await chrome.storage.local.get(SESSION_LISTINGS_KEY);
 
@@ -9015,32 +9141,60 @@ function getResolvedGoogleIdentity(
 
           medium/mixed does NOT qualify.
         */
-        const confidence =
-          String(
-            result
-              ?.dataForSeoEvidence
-              ?.confidence ||
-            ""
-          )
-            .trim()
-            .toLowerCase();
+ const visualEvidenceSource =
+  String(
+    result
+      ?.visualEvidenceSource ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
 
 
-        const consensus =
-          String(
-            result
-              ?.dataForSeoEvidence
-              ?.consensus ||
-            ""
-          )
-            .trim()
-            .toLowerCase();
+/*
+  SerpApi Google AI Mode uses the legacy
+  Google Lens identification behavior.
+
+  It does not produce DataForSEO confidence
+  or consensus metadata.
+*/
+if (
+  visualEvidenceSource ===
+    "serpapi-google-ai-mode"
+) {
+  return true;
+}
 
 
-        return (
-          confidence === "high" &&
-          consensus === "strong"
-        );
+/*
+  DataForSEO keeps its strict confidence gate.
+*/
+const confidence =
+  String(
+    result
+      ?.dataForSeoEvidence
+      ?.confidence ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+
+const consensus =
+  String(
+    result
+      ?.dataForSeoEvidence
+      ?.consensus ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+
+return (
+  confidence === "high" &&
+  consensus === "strong"
+);
       }
     );
 
@@ -9425,7 +9579,15 @@ function convertPrimaryProductToCompItem(
 
 let description = "";
 
-const facebookPrice =
+/*
+  DOM-scraped price. Kept only as a last-resort fallback -
+  see extractFacebookAskingPriceFromOcr() below, which
+  overrides this once the listing screenshot OCR comes back.
+  getFacebookAskingPrice() scans the whole page and is not
+  scoped to this listing, so it can grab an unrelated price
+  from another tile on the page.
+*/
+let facebookPrice =
   parsePriceValue(
     getFacebookAskingPrice()
   );
@@ -9531,6 +9693,28 @@ console.log(
 console.log(
   listingScreenshotOcr
 );
+
+/*
+  Prefer the OCR-anchored price over the whole-page DOM scrape.
+
+  getFacebookAskingPrice() has no idea which listing is
+  actually open, so it's kept only as the pre-OCR fallback set
+  above. This is the authoritative source once we have it.
+*/
+const ocrAnchoredPrice =
+  extractFacebookAskingPriceFromOcr(
+    listingScreenshotOcr,
+    title
+  );
+
+console.log(
+  "[STEP 1A] OCR-anchored Facebook asking price:",
+  ocrAnchoredPrice
+);
+
+if (ocrAnchoredPrice != null) {
+  facebookPrice = ocrAnchoredPrice;
+}
 
 /*
   Google Cloud Vision OCR is now the sole source
@@ -10110,19 +10294,78 @@ const needsGoogleLens =
     : [];
 
 
+const lensfunCandidateConstraints =
+  Array.isArray(
+    initialIdentificationData
+      ?.lensfunCandidateConstraints
+  )
+    ? initialIdentificationData
+        .lensfunCandidateConstraints
+    : [];
+
+
 const lensFallbackTargets =
-  bestTargets.filter(
-    target =>
-      needsGoogleLens.some(
-        unresolved =>
-          String(
-            unresolved.productId
-          ) ===
+  bestTargets
+    .map(
+      target => {
+        const unresolved =
+          needsGoogleLens.find(
+            item =>
+              String(
+                item?.productId ||
+                ""
+              ) ===
+              String(
+                target?.productId ||
+                ""
+              )
+          );
+
+        if (!unresolved) {
+          return null;
+        }
+
+        const lensfunConstraint =
+          lensfunCandidateConstraints.find(
+            entry =>
+              String(
+                entry?.productId ||
+                ""
+              ) ===
+              String(
+                target?.productId ||
+                ""
+              )
+          );
+
+        return {
+          ...target,
+
+          /*
+            The server always sets visualFallbackMode explicitly
+            now (camera bodies/cameras included, not just lenses),
+            so the fallback below is defensive only. It matches
+            the only visual fallback provider currently in use.
+          */
+          visualFallbackMode:
             String(
-              target.productId
+              unresolved
+                ?.visualFallbackMode ||
+              "serpapi-ai-mode-uncropped"
+            ).trim(),
+
+          lensfunCandidates:
+            Array.isArray(
+              lensfunConstraint
+                ?.candidates
             )
-      )
-  );
+              ? lensfunConstraint
+                  .candidates
+              : []
+        };
+      }
+    )
+    .filter(Boolean);
 
 
 console.log(
@@ -10166,24 +10409,124 @@ if (
     }
   );
 
-button.innerText =
-  `Cropping ${lensFallbackTargets.length} unresolved product(s)...`;
+/*
+  ============================================================
+  SPLIT VISUAL FALLBACK PROVIDERS
+  ============================================================
+*/
 
+/*
+  IMPORTANT:
 
-const croppedFallbackTargets =
-  await prepareDataForSeoCrops(
-    lensFallbackTargets,
-    initialIdentificationData,
-    productOcrResults
+  Route purely on visualFallbackMode, never on productType.
+
+  visualFallbackMode is computed server-side in
+  /reconcile-primary-products for EVERY needsGoogleLens entry
+  — camera bodies/cameras and camera lenses alike — and every
+  path there now sets it to "serpapi-ai-mode-uncropped".
+  DataForSEO cropping is kept below for future use but is not
+  currently assigned to anything, so dataForSeoCropTargets is
+  expected to stay empty.
+
+  Re-checking productType here against target.productType
+  (sourced from Step 2's gallery analysis instead) would be
+  redundant AND unsafe: Step 2's vision model is not guaranteed
+  to use the literal string "camera lens" (it has returned bare
+  "lens" here), so a second productType check could silently
+  drop a target into the DataForSEO-cropped bucket even though
+  the server explicitly asked for uncropped SerpApi AI Mode.
+*/
+const serpApiAiModeTargets =
+  lensFallbackTargets.filter(
+    target =>
+      target?.visualFallbackMode ===
+        "serpapi-ai-mode-uncropped"
   );
 
 
+const dataForSeoCropTargets =
+  lensFallbackTargets.filter(
+    target =>
+      !serpApiAiModeTargets.some(
+        serpTarget =>
+          String(
+            serpTarget?.productId ||
+            ""
+          ) ===
+          String(
+            target?.productId ||
+            ""
+          )
+      )
+  );
+
+
+button.innerText =
+  dataForSeoCropTargets.length
+    ? `Cropping ${dataForSeoCropTargets.length} unresolved product(s)...`
+    : `Preparing ${serpApiAiModeTargets.length} AI Mode lens search(es)...`;
+
+
+/*
+  ONLY DataForSEO targets get cropped. Retained for future use;
+  not currently reachable since nothing sets visualFallbackMode
+  to a DataForSEO mode anymore.
+*/
+const croppedDataForSeoTargets =
+  dataForSeoCropTargets.length
+    ? await prepareDataForSeoCrops(
+        dataForSeoCropTargets,
+        initialIdentificationData,
+        productOcrResults
+      )
+    : [];
+
+
+/*
+  SerpApi targets keep the ORIGINAL best imageUrl.
+*/
+const visualFallbackTargets = [
+  ...serpApiAiModeTargets.map(
+    target => ({
+      ...target,
+
+      visualSearchProvider:
+        "serpapi-google-ai-mode",
+
+      cropPrepared:
+        false,
+
+      dataForSeoImageUrl:
+        "",
+
+      dataForSeoCropObjectPath:
+        "",
+
+      cropBoundingBox:
+        null,
+
+      cropError:
+        ""
+    })
+  ),
+
+  ...croppedDataForSeoTargets.map(
+    target => ({
+      ...target,
+
+      visualSearchProvider:
+        "dataforseo"
+    })
+  )
+];
+
+
 console.log(
-  "[DATAFORSEO CROP] Prepared fallback targets:"
+  "[VISUAL FALLBACK] Prepared targets:"
 );
 
 console.dir(
-  croppedFallbackTargets,
+  visualFallbackTargets,
   {
     depth:
       null
@@ -10192,7 +10535,7 @@ console.dir(
 
 
 button.innerText =
-  `Identifying ${croppedFallbackTargets.length} cropped product(s)...`;
+  `Identifying ${visualFallbackTargets.length} unresolved product(s)...`;
 
 
 /*
@@ -10224,7 +10567,7 @@ console.log(
       getCurrentMarketplaceAnalysisJobId(),
 
     targetCount:
-      croppedFallbackTargets.length
+      croppedDataForSeoTargets.length
   }
 );
 
@@ -10284,7 +10627,7 @@ console.log(
 */
 googleLensResults =
   await runLocalGoogleLensTargets(
-    croppedFallbackTargets
+    visualFallbackTargets
   );
 
 

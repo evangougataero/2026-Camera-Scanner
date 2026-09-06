@@ -647,6 +647,285 @@ Do not use Markdown.
   return cleaned;
 }
 
+/*
+  ============================================================
+  SERPAPI GOOGLE AI MODE — UNCROPPED LENS FALLBACK
+  ============================================================
+*/
+
+const SERPAPI_API_KEY =
+  String(
+    process.env.SERPAPI_API_KEY ||
+    ""
+  ).trim();
+
+
+async function identifyLensWithSerpApiAiMode({
+  imageUrl,
+  promptText,
+  lensfunCandidates = []
+}) {
+  if (!SERPAPI_API_KEY) {
+    throw new Error(
+      "Missing SERPAPI_API_KEY in .env"
+    );
+  }
+
+  const cleanImageUrl =
+    String(
+      imageUrl || ""
+    ).trim();
+
+  if (
+    !/^https?:\/\//i.test(
+      cleanImageUrl
+    )
+  ) {
+    throw new Error(
+      "SerpApi Google AI Mode requires a public image URL."
+    );
+  }
+
+  const cleanPrompt =
+    String(
+      promptText || ""
+    ).trim();
+
+  if (!cleanPrompt) {
+    throw new Error(
+      "SerpApi Google AI Mode requires a prompt."
+    );
+  }
+
+  /*
+    IMPORTANT:
+
+    Do NOT replace or wrap promptText.
+
+    background.js has already decided whether this is:
+
+      single
+      exclusion
+      group
+
+    and generated the correct old Google Lens prompt.
+  */
+  const params =
+    new URLSearchParams({
+      engine:
+        "google_ai_mode",
+
+      q:
+        cleanPrompt,
+
+      image_url:
+        cleanImageUrl,
+
+      gl:
+        "us",
+
+      hl:
+        "en",
+
+      no_cache:
+        "true",
+
+      api_key:
+        SERPAPI_API_KEY
+    });
+
+
+  console.log(
+    "[SERPAPI AI MODE] Request:",
+    {
+      imageUrl:
+        cleanImageUrl,
+
+      prompt:
+        cleanPrompt,
+
+      lensfunCandidateCount:
+        Array.isArray(
+          lensfunCandidates
+        )
+          ? lensfunCandidates.length
+          : 0
+    }
+  );
+
+
+  const response =
+    await fetch(
+      `https://serpapi.com/search?${params.toString()}`
+    );
+
+
+  const data =
+    await response.json();
+
+
+  if (
+    !response.ok ||
+    data?.error
+  ) {
+    throw new Error(
+      data?.error ||
+      `SerpApi failed with HTTP ${response.status}.`
+    );
+  }
+
+
+  /*
+    Mimic the OLD Google Lens behavior.
+
+    The old Chrome-based implementation extracted
+    the visible AI Overview text and returned it as
+    plain text.
+
+    reconstructed_markdown is the SerpApi equivalent.
+  */
+  const snippetAnswer =
+  Array.isArray(
+    data?.text_blocks
+  )
+    ? data.text_blocks
+        .map(
+          block =>
+            String(
+              block?.snippet ||
+              ""
+            ).trim()
+        )
+        .filter(Boolean)
+        .join("\n")
+    : "";
+
+
+const reconstructedAnswer =
+  String(
+    data?.reconstructed_markdown ||
+    ""
+  ).trim();
+
+
+let rawAnswer =
+  snippetAnswer ||
+  reconstructedAnswer;
+
+
+/*
+  reconstructed_markdown wraps the answer in a markdown
+  link, e.g.:
+
+    [Canon EF\-S 18\-55mm f/3.5\-5.6 IS II](https://www.google.com/search?ibp=oshop&prds=...)
+
+  If we don't unwrap this, the trailing Google Shopping
+  URL (often 150-300+ chars) gets left in rawAnswer and
+  trips the length-based "not a real model name" rejection
+  in background.js's cleanGoogleIdentificationResult(),
+  silently discarding a correct identification.
+
+  Collapse every markdown link down to just its display
+  text before any other cleanup runs.
+*/
+rawAnswer =
+  rawAnswer.replace(
+    /\[([^\]]*)\]\([^)]*\)/g,
+    "$1"
+  );
+
+
+/*
+  SerpApi / Google may append accessibility UI text
+  directly after the product name.
+*/
+rawAnswer =
+  rawAnswer.replace(
+    /Go to product viewer dialog for this item\.?/gi,
+    ""
+  );
+
+
+/*
+  reconstructed_markdown escapes hyphens:
+
+    EF\-S
+    18\-55mm
+    3.5\-5.6
+
+  Convert those back to normal hyphens.
+
+  This normally does nothing when text_blocks.snippet
+  was available, because snippet is already clean.
+*/
+rawAnswer =
+  rawAnswer.replace(
+    /\\-/g,
+    "-"
+  );
+
+
+rawAnswer =
+  rawAnswer
+    .replace(/\s+/g, " ")
+    .trim();
+
+
+  if (!rawAnswer) {
+    console.warn(
+      "[SERPAPI AI MODE] No AI Mode answer returned.",
+      {
+        searchId:
+          data?.search_metadata?.id
+      }
+    );
+
+    return {
+      searchId:
+        String(
+          data?.search_metadata?.id ||
+          ""
+        ),
+
+      found:
+        false,
+
+      text:
+        ""
+    };
+  }
+
+
+  console.log(
+    "[SERPAPI AI MODE] Raw identification answer:",
+    {
+      searchId:
+        data?.search_metadata?.id,
+
+      prompt:
+        cleanPrompt,
+
+      answer:
+        rawAnswer
+    }
+  );
+
+
+  return {
+    searchId:
+      String(
+        data?.search_metadata?.id ||
+        ""
+      ),
+
+    found:
+      true,
+
+    text:
+      rawAnswer
+  };
+}
+
 const __filename =
   fileURLToPath(
     import.meta.url
@@ -1021,138 +1300,61 @@ function normalizeFocalForComparison(
     .trim();
 }
 
-function hasExactObjectiveEvidence(
-  text,
-  value
+function inferExplicitLensMountFromEvidence(
+  product
 ) {
-  const cleanValue =
-    normalizeLensfunComparisonText(
-      value
-    );
-
-  if (!cleanValue) {
-    return false;
-  }
+  const evidenceText =
+    normalizeStringArray(
+      product?.extracted_evidence
+    )
+      .join(" ");
 
   /*
-    Single-character mount names such as F/E/Z
-    are far too easy to false-match against ordinary
-    OCR text such as f/3.5.
-
-    Require stronger context for those later.
+    Ordered most-specific first so:
+      RF-S does not become RF
+      EF-S does not become EF
   */
-  if (cleanValue.length < 2) {
-    return false;
+  const knownMountTokens = [
+    [ /\bRF-S\b/i, "RF-S" ],
+    [ /\bEF-S\b/i, "EF-S" ],
+    [ /\bEF-M\b/i, "EF-M" ],
+    [ /\bRF\b/i, "RF" ],
+    [ /\bEF\b/i, "EF" ]
+  ];
+
+  for (
+    const [pattern, mount] of
+      knownMountTokens
+  ) {
+    if (
+      pattern.test(
+        evidenceText
+      )
+    ) {
+      return mount;
+    }
   }
 
-  const escaped =
-    cleanValue
-      .replace(
-        /[.*+?^${}()|[\]\\]/g,
-        "\\$&"
-      )
-      .replace(
-        /\s+/g,
-        "\\s+"
-      );
-
-  const regex =
-    new RegExp(
-      `(^|[^a-z0-9-])${escaped}(?=$|[^a-z0-9-])`,
-      "i"
-    );
-
-  return regex.test(
-    normalizeLensfunComparisonText(
-      text
-    )
-  );
+  return null;
 }
 
-function collectObjectiveLensEvidence({
-  product,
-  productOcrResults,
-  listingTitle,
-  listingDescription,
-  listingScreenshotOcr,
-  explicitFacts
-}) {
+function collectStructuredLensEvidence(
+  product
+) {
   const productId =
     String(
       product?.productId || ""
     ).trim();
 
-
-  /*
-    IMPORTANT:
-
-    Lensfun lookup fields come ONLY from the
-    normalized + server-validated Step-5 structure.
-
-    Raw OCR remains available below strictly for
-    debugging/audit purposes.
-  */
   const normalizedIdentity =
     normalizeLensIdentity(
       product?.lensIdentity ||
       {}
     );
 
-
-  const matchingOcrEntries =
-    (productOcrResults || [])
-      .filter(
-        item =>
-          String(
-            item?.productId || ""
-          ).trim() ===
-          productId
-      );
-
-
-  const productOcrText =
-    matchingOcrEntries
-      .map(
-        item =>
-          String(
-            item?.ocrText || ""
-          ).trim()
-      )
-      .filter(Boolean)
-      .join("\n");
-
-
-  const sellerEvidence =
-    [
-      listingTitle,
-      listingDescription,
-
-      ...(
-        Array.isArray(
-          explicitFacts?.explicitlyIncluded
-        )
-          ? explicitFacts.explicitlyIncluded
-          : []
-      ),
-
-      ...(
-        Array.isArray(
-          explicitFacts?.listingNotes
-        )
-          ? explicitFacts.listingNotes
-          : []
-      )
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-
   return {
     productId,
 
-    /*
-      THESE are the Lensfun query fields.
-    */
     brand:
       normalizedIdentity.brand,
 
@@ -1168,26 +1370,14 @@ function collectObjectiveLensEvidence({
     generation:
       normalizedIdentity.generation,
 
-    explicitMount:
-      normalizedIdentity.mountSeries,
+explicitMount:
+  normalizedIdentity.mountSeries ||
+  inferExplicitLensMountFromEvidence(
+    product
+  ),
 
-    extractedEvidence:
-      normalizeStringArray(
-        product?.extracted_evidence
-      ),
-
-    /*
-      Audit/debug fields only.
-      findLensfunCandidates() must not re-parse these.
-    */
-    productOcrText,
-
-    sellerEvidence,
-
-    listingScreenshotOcr:
-      String(
-        listingScreenshotOcr || ""
-      ).trim()
+    featureTokens:
+      normalizedIdentity.featureTokens
   };
 }
 
@@ -1287,6 +1477,35 @@ function findLensfunCandidates(
       evidence?.explicitMount
     );
 
+    const featureTokens =
+  normalizeStringArray(
+    evidence?.featureTokens
+  )
+    .map(
+      token =>
+        normalizeLensfunComparisonText(
+          token
+        )
+    )
+    .filter(Boolean);
+
+  const generation =
+    normalizeLensfunComparisonText(
+      evidence?.generation
+    );
+
+  const modelCodes =
+    normalizeStringArray(
+      evidence?.modelCodes
+    )
+      .map(
+        code =>
+          normalizeLensfunComparisonText(
+            code
+          )
+      )
+      .filter(Boolean);
+
 
   /*
     We need at least something useful.
@@ -1316,10 +1535,6 @@ function findLensfunCandidates(
               lens?.model
             );
 
-          const compactModel =
-            modelText
-              .replace(/\s+/g, "");
-
 
           let score = 0;
 
@@ -1348,25 +1563,31 @@ function findLensfunCandidates(
           }
 
 
-          /*
-            Exact focal range is extremely strong.
-          */
-          if (focal) {
-            const compactFocal =
-              focal
-                .replace(/\s+/g, "");
+         /*
+  Focal length/range must match EXACTLY.
 
+  Do not allow:
+    -55mm -> 18-55mm
+    50mm  -> 16-50mm
+    55mm  -> 18-55mm
+*/
+if (focal) {
+  const candidateFocal =
+    normalizeFocalForComparison(
+      extractFocalLengthFromText(
+        lens?.model
+      )
+    );
 
-            if (
-              compactModel.includes(
-                compactFocal
-              )
-            ) {
-              score += 12;
-            } else {
-              return null;
-            }
-          }
+  if (
+    !candidateFocal ||
+    candidateFocal !== focal
+  ) {
+    return null;
+  }
+
+  score += 12;
+}
 
 
           /*
@@ -1406,6 +1627,90 @@ function findLensfunCandidates(
   }
 }
 
+if (featureTokens.length) {
+  const allFeatureTokensMatch =
+    featureTokens.every(
+      token => {
+        const escapedToken =
+          token.replace(
+            /[.*+?^${}()|[\]\\]/g,
+            "\\$&"
+          );
+
+        return new RegExp(
+          `(^|[^a-z0-9])${escapedToken}(?=$|[^a-z0-9])`,
+          "i"
+        ).test(
+          modelText
+        );
+      }
+    );
+
+  if (!allFeatureTokensMatch) {
+    return null;
+  }
+
+  score +=
+    featureTokens.length * 4;
+}
+
+/*
+  A revision/generation marker ("II", "III", "Mark II") printed
+  on the lens barrel or reported by visual identification is
+  just as strong a discriminator as a feature token, and rules
+  out any candidate whose name doesn't contain it - e.g.
+  generation "III" eliminates a plain "IS USM" candidate.
+*/
+if (generation) {
+  const escapedGeneration =
+    generation.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    );
+
+  const generationMatches =
+    new RegExp(
+      `(^|[^a-z0-9])${escapedGeneration}(?=$|[^a-z0-9])`,
+      "i"
+    ).test(
+      modelText
+    );
+
+  if (!generationMatches) {
+    return null;
+  }
+
+  score += 6;
+}
+
+/*
+  Literal manufacturer SKUs are rare in Lensfun model names but
+  are unambiguous when they do appear - treat them as a soft
+  scoring boost rather than a hard filter, since most Lensfun
+  entries won't include the SKU at all.
+*/
+if (modelCodes.length) {
+  const matchedModelCodes =
+    modelCodes.filter(
+      code => {
+        const escapedCode =
+          code.replace(
+            /[.*+?^${}()|[\]\\]/g,
+            "\\$&"
+          );
+
+        return new RegExp(
+          `(^|[^a-z0-9])${escapedCode}(?=$|[^a-z0-9])`,
+          "i"
+        ).test(
+          modelText
+        );
+      }
+    );
+
+  score +=
+    matchedModelCodes.length * 4;
+}
 
           return {
             lens,
@@ -1553,6 +1858,113 @@ function findLensfunCandidates(
 }
 
 
+/*
+  ============================================================
+  MULTIPLE-CANDIDATE DISAMBIGUATION STRATEGY
+
+  When Lensfun returns more than one candidate, they all
+  survived the SAME hard filters in findLensfunCandidates()
+  above (maker, exact focal length, exact aperture when known,
+  every feature token, and any reported generation marker -
+  any mismatch on those returns null and drops the candidate).
+  Multiple candidates can still survive together when they
+  differ only by something none of those fields captured, e.g.
+  a barrel-printed suffix like "USM" that OCR/seller text never
+  mentioned - "IS" vs "IS STM" vs "IS II" all differing only in
+  a token nobody supplied as structured evidence.
+
+  Before asking for a fresh visual identification, check whether
+  a visual identification we already have (this pass's SerpApi
+  answer, or an earlier one) exactly matches exactly one of the
+  remaining candidates via matchVisualAnswerToLensfunCandidate().
+  If so, that answer is treated as the final discriminator and
+  resolution stops there - it is NOT sent back through another
+  Lensfun/SerpApi cycle.
+
+  Empirically, a cropped reverse-image search (DataForSEO) has
+  never once resolved this specific ambiguity: a plain black
+  kit lens barrel looks visually identical across those three
+  variants at crop zoom level, so Google's image match just
+  returns generic "Canon EOS Rebel kit" results with no
+  consensus. SerpApi's Google AI Mode, run on the ORIGINAL
+  uncropped photo, can actually read the small print on the
+  barrel and has reliably resolved this exact case.
+
+  So: if no visual answer directly matches a candidate, prefer
+  requesting SerpApi AI Mode over cropped DataForSEO.
+  ============================================================
+*/
+
+/*
+  Normalize a lens model string for exact comparison by
+  stripping everything except letters/digits and lowercasing.
+  This makes formatting differences between the Lensfun database
+  and a visual-search answer (e.g. "f/4-5.6" vs "F4-5.6") collapse
+  to the same key without needing bespoke aperture-format logic.
+*/
+function normalizeLensAnswerForExactMatch(
+  value
+) {
+  return String(
+    value || ""
+  )
+    .toLowerCase()
+    .replace(
+      /[^a-z0-9]+/g,
+      ""
+    );
+}
+
+/*
+  Deterministically match a visual-identification answer (from
+  SerpApi AI Mode, or any other source) against the Lensfun
+  candidates that survived findLensfunCandidates(). Only an
+  EXACT match (after normalization) that uniquely identifies one
+  candidate is accepted - this is intentionally conservative:
+  a partial/fuzzy match could easily pick the wrong variant among
+  near-identical kit lens candidates, which is worse than staying
+  unresolved.
+*/
+function matchVisualAnswerToLensfunCandidate(
+  answerText,
+  candidates
+) {
+  const cleanAnswer =
+    String(
+      answerText || ""
+    ).trim();
+
+  if (
+    !cleanAnswer ||
+    cleanAnswer.toLowerCase() ===
+      "unknown" ||
+    !Array.isArray(candidates) ||
+    !candidates.length
+  ) {
+    return null;
+  }
+
+  const normalizedAnswer =
+    normalizeLensAnswerForExactMatch(
+      cleanAnswer
+    );
+
+  if (!normalizedAnswer) {
+    return null;
+  }
+
+  const exactMatches =
+    candidates.filter(
+      candidate =>
+        normalizeLensAnswerForExactMatch(
+          candidate?.model
+        ) === normalizedAnswer
+    );
+
+  return exactMatches.length === 1
+    ? exactMatches[0]
+    : null;
+}
 
 function lensfunCandidateToIdentity(
   candidate
@@ -1594,11 +2006,14 @@ function lensfunCandidateToIdentity(
 
     maxAperture,
 
-    featureModelCodes:
-      null,
+featureTokens:
+  [],
 
-    generation:
-      null,
+modelCodes:
+  [],
+
+generation:
+  null,
 
     lensfunCandidateId:
       candidate.candidateId,
@@ -1610,6 +2025,34 @@ function lensfunCandidateToIdentity(
       "lensfun"
   };
 }
+
+function isCompleteLensfunFocalEvidence(
+  value
+) {
+  const focal =
+    normalizeFocalForComparison(
+      value
+    );
+
+  /*
+    Only allow COMPLETE focal lengths/ranges.
+
+    Valid:
+      50mm
+      18-55mm
+      12.5mm
+
+    Invalid / truncated OCR:
+      -55mm
+      18-mm
+      18-
+  */
+  return /^(?:\d+(?:\.\d+)?)(?:-\d+(?:\.\d+)?)?mm$/i
+    .test(
+      focal
+    );
+}
+
 
 function hasEnoughEvidenceForLensfun(
   evidence
@@ -1626,48 +2069,26 @@ function hasEnoughEvidenceForLensfun(
       ""
     ).trim();
 
-  /*
-    Deterministic replacement for the old AI gate.
-
-    Minimum Lensfun requirement:
-      1. known manufacturer
-      2. known focal length/range
-
-    Examples:
-      Canon + 18-55mm → yes
-      Nikon + 50mm → yes
-
-      Canon only → no
-      EF-S only → no
-  */
   return Boolean(
     brand &&
-    focalLength
+    isCompleteLensfunFocalEvidence(
+      focalLength
+    )
   );
 }
 
 async function resolveCanonicalLens({
   product,
-  productOcrResults,
-  listingTitle,
-  listingDescription,
-  listingScreenshotOcr,
-  explicitFacts,
-  cameraContext
+  cameraContext,
+  visualIdentificationAnswer
 }) {
   const evidence =
-    collectObjectiveLensEvidence({
-      product,
-      productOcrResults,
-      listingTitle,
-      listingDescription,
-      listingScreenshotOcr,
-      explicitFacts
-    });
-
+    collectStructuredLensEvidence(
+      product
+    );
 
   console.log(
-    "[LENS RESOLVER] Objective evidence:",
+    "[LENS RESOLVER] Structured evidence:",
     evidence
   );
 
@@ -1698,21 +2119,21 @@ async function resolveCanonicalLens({
     );
 
 
-    return {
-      evidence,
+return {
+  evidence,
 
-      identity:
-        null,
+  identity:
+    null,
 
-      candidates:
-        [],
+  candidates:
+    [],
 
-      mode:
-        "needs-google-lens",
+  mode:
+    "serpapi-ai-mode-uncropped",
 
-      reason:
-        "Lensfun requires both manufacturer and focal length."
-    };
+  reason:
+    "Lensfun returned zero matching candidates; use uncropped SerpApi Google AI Mode."
+};
   }
 
 
@@ -1785,7 +2206,7 @@ async function resolveCanonicalLens({
         [],
 
       mode:
-        "needs-google-lens",
+        "serpapi-ai-mode-uncropped",
 
       reason:
         "Lensfun returned zero matching candidates."
@@ -1794,80 +2215,129 @@ async function resolveCanonicalLens({
 
 
   /*
-    EXACTLY ONE CANDIDATE
+  EXACTLY ONE CANDIDATE
 
-    Deterministic exact identity.
-    No DataForSEO required.
-  */
-  if (
-    candidates.length === 1
-  ) {
-    console.log(
-      "[LENS RESOLVER] Exactly one Lensfun candidate. Accepting deterministically:",
-      {
-        productId:
-          evidence.productId,
-
-        model:
-          candidates[0]
-            ?.model
-      }
+  Consider this resolved directly by Lensfun.
+*/
+if (
+  candidates.length === 1
+) {
+  const identity =
+    lensfunCandidateToIdentity(
+      candidates[0]
     );
 
+  console.log(
+    "[LENS RESOLVER] Exactly one Lensfun candidate. Resolved directly:",
+    {
+      productId:
+        evidence.productId,
 
-    return {
-      evidence,
+      model:
+        candidates[0]?.model
+    }
+  );
 
-      identity:
-        lensfunCandidateToIdentity(
-          candidates[0]
-        ),
+  return {
+    evidence,
 
-      candidates,
+    identity,
 
-      mode:
-        "lensfun-single",
+    candidates,
 
-      reason:
-        "Exactly one Lensfun candidate remained."
-    };
-  }
+    mode:
+      "lensfun",
+
+    reason:
+      "Exactly one Lensfun candidate remained; accepting it as the resolved lens identity."
+  };
+}
 
 
   /*
     TWO OR MORE CANDIDATES
 
-    DO NOT ask AI to choose.
-
-    Preserve all candidates as a hard candidate set
-    and route the product to cropped DataForSEO.
+    Lensfun did not uniquely resolve the lens on structured
+    evidence alone. Before asking for (another) visual
+    identification, check whether a visual identification we
+    already have exactly matches exactly one remaining
+    candidate - if so, that IS the resolution; stop here rather
+    than routing back into another Lensfun/SerpApi cycle.
   */
-  console.log(
-    "[LENS RESOLVER] Multiple Lensfun candidates. Routing to visual fallback:",
-    {
-      productId:
-        evidence.productId,
+  const directMatch =
+    matchVisualAnswerToLensfunCandidate(
+      visualIdentificationAnswer,
+      candidates
+    );
 
-      count:
-        candidates.length
-    }
-  );
+  if (directMatch) {
+    const identity =
+      lensfunCandidateToIdentity(
+        directMatch
+      );
 
+    identity.resolutionMode =
+      "lensfun-serpapi-matched";
 
-  return {
-    evidence,
+    console.log(
+      "[LENS RESOLVER] Visual identification exactly matched one remaining Lensfun candidate. Resolved directly:",
+      {
+        productId:
+          evidence.productId,
 
-    identity:
-      null,
+        visualIdentificationAnswer,
 
-    candidates,
+        matchedModel:
+          directMatch?.model
+      }
+    );
 
-    mode:
-      "lensfun-multiple",
+    return {
+      evidence,
 
-    reason:
-      "Multiple Lensfun candidates remain; visual identification is required."
-  };
+      identity,
+
+      candidates,
+
+      mode:
+        "lensfun",
+
+      reason:
+        `Visual identification ("${visualIdentificationAnswer}") exactly matched one remaining Lensfun candidate; accepting it as resolved.`
+    };
+  }
+
+  /*
+    No visual answer (yet), or it didn't exactly match a
+    remaining candidate. Always use SerpApi AI Mode on the
+    original best image rather than asking a generic
+    reconciliation AI to just pick one.
+  */
+console.log(
+  "[LENS RESOLVER] Multiple Lensfun candidates remain. Routing to SerpApi AI Mode:",
+  {
+    productId:
+      evidence.productId,
+
+    count:
+      candidates.length
+  }
+);
+
+return {
+  evidence,
+
+  identity:
+    null,
+
+  candidates,
+
+  mode:
+    "serpapi-ai-mode-uncropped",
+
+  reason:
+    "Multiple Lensfun candidates remain; use SerpApi Google AI Mode on the original best image to identify the exact lens."
+};
 }
 
 /*
@@ -2167,6 +2637,106 @@ app.post(
           error:
             error?.message ||
             "Could not prepare DataForSEO crops."
+        });
+    }
+  }
+);
+
+app.post(
+  "/serpapi-ai-mode-identify-lens",
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const imageUrl =
+        String(
+          req.body?.imageUrl ||
+          ""
+        ).trim();
+
+      const promptText =
+        String(
+          req.body?.promptText ||
+          ""
+        ).trim();
+
+      const lensfunCandidates =
+        Array.isArray(
+          req.body?.lensfunCandidates
+        )
+          ? req.body.lensfunCandidates
+          : [];
+
+      if (!imageUrl) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "Missing imageUrl."
+          });
+      }
+
+      if (!promptText) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "Missing promptText."
+          });
+      }
+
+  const result =
+  await identifyLensWithSerpApiAiMode({
+    imageUrl,
+    promptText,
+    lensfunCandidates
+  });
+
+
+return res.json({
+  ok:
+    true,
+
+  found:
+    result.found === true,
+
+  /*
+    IMPORTANT:
+
+    This is intentionally RAW AI identification text.
+
+    For a single/exclusion request this will normally
+    be one model.
+
+    For a group request it may contain multiple lines.
+  */
+  identification:
+    result.text || "",
+
+  evidenceSource:
+    "serpapi-google-ai-mode",
+
+  serpApiSearchId:
+    result.searchId
+});
+
+    } catch (error) {
+      console.error(
+        "[SERPAPI AI MODE] Identification failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "SerpApi Google AI Mode lens identification failed."
         });
     }
   }
@@ -2565,181 +3135,6 @@ function normalizeStringArray(
   ];
 }
 
-
-function getStep5GroundingSources({
-  productId,
-  productOcrResults,
-  listingTitle,
-  listingDescription,
-  explicitFacts
-}) {
-  const matchingProductOcr =
-    (productOcrResults || [])
-      .filter(
-        item =>
-          String(
-            item?.productId || ""
-          ).trim() ===
-          String(
-            productId || ""
-          ).trim()
-      )
-      .map(
-        item =>
-          String(
-            item?.ocrText || ""
-          ).trim()
-      )
-      .filter(Boolean);
-
-
-  const sellerSources = [
-    String(
-      listingTitle || ""
-    ).trim(),
-
-    String(
-      listingDescription || ""
-    ).trim(),
-
-    ...(
-      Array.isArray(
-        explicitFacts?.explicitlyIncluded
-      )
-        ? explicitFacts.explicitlyIncluded
-        : []
-    ),
-
-    ...(
-      Array.isArray(
-        explicitFacts?.listingNotes
-      )
-        ? explicitFacts.listingNotes
-        : []
-    )
-  ]
-    .map(
-      value =>
-        String(
-          value || ""
-        ).trim()
-    )
-    .filter(Boolean);
-
-
-  return [
-    ...matchingProductOcr,
-    ...sellerSources
-  ];
-}
-
-
-function keepOnlyVerbatimEvidence(
-  extractedEvidence,
-  groundingSources
-) {
-  return normalizeStringArray(
-    extractedEvidence
-  ).filter(
-    evidence =>
-      groundingSources.some(
-        source =>
-          String(source)
-            .includes(
-              evidence
-            )
-      )
-  );
-}
-
-
-function evidenceSupportsLiteral(
-  value,
-  evidence
-) {
-  const cleanValue =
-    String(
-      value || ""
-    ).trim();
-
-  if (!cleanValue) {
-    return false;
-  }
-
-
-  return evidence.some(
-    text =>
-      hasExactObjectiveEvidence(
-        text,
-        cleanValue
-      )
-  );
-}
-
-
-function evidenceSupportsFocalLength(
-  value,
-  evidence
-) {
-  const target =
-    normalizeFocalForComparison(
-      value
-    );
-
-  if (!target) {
-    return false;
-  }
-
-
-  return evidence.some(
-    text => {
-      const extracted =
-        extractFocalLengthFromText(
-          text
-        );
-
-      return (
-        normalizeFocalForComparison(
-          extracted
-        ) ===
-        target
-      );
-    }
-  );
-}
-
-
-function evidenceSupportsAperture(
-  value,
-  evidence
-) {
-  const target =
-    normalizeApertureForComparison(
-      value
-    );
-
-  if (!target) {
-    return false;
-  }
-
-
-  return evidence.some(
-    text => {
-      const extracted =
-        extractMaxApertureFromText(
-          text
-        );
-
-      return (
-        normalizeApertureForComparison(
-          extracted
-        ) ===
-        target
-      );
-    }
-  );
-}
-
 function normalizeLocalizerBoundingBox(
   boundingBox
 ) {
@@ -2899,37 +3294,26 @@ async function localizeDataForSeoTargets({
   imageIndex,
   targets
 }) {
-  const localizationTargets =
-    targets.map(
-      target => ({
-        productId:
-          String(
-            target?.productId ||
-            ""
-          ).trim(),
+ const localizationTargets =
+  targets.map(
+    target => ({
+      productId:
+        String(
+          target?.productId ||
+          ""
+        ).trim(),
 
-        productType:
-          String(
-            target?.productType ||
-            ""
-          ).trim(),
+      productType:
+        String(
+          target?.productType ||
+          ""
+        ).trim(),
 
-        knownProduct:
-          target?.knownProduct ||
-          null,
-
-        ocrText:
-          String(
-            target?.ocrText ||
-            ""
-          )
-            .trim()
-            .slice(
-              0,
-              1200
-            )
-      })
-    );
+      knownProduct:
+        target?.knownProduct ||
+        null
+    })
+  );
 
 
   const prompt = `
@@ -5549,15 +5933,201 @@ console.log(
   "[PRODUCT DATABASE] Using global Supabase camera_products table."
 );
 
+/*
+  ============================================================
+  KNOWN CANONICAL NAME ALIASES
+  ============================================================
+
+  Some products have genuinely different names that still refer
+  to the exact same physical item - most commonly Canon's
+  regional DSLR naming (same camera, different badge in the US
+  vs. Europe vs. Asia). No generic formatting rule can safely
+  catch these since the names don't share a common pattern; they
+  have to be listed explicitly.
+
+  HOW TO ADD A NEW ONE: add a { pattern, replacement } entry
+  below. `pattern` matches the case where the ALTERNATE name
+  appears (word-boundary, case-insensitive since the input is
+  already lowercased); `replacement` is whichever form should
+  win going forward. It does not matter which side "wins" as
+  long as it's applied consistently - pick whichever spelling is
+  already more common in camera_products if unsure. Verify a new
+  pair actually refers to the same camera (not just a similar
+  one) before adding it - an incorrect merge would silently
+  combine pricing data for two different products.
+
+  Confirmed as of this writing:
+    Rebel T6   = EOS 1300D
+    Rebel T7   = EOS 2000D
+    Rebel T100 = EOS 4000D
+    Rebel XTi  = EOS 400D
+  ============================================================
+*/
+const CANONICAL_NAME_KNOWN_ALIASES = [
+  {
+    pattern: /\brebel t6\b/g,
+    replacement: "1300d"
+  },
+  {
+    pattern: /\beos t6\b/g,
+    replacement: "eos 1300d"
+  },
+  {
+    pattern: /\brebel t7\b/g,
+    replacement: "2000d"
+  },
+  {
+    pattern: /\bt7 rebel\b/g,
+    replacement: "2000d"
+  },
+  {
+    pattern: /\beos t7\b/g,
+    replacement: "eos 2000d"
+  },
+  {
+    pattern: /\brebel t100\b/g,
+    replacement: "4000d"
+  },
+  {
+    pattern: /\beos t100\b/g,
+    replacement: "eos 4000d"
+  },
+  {
+    pattern: /\brebel xti\b/g,
+    replacement: "400d"
+  }
+];
+
+/*
+  Lens mount prefixes that are sometimes glued directly to the
+  focal length with no space (e.g. OCR/reconstruction producing
+  "ef-s55-250mm" instead of "ef-s 55-250mm"). Longer/more
+  specific prefixes are listed before their shorter substrings
+  ("ef-s" before "ef") so the more specific one always matches
+  first.
+*/
+const LENS_MOUNT_PREFIXES_NEEDING_SPACE =
+  [
+    "ef-s",
+    "ef-m",
+    "rf-s",
+    "ef",
+    "rf",
+    "fd",
+    "fl",
+    "dx",
+    "fx"
+  ];
+
 function normalizeCanonicalName(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
+  let name =
+    String(value || "")
+      .trim()
+      .toLowerCase()
 
-    // Normalize trivial product-type wording.
-    .replace(/\bcamera lens\b/g, "lens")
+      // Normalize trivial product-type wording.
+      .replace(/\bcamera lens\b/g, "lens")
 
-    // Normalize whitespace after replacements.
+      /*
+        Parenthetical asides and slash-separated alternates are
+        almost always just an alternate/regional name annotation
+        ("EOS 1300D (Rebel T6)", "EOS Rebel XTi / 400D") - strip
+        them to plain whitespace so both spellings of a listing
+        converge to the same string once the alias table and the
+        duplicate-token collapse below run.
+      */
+      .replace(/\([^)]*\)/g, " ")
+      .replace(/\//g, " ")
+
+      .replace(/\s+/g, " ")
+      .trim();
+
+  /*
+    Known same-product-different-name aliases (see table above).
+  */
+  for (
+    const alias of CANONICAL_NAME_KNOWN_ALIASES
+  ) {
+    name =
+      name.replace(
+        alias.pattern,
+        alias.replacement
+      );
+  }
+
+  /*
+    Insert a missing space between a lens mount prefix and an
+    immediately-following focal length digit, e.g.
+    "ef-s55-250mm" -> "ef-s 55-250mm".
+  */
+  for (
+    const prefix of LENS_MOUNT_PREFIXES_NEEDING_SPACE
+  ) {
+    const escapedPrefix =
+      prefix.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+      );
+
+    name =
+      name.replace(
+        new RegExp(
+          `\\b${escapedPrefix}(?=\\d)`,
+          "g"
+        ),
+        `${prefix} `
+      );
+  }
+
+  name = name
+
+    /*
+      Aperture notation formatting varies ("f/4-5.6" vs.
+      "f4-5.6") without changing what the aperture actually is -
+      collapse both to the same form so they compare equal.
+    */
+    .replace(/\bf\s*\/?\s*/g, "f")
+
+    /*
+      A revision marker occasionally gets extracted in the wrong
+      order relative to "IS" (e.g. "II IS" instead of Canon's
+      actual "IS II" naming) - normalize to the correct order.
+    */
+    .replace(
+      /\b(ii|iii|iv)\s+is\b/g,
+      "is $1"
+    )
+
+    /*
+      Marketing/descriptive filler that doesn't add any
+      identifying information beyond what's already in the
+      focal length + productType. Strip the descriptive words
+      but leave a trailing bare "lens" (from productType) intact.
+    */
+    .replace(
+      /\b(manual focus )?telephoto zoom\b/g,
+      " "
+    )
+
+    .replace(/\s+/g, " ")
+    .trim();
+
+  /*
+    Collapse any word/token that's immediately repeated
+    (e.g. "ef-s ef-s", "1300d 1300d") - this can happen either
+    from upstream string-building bugs or as a side effect of
+    the alias substitution above. Run twice to also catch a
+    repeat created by the first pass (e.g. three in a row).
+  */
+  for (let pass = 0; pass < 2; pass++) {
+    name =
+      name.replace(
+        /\b([a-z0-9][a-z0-9-]*)\s+\1\b/g,
+        "$1"
+      );
+  }
+
+  return name
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -5573,6 +6143,41 @@ function cleanNullableIdentityField(value) {
       .trim();
 
   return cleaned || null;
+}
+
+/*
+  ============================================================
+  DETERMINISTIC CAMERA MODEL VAGUENESS CHECK
+  ============================================================
+
+  Camera lenses get a deterministic fallback backstop via
+  resolveCanonicalLens() regardless of what Step 5's LLM call
+  decided. Camera bodies/cameras have no such resolver, so
+  whether an obviously-vague identity (e.g. "Canon EOS" alone)
+  gets queued for visual fallback previously depended entirely
+  on the LLM choosing to follow that instruction - which it did
+  not reliably do. This gives non-lens products the same kind
+  of deterministic check.
+*/
+function isVagueCameraModelName(
+  modelName
+) {
+  const cleaned =
+    String(
+      modelName || ""
+    ).trim();
+
+  if (!cleaned) {
+    return true;
+  }
+
+  /*
+    A specific camera model name virtually always includes a
+    digit ("60D", "D750", "a6000", "GH5", "X100", "SL2"). A bare
+    series/family name ("EOS", "Rebel", "Alpha", "D",
+    "PowerShot") does not, and maps to many distinct cameras.
+  */
+  return !/\d/.test(cleaned);
 }
 
 function normalizeLensModelCodes(
@@ -5608,16 +6213,19 @@ function normalizeLensIdentity(
       ),
 
     maxAperture:
-      cleanNullableIdentityField(
-        lensIdentity?.maxAperture
-      ),
+  cleanNullableIdentityField(
+    lensIdentity?.maxAperture
+  ),
 
-    modelCodes:
-      normalizeLensModelCodes(
-        lensIdentity?.modelCodes ??
-        lensIdentity?.featureModelCodes
-      ),
+featureTokens:
+  normalizeStringArray(
+    lensIdentity?.featureTokens
+  ),
 
+modelCodes:
+  normalizeLensModelCodes(
+    lensIdentity?.modelCodes
+  ),
     generation:
       cleanNullableIdentityField(
         lensIdentity?.generation
@@ -8768,7 +9376,6 @@ camera_1
 camera_2
 lens_1
 lens_2
-flash_1
 
 refers to one specific physical object across ALL galleries in this listing.
 
@@ -8795,7 +9402,6 @@ Likewise:
 
 lens_1 always refers to the same physical lens across galleries.
 lens_2 means a different physical lens.
-flash_1 always refers to the same physical flash across galleries.
 
 Never restart product numbering when a new gallery begins.
 
@@ -8856,7 +9462,7 @@ For example, an uploaded image may show:
 A camera or lens shown INSIDE such a screenshot is NOT a physical
 Marketplace product.
 
-Do NOT create camera_*, lens_*, flash_*, or any other productId for
+Do NOT create camera_*, lens_*, or any other productId for
 products that exist only as images inside screenshots, webpages,
 advertisements, packaging artwork, manuals, or reference material.
 
@@ -8884,7 +9490,6 @@ For this application, primary products include:
 - camera bodies
 - cameras
 - camera lenses
-- flashes / Speedlites
 
 Do not treat these as primary products:
 - batteries
@@ -8914,7 +9519,6 @@ camera_1
 camera_2
 lens_1
 lens_2
-flash_1
 
 If the SAME physical camera appears in multiple images, use the same product ID in all of those images.
 
@@ -9262,7 +9866,6 @@ const STEP5_RECONCILIATION_SCHEMA = {
               "camera body",
               "camera",
               "camera lens",
-              "flash"
             ]
           },
 
@@ -9346,6 +9949,13 @@ const STEP5_RECONCILIATION_SCHEMA = {
                 ]
               },
 
+              featureTokens: {
+  type: "array",
+  items: {
+    type: "string"
+  }
+},
+
               /*
                 Actual literal markings / model codes only.
 
@@ -9371,14 +9981,15 @@ const STEP5_RECONCILIATION_SCHEMA = {
               }
             },
 
-            required: [
-              "brand",
-              "mountSeries",
-              "focalLength",
-              "maxAperture",
-              "modelCodes",
-              "generation"
-            ]
+         required: [
+  "brand",
+  "mountSeries",
+  "focalLength",
+  "maxAperture",
+  "featureTokens",
+  "modelCodes",
+  "generation"
+]
           },
 
           /*
@@ -9557,6 +10168,46 @@ const preDataForSeoPrimaryProducts =
           ? req.body.googleLensResults
           : [];
 
+         const hasDataForSeoResults =
+  googleLensResults.some(
+    result =>
+      String(
+        result?.visualEvidenceSource ||
+        ""
+      )
+        .trim()
+        .toLowerCase() ===
+      "dataforseo"
+  );
+
+
+const hasSerpApiResults =
+  googleLensResults.some(
+    result =>
+      String(
+        result?.visualEvidenceSource ||
+        ""
+      )
+        .trim()
+        .toLowerCase() ===
+      "serpapi-google-ai-mode"
+  );
+
+
+/*
+  DataForSEO already went through its own evidence
+  cleaner, so preserve the existing second-pass shortcut.
+
+  SerpApi intentionally mimics the OLD Google Lens
+  behavior and therefore MUST go back through Step 5
+  so its plain-text identification can be reconciled
+  against OCR, seller text, gallery evidence, etc.
+*/
+const isPostDataForSeoPass =
+  hasDataForSeoResults &&
+  !hasSerpApiResults &&
+  preDataForSeoPrimaryProducts.length > 0;
+
           /*
   ============================================================
   VISUAL FALLBACK ATTEMPT TRACKING
@@ -9699,18 +10350,29 @@ function getLensfunCorroboratedDataForSeoCandidate(
       productId
     );
 
-
   if (!dataForSeoResult) {
     return null;
   }
 
-
   /*
-    HIGH + STRONG is handled by the existing
-    authoritative DataForSEO path.
+    This function is ONLY for DataForSEO.
 
-    This helper is specifically for weaker results.
+    SerpApi is handled separately by the legacy
+    Google Lens evidence path.
   */
+  if (
+    String(
+      dataForSeoResult
+        ?.visualEvidenceSource ||
+      ""
+    )
+      .trim()
+      .toLowerCase() ===
+        "serpapi-google-ai-mode"
+  ) {
+    return null;
+  }
+
   const confidence =
     String(
       dataForSeoResult
@@ -9720,7 +10382,6 @@ function getLensfunCorroboratedDataForSeoCandidate(
     )
       .trim()
       .toLowerCase();
-
 
   const consensus =
     String(
@@ -9732,19 +10393,17 @@ function getLensfunCorroboratedDataForSeoCandidate(
       .trim()
       .toLowerCase();
 
+  const isAuthoritativeDataForSeo =
+    (
+      confidence === "high" &&
+      consensus === "strong"
+    );
 
-const isAuthoritativeDataForSeo =
-  (
-    confidence === "high" &&
-    consensus === "strong"
-  );
-
-if (
-  isAuthoritativeDataForSeo
-) {
-  return null;
-}
-
+  if (
+    isAuthoritativeDataForSeo
+  ) {
+    return null;
+  }
 
   const recommendedIdentification =
     String(
@@ -9919,532 +10578,183 @@ function wasVisualFallbackAttemptedForProduct(
   );
 }
 
+const prompt = `
+You are performing the FINAL reconciliation step for a Facebook Marketplace
+camera-equipment listing. You will reason briefly per product, then output
+one JSON object.
 
-      const prompt = `
-You are performing the FINAL reconciliation step for a Facebook Marketplace camera-equipment listing.
+TASK: Determine the final list of PRIMARY PRODUCTS being sold and identify
+each as specifically as the evidence reliably supports.
 
-Your job is to determine the final list of PRIMARY PRODUCTS being sold.
+PRIMARY PRODUCTS: camera bodies, cameras, camera lenses.
+NOT primary: batteries, chargers, straps, caps, filters, hoods, cases, bags,
+manuals, boxes, memory cards, cables, adapters, screen protectors.
 
-Primary products include:
-- camera bodies
-- cameras
-- camera lenses
-- flashes / Speedlites
-
-Do NOT include:
-- batteries
-- chargers
-- straps
-- caps
-- filters
-- hoods
-- cases
-- bags
-- manuals
-- boxes
-- memory cards
-- cables
-- adapters
-- screen protectors
-- other small accessories
-
-You are receiving several evidence sources.
-
-Your first objective is to identify each physical primary product as
-specifically as the supplied evidence reliably supports.
-
-Google Lens evidence may be completely absent. That is normal.
-
-When seller text + OCR + gallery evidence are sufficient to establish
-the exact specific model, resolve the product without requesting
-Google Lens.
-
-Only request Google Lens when the product identity remains too vague
-to create a reliable exact-model resale/eBay lookup.
+EVIDENCE PRIORITY (strongest to weakest):
+1. Explicit seller-written facts (Source A) and seller title/description (Source 0)
+2. OCR from the product's own image (Source D), matched to the product via
+   productId/gallery mapping — NOT interface text or another product's OCR
+3. Gallery product mapping / readability scores (Source B, C)
+4. Visual search (Source E) — NOT used for lensIdentity fields; see
+   LENS EXTRACTION RULES below for why
 
 ==================================================
-SOURCE 0 — RAW LISTING INFORMATION
+INPUTS
 ==================================================
 
-LISTING TITLE:
+LISTING TITLE: ${listingTitle}
+LISTING DESCRIPTION: ${listingDescription}
+SCREENSHOT OCR (may contain Facebook UI text — ignore interface chrome): ${listingScreenshotOcr}
 
-${listingTitle}
+EXPLICIT SELLER FACTS: ${JSON.stringify(explicitFacts, null, 2)}
+- explicitlyIncluded / explicitlyExcluded are direct seller statements.
+- Absence from seller text does NOT mean excluded.
 
-LISTING DESCRIPTION:
+GALLERY PRODUCT MAPPING: ${JSON.stringify(galleryResults, null, 2)}
+- productId is global across the whole listing; same ID in multiple images = same physical item.
+- Different IDs (camera_1, lens_1, lens_2) = different physical products.
+- modelReadabilityScore: higher = stronger evidence for that product in that image.
 
-${listingDescription}
+BEST IMAGE PER PRODUCT: ${JSON.stringify(bestGoogleTargets, null, 2)}
 
-VISIBLE SCREENSHOT OCR:
+OCR PER PRODUCT (Google Cloud Vision): ${JSON.stringify(productOcrResults, null, 2)}
+- Text may belong to another visible product in the same image — attribute
+  using productId, gallery mapping, readability, and surrounding evidence.
+- May contain cropped/misspaced/duplicated text.
 
-${listingScreenshotOcr}
-
-Rules:
-
-- This is seller/listing evidence.
-- OCR may contain Facebook UI text unrelated to the listing.
-- Use the title and description as cleaner evidence when available.
-- OCR spelling can contain mistakes.
-- Do not interpret unrelated Facebook interface text as a product.
-
-==================================================
-SOURCE A — EXPLICIT SELLER-WRITTEN FACTS
-==================================================
-
-These came from visible listing text.
-
-${JSON.stringify(
-  explicitFacts,
-  null,
-  2
-)}
-
-Rules for Source A:
-
-- explicitlyIncluded means the seller directly stated that the item is included.
-- explicitlyExcluded means the seller directly stated that the item is NOT included.
-- listingNotes contains other explicit seller-written information.
-- Seller-written model names can be strong evidence.
-- An item being absent from seller text does NOT mean it is excluded.
+VISUAL SEARCH RESULTS: ${JSON.stringify(googleLensResults, null, 2)}
+- Observations, not ground truth. Use targetProductId/targetProductType to
+  attribute a result to a physical product.
 
 ==================================================
-SOURCE B — GALLERY PRODUCT MAPPING
+LEXICON REFERENCE — MATCH LITERALLY AGAINST OCR/TITLE/DESCRIPTION
 ==================================================
 
-This came from visual analysis of the listing photos.
+If any token below appears anywhere in authorized evidence for a lens —
+even as the trailing fragment of a cropped string like "1:3.5-5.6 IS" —
+copy it into featureTokens. This is direct transcription, not inference.
+Missing an already-present token is the error; including it is not.
 
-${JSON.stringify(
-  galleryResults,
-  null,
-  2
-)}
+CANON feature tokens: IS, USM, STM, L, DO
+CANON mounts: EF, EF-S, EF-M, RF, RF-S, FD, FL
+NIKON feature tokens: VR, AF-S, AF-P, ED, SWM
+NIKON aperture suffixes (keep attached to maxAperture, not featureTokens): D, G, E
+  e.g. "1:1.4D" -> maxAperture "f/1.4D" ; "1:3.5-5.6G" -> maxAperture "f/3.5-5.6G"
+NIKON mounts: F, F-mount, Nikon F, Z, Z-mount, NIKKOR Z, CX / 1 NIKKOR
+SIGMA/TAMRON/OTHER feature tokens: OS, VC, OIS, OSS, HSM
+GENERIC generation markers (→ \`generation\`, never featureTokens): II, III, Mark II, G2
 
-Rules for Source B:
-
-- productId represents a physical product tracked across images.
-- The same product appearing in multiple images must NOT become multiple final products.
-- modelReadabilityScore measures how readable model-identifying markings were for that specific product in that specific image.
-- Higher readability means that image is stronger evidence for identifying that particular product.
-- Gallery analysis did NOT intentionally identify exact models.
-
-IMPORTANT GLOBAL PRODUCT-ID RULE:
-
-Gallery product IDs are GLOBAL across the entire Marketplace listing.
-
-The same productId always represents the same physical product regardless
-of which gallery contains it.
-
-For example:
-
-Gallery 1 camera_1
-Gallery 2 camera_1
-
-are the SAME physical camera.
-
-They must produce exactly ONE final primary product.
-
-Gallery numbers indicate which collage contained an observation.
-They are NOT part of the product's identity.
-
-Do NOT create separate final products because the same productId appears
-in multiple gallery batches.
-
-camera_2, lens_2, etc. represent genuinely separate physical products
-that were assigned those distinct IDs during gallery analysis.
+Common OCR corruptions to recognize, not "correct" — preserve as evidence,
+normalize only the specific fields below:
+- "1:3.5-5.6" -> maxAperture "f/3.5-5.6" (normalize this specific pattern only)
+- "-55mm" or "18-" alone = incomplete zoom range, NOT a prime focal length.
+  Complete it only if other evidence confirms the missing endpoint
+  (e.g. "-55mm" -> "18-55mm" if an 18-55mm family is otherwise supported).
+  Never turn "-55mm" into "55mm."
 
 ==================================================
-CRITICAL PHYSICAL PRODUCT PRESERVATION RULE
+LENS EXTRACTION RULES
 ==================================================
 
-Every distinct physical primary product represented by a unique gallery
-productId must remain a distinct final primary product unless there is
-strong evidence that the seller explicitly excludes that physical item.
+Authorized sources for lens fields: title, description, seller-written facts,
+OCR from that product's own image. Visual search (Source E) is NEVER a source
+for any lensIdentity field, including generation, featureTokens, and
+modelCodes — not even when a visual search answer is quoted verbatim and
+looks unambiguous. Extracting a generation/feature marker from Source E here
+would just be a guess dressed up as structured evidence; the code that
+consumes lensIdentity does its own exact, deterministic comparison against
+Source E answers afterward, and does not trust anything this step infers from
+Source E. If a revision marker like "II"/"III"/"STM" is not present in
+Source A/D (seller text or that product's own OCR), generation and
+featureTokens must reflect only what those sources show — leave them
+incomplete rather than filling gaps from Source E.
 
-Examples:
+- nonLensIdentity MUST be null for lenses.
+- brand / mountSeries: populate only when explicitly supported. Don't infer
+  a mount from format designations (DX, FX are formats, not mounts).
+- focalLength / maxAperture: normalize per the rules above; otherwise verbatim.
+- featureTokens: literal matches from the lexicon table above, found in
+  Source A/D only. [] if none present in those sources.
+- generation: null unless a revision marker is explicitly present in
+  Source A/D. The presence of a feature token (e.g. "IS") never implies a
+  generation, and never implies featureTokens should be left empty.
+- modelCodes: only literal manufacturer SKUs (e.g. "H-FSA14140") found in
+  Source A/D. Never inferred from focal length, aperture, tokens, general
+  knowledge, or Source E.
 
-camera_1 + lens_1
-means TWO physical primary products.
+Worked example:
+OCR: "EF-S -55mm 1:3.5-5.6 IS"
+-> focalLength: "18-55mm" (only if another source confirms 18mm end)
+   otherwise leave as best-supported partial, do not invent "55mm" as prime
+-> maxAperture: "f/3.5-5.6"
+-> featureTokens: ["IS"]
+-> generation: null
+-> extracted_evidence includes "1:3.5-5.6 IS" in full — not truncated before "IS"
 
-Even if lens_1 is physically mounted on camera_1, lens_1 is still a
-separate sellable primary product and MUST appear separately in
-primaryProducts.
-
-Correct:
-
-camera_1 -> Canon EOS Rebel T3 camera body
-lens_1   -> Sigma 18-250mm camera lens
-
-Incorrect:
-
-camera_1 -> Canon EOS Rebel T3 with the Sigma lens identity embedded
-inside camera_1
-
-Incorrect:
-
-camera_1 only, with lens_1 omitted
-
-A mounted lens does NOT become part of the camera-body product identity.
-
-Likewise:
-
-camera_1
-lens_1
-lens_2
-
-must normally produce THREE final primaryProducts.
-
-For every unique gallery productId:
-
-- preserve that productId in primaryProducts exactly once;
-- identify THAT physical product using the evidence associated with it;
-- never transfer the identity of one productId into another productId;
-- never delete a gallery-visible lens merely because it is attached to a camera;
-- never place lensIdentity on a camera body or camera;
-- lensIdentity belongs ONLY to a product whose productType is "camera lens".
-
-The only reasons a gallery product may be omitted are:
-
-1. seller evidence explicitly states that physical product is NOT included; or
-2. the gallery clearly misclassified a non-primary accessory as a primary product.
-
-Uncertainty about exact model identity is NOT a reason to remove the
-physical product.
-
-If the exact model cannot be established, preserve the physical product
-with null identity fields and add it to needsGoogleLens.
+extracted_evidence: verbatim substrings only. No paraphrasing, no OCR
+correction, no invented supporting quotes.
 
 ==================================================
-SOURCE C — SELECTED GOOGLE TARGETS
+PRODUCT IDENTITY & RECONCILIATION
 ==================================================
 
-These show which image was selected as the strongest image for each detected product.
-
-${JSON.stringify(
-  bestGoogleTargets,
-  null,
-  2
-)}
-
-==================================================
-SOURCE D — GOOGLE CLOUD VISION OCR FROM SELECTED PRODUCT IMAGES
-==================================================
-
-${JSON.stringify(
-  productOcrResults,
-  null,
-  2
-)}
-
-Rules for Source D:
-
-- Each entry corresponds to the selected best image for a physical product.
-- ocrText is ALL text Google Vision detected in that complete image.
-- More than one physical product may be visible in the image.
-- Therefore, not every OCR string necessarily belongs to target productId.
-- Use productType, gallery mapping, seller evidence, and surrounding evidence to determine which markings belong to which physical product.
-- OCR can contain mistakes, missing characters, duplicated words, or incorrect spacing.
-- Combine OCR markings only when those markings are actually present in the
-  supplied evidence. Do not add missing components merely because they would
-  form a known or common product identity.
-- Do NOT invent missing model components.
-- A highly readable OCR result such as:
-  "Canon / EOS / 60D"
-  is sufficient evidence for Canon EOS 60D.
-- Lens OCR such as:
-  "Canon / EF-S / 18-55mm / 1:3.5-5.6 / IS II"
-  can support the normalized Canon EF-S 18-55mm f/3.5-5.6 IS II identity.
+- Every unique gallery productId = one entry in primaryProducts, even if
+  physically attached (a lens mounted on a body is still two products).
+  Never merge a lens identity into a camera/body entry.
+- Omit a gallery product only if (a) seller explicitly excludes it, or
+  (b) gallery analysis clearly misclassified an accessory as primary.
+  If identity is uncertain, keep the product with unknown fields — never delete.
+- Seller-stated quantities ("2 lenses") matched by 2 gallery IDs → don't add
+  more. Add a *_text_* product only if seller evidence establishes a physical
+  product beyond what gallery IDs already represent.
+- Visual-search conflicts for the same product: trust the image with the
+  higher modelReadabilityScore for that specific product.
+- DataForSEO establishes a new exact identity only when confidence="high"
+  AND consensus="strong" — otherwise treat as supporting evidence only.
+- SerpApi/Google AI Mode single or exclusion results may establish identity
+  if consistent with gallery/seller/OCR evidence; group results must be
+  mapped to individual productIds only when evidence supports it — never
+  assign a whole group answer to one product.
 
 ==================================================
-SOURCE E — GOOGLE SEARCH-BY-IMAGE / DATAFORSEO EVIDENCE
+VISUAL FALLBACK
 ==================================================
 
-${JSON.stringify(
-  googleLensResults,
-  null,
-  2
-)}
-
-Rules for Source E:
-
-- Google results are OBSERVATIONS, not guaranteed truth.
-- Google can identify multiple visible products even when only one product was the target.
-- Do not assume every model mentioned by Google corresponds to the target product.
-- Use targetProductId and targetProductType to understand what the Google search was intended to identify.
-- Preserve awareness that another product may also be visible in the same image.
-DATAFORSEO CLEANING RULES:
-
-- dataForSeoEvidence is an intermediary AI-cleaned summary of raw Google
-  Search By Image results.
-
-- DataForSEO may ESTABLISH a new exact commercially-distinct model ONLY when:
-
-  confidence = "high"
-
-  AND
-
-  consensus = "strong"
-
-- BOTH conditions are mandatory.
-
-- If confidence is medium or low, DataForSEO is supporting evidence only.
-
-- If consensus is mixed, weak, or none, DataForSEO is supporting evidence only.
-
-- Supporting DataForSEO evidence MUST NOT change a previously supported
-  specification such as:
-  focal length,
-  aperture,
-  stabilization designation,
-  mount series,
-  generation,
-  STM,
-  USM,
-  IS,
-  VR,
-  II,
-  III,
-  G2,
-  or other commercially meaningful suffixes.
-
-- In particular, do NOT replace an existing seller/OCR-supported fact merely
-  because a medium-confidence or mixed-consensus Search By Image result
-  contains a different specification.
-
-- When DataForSEO confidence = high AND consensus = strong, its exact model
-  may be used as strong evidence for the targeted physical product.
-
-- candidateModels remain observations and do not themselves establish identity.
-
-- Seller evidence, product OCR, and other objective evidence can still reject
-  a high/strong DataForSEO result if there is a direct contradiction.
-
-GROUP IDENTIFICATION RULES:
-
-- A Google result with identificationMode = "group" was intentionally asked to identify MULTIPLE same-type physical products visible in one image.
-- sameTypeProductIds contains the physical gallery product IDs represented by that group.
-- groupIdentificationText may therefore contain multiple model names.
-- Do NOT assign the entire groupIdentificationText to one targetProductId.
-- Instead, treat the returned model names collectively as candidate identities for the physical products in sameTypeProductIds.
-- Use gallery evidence, seller-written evidence, other Google observations, readability scores, already-resolved identities, and visible-product relationships to map individual models to individual physical product IDs when supported.
-- Never create an additional physical product merely because a group Google result contains multiple model names.
-- The number of model names in a group Google result does NOT override stronger gallery evidence about how many physical products exist.
-- If the group identifies the models but there is insufficient evidence to determine which model belongs to which product ID, preserve the correct number of physical products and leave ambiguous individual models null rather than assigning them arbitrarily.
-
-CRITICAL CONFLICT RULE:
-
-When Google results disagree about the model of a particular physical product, prefer the Google observation coming from the image with the higher modelReadabilityScore FOR THAT SPECIFIC PRODUCT.
-
-Example:
-
-Image 1:
-camera_1 readability = 10
-lens_1 readability = 4
-Google says:
-Nikon D3100
-18-55mm VR
-
-Image 2:
-camera_1 readability = 3
-lens_1 readability = 10
-Google says:
-Nikon D3000
-18-55mm VR II
-
-Correct reconciliation:
-camera_1 -> Nikon D3100
-lens_1 -> 18-55mm VR II
-
-Do NOT simply trust the entire Google result from whichever image had the highest score for the targeted product.
-
-Instead, reason product-by-product.
-
-OTHER RULES:
-
-- Do not duplicate the same physical item.
-- Seller-written text may explicitly establish a model even if visual evidence is weak.
-- If seller text explicitly says multiple distinct primary products are included, preserve that unless there is strong contradictory evidence.
-- If gallery evidence detects fewer products than seller text because an item is boxed, obscured, or not visibly identifiable, seller text may still establish that product as included.
-- If exact model evidence is insufficient, use null for model rather than inventing one.
-- If brand is unknown, use null.
-- Prefer the most specific supported model name.
-- Do not include secondary accessories.
-- Do not include explanations in the final response.
-
-SELLER QUANTITY RECONCILIATION RULE:
-
-If seller text says a quantity such as "2 lenses" and gallery evidence
-already contains 2 distinct physical camera lenses that reasonably
-account for that quantity, those gallery products satisfy the seller's
-quantity statement.
-
-Do NOT create additional lens_text_* products merely because the
-seller-written quantity does not explicitly map names to gallery IDs.
-
-Only create *_text_* products when seller evidence establishes that
-additional physical products are included BEYOND the products already
-accounted for by the gallery evidence.
-
-LENS EXTRACTION — STRICT GROUNDING CONTRACT:
-
-For camera lenses, this step is an EXTRACTION step only.
-
-You are NOT identifying a canonical commercial lens model.
-You are NOT choosing the most likely revision.
-You are NOT allowed to complete a partial lens identity using camera knowledge.
-
-The dedicated Lensfun / visual-resolution pipeline runs AFTER this step.
-
-For every camera lens:
-
-- nonLensIdentity MUST be null.
-- lensIdentity MUST contain only attributes supported by Marketplace source evidence.
-- extracted_evidence MUST contain exact verbatim substrings copied from the supplied source material.
-
-AUTHORIZED SOURCES FOR extracted_evidence:
-
-1. Marketplace listing title.
-2. Marketplace listing description / seller-written text.
-3. OCR from the physical Marketplace product image.
-4. Explicit seller-written facts extracted from those sources.
-
-Google Search By Image / DataForSEO evidence is NOT an authorized source
-for lensIdentity fields in this extraction step.
-
-DataForSEO may be used later by the dedicated resolver, but must never
-be used here to rewrite or complete the structured Marketplace extraction.
-
-EXTRACTED EVIDENCE RULE:
-
-Every string in extracted_evidence must be copied VERBATIM.
-
-Do not paraphrase it.
-Do not normalize it.
-Do not correct OCR inside extracted_evidence.
-Do not manufacture a supporting quote.
-
-Example:
-
-Source:
-"PANASONIC LUMIX G Vario Lens, 14-140MM, F3.5-5.6"
-
-Valid extracted_evidence:
-[
-  "PANASONIC LUMIX G Vario",
-  "14-140MM",
-  "F3.5-5.6"
-]
-
-Invalid extracted_evidence:
-[
-  "Panasonic H-FSA14140",
-  "Mark II",
-  "Version 2"
-]
-
-because none of those strings occur in the supplied Marketplace source.
-
-ATTRIBUTE RULES:
-
-brand:
-Populate only if manufacturer/brand wording is directly supported.
-
-mountSeries:
-Populate only if the mount/series is directly stated.
-
-focalLength:
-You may normalize directly stated text.
-
-Example:
-"14-140MM"
-may become:
-"14-140mm"
-
-maxAperture:
-You may normalize directly stated aperture notation.
-
-Example:
-"F3.5-5.6"
-or
-"1:3.5-5.6"
-
-may become:
-"f/3.5-5.6"
-
-modelCodes:
-Contains ONLY literal manufacturer model / SKU codes directly present
-in the Marketplace source.
-
-Examples:
-"H-FS14140"
-"H-FSA14140"
-"A006"
-
-Do NOT infer a model code from focal length, aperture, appearance,
-camera compatibility, product family, or general knowledge.
-
-generation:
-Populate ONLY if the generation/revision is explicitly present.
-
-Examples:
-"II"
-"III"
-"Mark II"
-"G2"
-
-If no generation is explicitly stated:
-generation MUST be null.
-
-Absence of "II" does NOT establish generation I.
-
-Do NOT assume:
-- the oldest version;
-- the newest version;
-- the most common version.
-
-Example source:
-
-"PANASONIC LUMIX G Vario Lens, 14-140MM, F3.5-5.6 ASPH"
-"Micro Four Thirds"
-
-Correct lensIdentity:
-
-{
-  "brand": "Panasonic",
-  "mountSeries": "Micro Four Thirds",
-  "focalLength": "14-140mm",
-  "maxAperture": "f/3.5-5.6",
-  "modelCodes": [],
-  "generation": null
-}
-
-It is FORBIDDEN to output:
-
-"H-FSA14140"
-"II"
-"Mark II"
-
-unless those distinguishing facts are explicitly supported by the
-Marketplace source.
-
-UNKNOWN INFORMATION MUST REMAIN UNKNOWN.
-
-The dedicated resolver owns canonical lens identification.
-
-Return objects matching this structure:
-
+Add a product to needsGoogleLens only if seller text + OCR are genuinely too
+vague for a reliable resale lookup. For camera bodies, a bare series/family
+name with no specific model number is vague, not an identity — "Canon EOS",
+"Rebel", "Sony Alpha", and "Nikon D" each match many distinct camera models,
+so treat them as unresolved rather than guessing which one. A specific model
+("EOS 60D", "Alpha a6000", "D750") is sufficient even if other fields are
+unknown. For lenses, "18-55mm" with no mount/aperture/feature tokens is
+similarly vague. Do NOT request it just because some field is unknown — e.g.
+"EF-S 18-55mm f/3.5-5.6 IS II" is specific enough already. Skip re-requesting
+if visual evidence was already supplied and used.
+
+==================================================
+REQUIRED OUTPUT FORMAT
+==================================================
+
+First, output a brief evidence scan, one entry per productId:
+
+<evidence_scan>
+productId: what title/description/seller-facts say | what OCR (this product's
+image) says, verbatim fragments | what visual search says (if any) | resulting
+fields and why
+</evidence_scan>
+
+Then output exactly one JSON object in a fenced code block:
+
+\`\`\`json
 {
   "primaryProducts": [
     {
       "productId": "camera_1",
       "galleryIndex": 1,
       "productType": "camera body",
-      "nonLensIdentity": {
-        "brand": "Canon",
-        "modelName": "EOS 60D"
-      },
+      "nonLensIdentity": { "brand": "Canon", "modelName": "EOS 60D" },
       "lensIdentity": null,
-      "extracted_evidence": [
-        "Canon EOS 60D"
-      ]
+      "extracted_evidence": ["Canon EOS 60D"]
     },
     {
       "productId": "lens_1",
@@ -10452,192 +10762,154 @@ Return objects matching this structure:
       "productType": "camera lens",
       "nonLensIdentity": null,
       "lensIdentity": {
-        "brand": "Panasonic",
-        "mountSeries": "Micro Four Thirds",
-        "focalLength": "14-140mm",
+        "brand": "Canon",
+        "mountSeries": "EF-S",
+        "focalLength": "18-55mm",
         "maxAperture": "f/3.5-5.6",
+        "featureTokens": ["IS"],
         "modelCodes": [],
         "generation": null
       },
-      "extracted_evidence": [
-        "PANASONIC LUMIX G Vario",
-        "14-140MM",
-        "F3.5-5.6",
-        "Micro Four Thirds"
-      ]
+      "extracted_evidence": ["EF-S", "18-55mm", "1:3.5-5.6 IS"]
     }
   ],
-
   "needsGoogleLens": []
 }
+\`\`\`
 
-GOOGLE LENS FALLBACK RULE:
-
-For every gallery-visible physical product, decide whether the available
-seller evidence + OCR evidence is specific enough to establish the
-particular product model.
-
-Add a product to needsGoogleLens ONLY when additional visual
-identification is genuinely required.
-
-Do NOT request Google Lens merely because:
-- every possible marketing word is not known;
-- seller text and OCR already clearly establish an exact camera model;
-- a lens identity is already specific enough to distinguish the exact
-  resale product.
-
-DO request Google Lens when evidence remains materially ambiguous.
-
-Examples:
-
-Canon + EOS + 60D
-→ specific enough
-→ do NOT request Lens.
-
-Canon + EOS
-→ too vague
-→ request Lens.
-
-Canon + 18-55mm
-→ normally too vague because many Canon 18-55mm revisions exist
-→ request Lens.
-
-Canon + EF-S + 18-55mm + f/3.5-5.6 + IS II
-→ specific enough
-→ do NOT request Lens.
-
-If Google Lens evidence is already supplied for a product, incorporate
-that evidence and do not request another Lens search unless the supplied
-Lens evidence itself failed to identify the product.
-
-Requirements:
-
-- primaryProducts must be an array.
-- Each physical primary product should appear exactly once.
-- productId should reuse gallery product IDs when possible.
-
-For camera lenses:
-- nonLensIdentity MUST be null.
-- lensIdentity MUST be an object.
-- Do not output a free-form model name.
-- Do not output canonicalModel.
-- Use modelCodes only for explicitly visible model/SKU codes.
-- extracted_evidence must contain verbatim Marketplace-source substrings.
-
-For non-lens products:
-- lensIdentity MUST be null.
-- nonLensIdentity contains brand and modelName.
-
-productType must be one of:
-"camera body"
-"camera"
-"camera lens"
-"flash"
-
-CRITICAL:
-
-A camera body may NEVER contain information about an attached lens in
-its lensIdentity field.
-
-For example, this is INVALID:
-
-{
-  "productId": "camera_1",
-  "productType": "camera body",
-  "brand": "Canon",
-  "model": "EOS Rebel T3",
-  "lensIdentity": {
-    "brand": "Sigma",
-    "focalLength": "18-250mm"
-  }
-}
-
-The correct representation is TWO objects:
-
-camera_1 = Canon EOS Rebel T3 camera body
-lens_1   = Sigma 18-250mm camera lens
+Rules for this block: productType is exactly one of "camera body", "camera",
+"camera lens". Cameras/bodies: lensIdentity MUST be null. Lenses:
+nonLensIdentity MUST be null, lensIdentity MUST be an object (no bare model
+string, no canonicalModel field). Unknown = null, never invented. Each
+physical product appears exactly once.
       `.trim();
 
 
-const response =
-  await createLoggedOpenAiResponse({
-    step:
-      "Step 5 primary product reconciliation",
+let parsed =
+  null;
 
-    request: {
-  model:
-    "gpt-4o-mini",
-
-  text: {
-    format: {
-      type:
-        "json_schema",
-
-      name:
-        "step5_primary_product_reconciliation",
-
-      strict:
-        true,
-
-      schema:
-        STEP5_RECONCILIATION_SCHEMA
-    }
-  },
-
-  input: [
-    {
-      role:
-        "user",
-
-      content: [
-        {
-          type:
-            "input_text",
-
-          text:
-            prompt
-        }
-      ]
-    }
-  ]
-}
-  });
+let parsedPrimaryProducts =
+  [];
 
 
-      const rawText =
-        String(
-          response.output_text ||
-          ""
-        ).trim();
+if (isPostDataForSeoPass) {
+  /*
+    SECOND PASS:
+
+    Do not send OCR, seller evidence, or Marketplace
+    source text through Step 5 again.
+
+    The first-pass structured JSON is now the
+    authoritative Marketplace evidence state.
+  */
+  parsedPrimaryProducts =
+    preDataForSeoPrimaryProducts.map(
+      product =>
+        JSON.parse(
+          JSON.stringify(
+            product
+          )
+        )
+    );
+
+  console.log(
+    "[STEP 5] Skipping AI reconciliation on post-DataForSEO pass."
+  );
+
+} else {
+  /*
+    FIRST PASS ONLY.
+  */
+  const response =
+    await createLoggedOpenAiResponse({
+      step:
+        "Step 5 primary product reconciliation",
+
+      request: {
+        model:
+          "gpt-4o-mini",
+
+        /*
+          This step is literal transcription (copy tokens that are
+          present, leave fields null when absent), not creative
+          generation. A non-zero temperature was letting the model
+          inconsistently drop literal tokens like "IS" across
+          otherwise-identical runs (see identical OCR input producing
+          featureTokens: [] on some passes and correct extraction on
+          others). Pin this to 0 for reproducible extraction.
+        */
+        temperature:
+          0,
+
+        text: {
+          format: {
+            type:
+              "json_schema",
+
+            name:
+              "step5_primary_product_reconciliation",
+
+            strict:
+              true,
+
+            schema:
+              STEP5_RECONCILIATION_SCHEMA
+          }
+        },
+
+        input: [
+          {
+            role:
+              "user",
+
+            content: [
+              {
+                type:
+                  "input_text",
+
+                text:
+                  prompt
+              }
+            ]
+          }
+        ]
+      }
+    });
 
 
-      console.log(
-        "[STEP 5] Raw reconciliation response:"
-      );
+  const rawText =
+    String(
+      response.output_text ||
+      ""
+    ).trim();
 
-      console.log(
+
+  console.log(
+    "[STEP 5] Raw reconciliation response:"
+  );
+
+  console.log(
+    rawText
+  );
+
+
+  try {
+    parsed =
+      JSON.parse(
         rawText
       );
 
+  } catch (error) {
+    return res
+      .status(502)
+      .json({
+        error:
+          "OpenAI returned invalid Step-5 JSON.",
 
-      let parsed;
-
-      try {
-        parsed =
-          JSON.parse(
-            rawText
-          );
-
-      } catch (error) {
-        return res
-          .status(502)
-          .json({
-            error:
-              "OpenAI returned invalid Step-5 JSON.",
-
-            rawText
-          });
-      }
+        rawText
+      });
+  }
+}
 
 function sanitizeStep5Product(
   rawProduct
@@ -10661,24 +10933,21 @@ function sanitizeStep5Product(
     ) || 1;
 
 
-  const groundingSources =
-    getStep5GroundingSources({
-      productId,
-      productOcrResults,
-      listingTitle,
-      listingDescription,
-      explicitFacts
-    });
-
-
   /*
-    Never trust the model's claimed citations until
-    they have been proven to occur literally in source.
+    IMPORTANT:
+
+    Step 5 is the ONE AND ONLY boundary where raw
+    Marketplace/OCR evidence is interpreted.
+
+    After Step 5 returns structured JSON, downstream
+    code trusts that structured representation.
+
+    This function performs structural normalization only.
+    It does NOT re-read or re-validate against OCR.
   */
   const extractedEvidence =
-    keepOnlyVerbatimEvidence(
-      rawProduct?.extracted_evidence,
-      groundingSources
+    normalizeStringArray(
+      rawProduct?.extracted_evidence
     );
 
 
@@ -10694,80 +10963,13 @@ function sanitizeStep5Product(
         : {};
 
 
-    const brand =
-      evidenceSupportsLiteral(
-        rawIdentity?.brand,
-        extractedEvidence
-      )
-        ? cleanNullableIdentityField(
-            rawIdentity.brand
-          )
-        : null;
-
-
-    const mountSeries =
-      evidenceSupportsLiteral(
-        rawIdentity?.mountSeries,
-        extractedEvidence
-      )
-        ? cleanNullableIdentityField(
-            rawIdentity.mountSeries
-          )
-        : null;
-
-
-    const focalLength =
-      evidenceSupportsFocalLength(
-        rawIdentity?.focalLength,
-        extractedEvidence
-      )
-        ? cleanNullableIdentityField(
-            rawIdentity.focalLength
-          )
-        : null;
-
-
-    const maxAperture =
-      evidenceSupportsAperture(
-        rawIdentity?.maxAperture,
-        extractedEvidence
-      )
-        ? cleanNullableIdentityField(
-            rawIdentity.maxAperture
-          )
-        : null;
-
-
-    const modelCodes =
-      normalizeStringArray(
-        rawIdentity?.modelCodes
-      ).filter(
-        code =>
-          evidenceSupportsLiteral(
-            code,
-            extractedEvidence
-          )
-      );
-
-
-    const generation =
-      evidenceSupportsLiteral(
-        rawIdentity?.generation,
-        extractedEvidence
-      )
-        ? cleanNullableIdentityField(
-            rawIdentity.generation
-          )
-        : null;
-
-
     return {
       productId,
       galleryIndex,
 
       /*
-        Step 5 cannot freely create a lens model.
-        The resolver does that later.
+        Canonical lens identity is still owned
+        by the dedicated resolver.
       */
       brand:
         null,
@@ -10778,21 +10980,52 @@ function sanitizeStep5Product(
       productType,
 
       lensIdentity: {
-        brand,
+        brand:
+          cleanNullableIdentityField(
+            rawIdentity?.brand
+          ),
 
         canonicalModel:
           null,
 
-        mountSeries,
-        focalLength,
-        maxAperture,
-        modelCodes,
-        generation,
+        mountSeries:
+          cleanNullableIdentityField(
+            rawIdentity?.mountSeries
+          ),
+
+        focalLength:
+          cleanNullableIdentityField(
+            rawIdentity?.focalLength
+          ),
+
+  maxAperture:
+  cleanNullableIdentityField(
+    rawIdentity?.maxAperture
+  ),
+
+featureTokens:
+  normalizeStringArray(
+    rawIdentity?.featureTokens
+  ),
+
+modelCodes:
+  normalizeStringArray(
+    rawIdentity?.modelCodes
+  ),
+
+        generation:
+          cleanNullableIdentityField(
+            rawIdentity?.generation
+          ),
 
         resolutionMode:
           null
       },
 
+      /*
+        Retained for logging/audit only.
+        Downstream identity logic must not parse this.
+      */
       extracted_evidence:
         extractedEvidence
     };
@@ -10899,15 +11132,16 @@ for (
 }
 
 
-const parsedPrimaryProducts =
-  Array.isArray(
-    parsed?.primaryProducts
-  )
-    ? parsed.primaryProducts
-        .map(
+if (!isPostDataForSeoPass) {
+  parsedPrimaryProducts =
+    Array.isArray(
+      parsed?.primaryProducts
+    )
+      ? parsed.primaryProducts.map(
           sanitizeStep5Product
         )
-    : [];
+      : [];
+}
 
 
 /*
@@ -11157,14 +11391,17 @@ for (
             focalLength:
               null,
 
-            maxAperture:
-              null,
+          maxAperture:
+  null,
 
-            modelCodes:
+featureTokens:
   [],
 
-            generation:
-              null,
+modelCodes:
+  [],
+
+generation:
+  null,
 
             resolutionMode:
               null
@@ -11221,6 +11458,33 @@ if (
         if (!dataForSeoResult) {
           return product;
         }
+
+        /*
+  SerpApi Google AI Mode uses the legacy Google Lens
+  evidence semantics.
+
+  Step 5 has already reconciled its identification
+  against OCR, seller text, gallery evidence, etc.
+
+  Do NOT apply the DataForSEO confidence rollback
+  to SerpApi results.
+*/
+const visualEvidenceSource =
+  String(
+    dataForSeoResult
+      ?.visualEvidenceSource ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+
+if (
+  visualEvidenceSource ===
+    "serpapi-google-ai-mode"
+) {
+  return product;
+}
 
 
         /*
@@ -11344,36 +11608,153 @@ if (
     );
 }
 
-          let needsGoogleLens =
-  Array.isArray(
-    parsed?.needsGoogleLens
-  )
-    ? parsed.needsGoogleLens
-        .map(
-          item => ({
-            galleryIndex:
-              Number(
-                item?.galleryIndex
-              ) || 1,
+let needsGoogleLens =
+  isPostDataForSeoPass
+    ? []
+    : Array.isArray(
+        parsed?.needsGoogleLens
+      )
+      ? parsed.needsGoogleLens
+          .map(
+            item => ({
+              galleryIndex:
+                Number(
+                  item?.galleryIndex
+                ) || 1,
 
-            productId:
-              String(
-                item?.productId ||
-                ""
-              ).trim(),
+              productId:
+                String(
+                  item?.productId ||
+                  ""
+                ).trim(),
 
-            reason:
-              String(
-                item?.reason ||
-                ""
-              ).trim()
-          })
-        )
-        .filter(
-          item =>
-            item.productId
-        )
-    : [];
+              reason:
+                String(
+                  item?.reason ||
+                  ""
+                ).trim(),
+
+              /*
+                Default for every product type, including
+                camera bodies/cameras. Uncropped SerpApi AI
+                Mode on the original best image is the only
+                visual fallback provider in active use.
+
+                The dedicated lens resolver below overwrites
+                this for camera lenses once it has evaluated
+                Lensfun candidates.
+              */
+              visualFallbackMode:
+                "serpapi-ai-mode-uncropped"
+            })
+          )
+          .filter(
+            item =>
+              item.productId
+          )
+      : [];
+
+/*
+  ============================================================
+  DETERMINISTIC CAMERA BODY / CAMERA VAGUENESS GUARD
+  ============================================================
+
+  Do not rely solely on the LLM having followed the
+  "vague series name" instruction in the Step 5 prompt above.
+  Force any camera body/camera whose model is missing or a bare
+  series/family name into needsGoogleLens here, deterministically,
+  the same way resolveCanonicalLens() below deterministically
+  backstops camera lenses.
+
+  Skipped on the post-DataForSEO gate pass: needsGoogleLens is
+  intentionally already [] there (see isPostDataForSeoPass above)
+  and this pass reuses baseline products rather than fresh
+  Step-5 output.
+*/
+if (!isPostDataForSeoPass) {
+  for (
+    const product of primaryProducts
+  ) {
+    const productType =
+      String(
+        product?.productType || ""
+      )
+        .trim()
+        .toLowerCase();
+
+    if (
+      productType ===
+      "camera lens"
+    ) {
+      continue;
+    }
+
+    const productId =
+      String(
+        product?.productId || ""
+      ).trim();
+
+    if (
+      !productId ||
+      !isVagueCameraModelName(
+        product?.model
+      ) ||
+      wasVisualFallbackAttemptedForProduct(
+        productId
+      )
+    ) {
+      continue;
+    }
+
+    console.warn(
+      "[STEP 5 GUARD] Forcing vague camera body/camera model into needsGoogleLens:",
+      {
+        productId,
+
+        model:
+          product?.model,
+
+        productType:
+          product?.productType
+      }
+    );
+
+    const fallbackEntry = {
+      galleryIndex:
+        Number(
+          product?.galleryIndex
+        ) || 1,
+
+      productId,
+
+      reason:
+        `Camera model "${product?.model || "(none)"}" is a bare series/family name, not a specific model; visual identification is required.`,
+
+      visualFallbackMode:
+        "serpapi-ai-mode-uncropped"
+    };
+
+    const existingIndex =
+      needsGoogleLens.findIndex(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim() ===
+          productId
+      );
+
+    if (existingIndex >= 0) {
+      needsGoogleLens[existingIndex] = {
+        ...needsGoogleLens[existingIndex],
+        ...fallbackEntry
+      };
+    } else {
+      needsGoogleLens.push(
+        fallbackEntry
+      );
+    }
+  }
+}
 
 /*
   ============================================================
@@ -11416,11 +11797,6 @@ const cameraContext =
       })
     );
 
-    const isPostDataForSeoPass =
-  Array.isArray(
-    googleLensResults
-  ) &&
-  googleLensResults.length > 0;
 
 const lensfunCandidatesByProductId =
   new Map(
@@ -11605,22 +11981,25 @@ if (isPostDataForSeoPass) {
 }
 
   try {
+    const productVisualResult =
+      getDataForSeoResultForProduct(
+        product?.productId
+      );
+
     const resolution =
       await resolveCanonicalLens({
-        product,
+  product,
+  cameraContext,
 
-        productOcrResults,
+  visualIdentificationAnswer:
+    productVisualResult
+      ?.identifiedModel ||
 
-        listingTitle,
+    productVisualResult
+      ?.aiOverviewText ||
 
-        listingDescription,
-
-        listingScreenshotOcr,
-
-        explicitFacts,
-
-        cameraContext
-      });
+    ""
+})
 
       const resolvedProductId =
   String(
@@ -11714,41 +12093,112 @@ if (
             ).trim()
         );
     } else {
-      /*
-        Dedicated resolution failed.
+  const fallbackProductId =
+    String(
+      product?.productId ||
+      ""
+    ).trim();
 
-        Keep it eligible for the existing
-        visual Serper fallback as a final safety net.
-      */
-      const alreadyQueued =
-        needsGoogleLens.some(
-          item =>
-            String(
-              item?.productId || ""
-            ).trim() ===
-            String(
-              product?.productId || ""
-            ).trim()
-        );
+  /*
+    Visual identification was already attempted for this exact
+    product and still didn't exactly match any remaining
+    candidate (handled above, before this branch). Requesting
+    SerpApi again would just repeat the same failed cycle, so
+    stop here instead of requeuing it.
+  */
+  if (
+    wasVisualFallbackAttemptedForProduct(
+      fallbackProductId
+    )
+  ) {
+    console.warn(
+      "[LENS RESOLVER] Visual identification already attempted and did not resolve remaining ambiguity. Leaving unresolved rather than requesting fallback again:",
+      {
+        productId:
+          fallbackProductId,
 
+        visualIdentificationAnswer:
+          productVisualResult
+            ?.identifiedModel ||
+          "",
 
-      if (!alreadyQueued) {
-        needsGoogleLens.push({
-          galleryIndex:
-            Number(
-              product?.galleryIndex
-            ) || 1,
-
-          productId:
-            String(
-              product?.productId || ""
-            ).trim(),
-
-         reason:
-  "OCR/Lensfun resolution could not establish a canonical lens identity, so Google Lens identification is required."
-        });
+        remainingCandidateCount:
+          Array.isArray(
+            resolution?.candidates
+          )
+            ? resolution.candidates.length
+            : 0
       }
-    }
+    );
+
+    needsGoogleLens =
+      needsGoogleLens.filter(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim() !==
+          fallbackProductId
+      );
+
+    continue;
+  }
+
+  /*
+    resolveCanonicalLens() only ever returns "lensfun" (either
+    exactly one candidate, or a direct visual-answer match,
+    both handled above) or "serpapi-ai-mode-uncropped" (zero or
+    still-ambiguous multiple candidates) - so every unresolved
+    lens here always uses uncropped SerpApi AI Mode on the
+    original best image.
+  */
+  const visualFallbackMode =
+    "serpapi-ai-mode-uncropped";
+
+  const existingFallbackIndex =
+    needsGoogleLens.findIndex(
+      item =>
+        String(
+          item?.productId ||
+          ""
+        ).trim() ===
+        fallbackProductId
+    );
+
+  const fallbackEntry = {
+    galleryIndex:
+      Number(
+        product?.galleryIndex
+      ) || 1,
+
+    productId:
+      fallbackProductId,
+
+    reason:
+      resolution?.reason ||
+      "Visual identification is required.",
+
+    visualFallbackMode
+  };
+
+  if (
+    existingFallbackIndex >= 0
+  ) {
+    needsGoogleLens[
+      existingFallbackIndex
+    ] = {
+      ...needsGoogleLens[
+        existingFallbackIndex
+      ],
+
+      ...fallbackEntry
+    };
+
+  } else {
+    needsGoogleLens.push(
+      fallbackEntry
+    );
+  }
+}
 
   } catch (error) {
     console.warn(
@@ -11793,7 +12243,10 @@ if (
           ).trim(),
 
         reason:
-          "Dedicated lens resolver failed and visual fallback is required."
+          "Dedicated lens resolver failed and visual fallback is required.",
+
+        visualFallbackMode:
+          "serpapi-ai-mode-uncropped"
       });
     }
   }
@@ -15906,20 +16359,37 @@ app.post(
           "camera lens" &&
         lensIdentity
       ) {
-        productName = [
-          lensIdentity.brand,
-          lensIdentity.mountSeries,
-          lensIdentity.focalLength,
-          lensIdentity.maxAperture,
-          lensIdentity.featureModelCodes,
-          lensIdentity.generation
-        ]
-          .filter(Boolean)
-          .map(value =>
-            String(value).trim()
-          )
-          .filter(Boolean)
-          .join(" ");
+      productName = [
+  lensIdentity.brand,
+  lensIdentity.mountSeries,
+  lensIdentity.focalLength,
+  lensIdentity.maxAperture,
+
+  ...(
+    Array.isArray(
+      lensIdentity.featureTokens
+    )
+      ? lensIdentity.featureTokens
+      : []
+  ),
+
+  ...(
+    Array.isArray(
+      lensIdentity.modelCodes
+    )
+      ? lensIdentity.modelCodes
+      : []
+  ),
+
+  lensIdentity.generation
+]
+  .filter(Boolean)
+  .map(
+    value =>
+      String(value).trim()
+  )
+  .filter(Boolean)
+  .join(" ");
 
         if (productName) {
           productName += " lens";

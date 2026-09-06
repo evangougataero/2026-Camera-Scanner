@@ -7,7 +7,7 @@ const MARKETPLACE_CONVERSATION_PARSE_ALARM =
 const MARKETPLACE_CONVERSATION_PARSE_INTERVAL_MINUTES =
   30;
 
-  // ============================================================
+// ============================================================
 // MESSENGER BACKGROUND CONVERSATION PARSER
 //
 // false = completely disabled
@@ -2553,6 +2553,138 @@ async function processSingleImage({
   };
 }
 
+async function processSerpApiAiModeLensImage({
+  imageUrl,
+  imageIndex,
+  totalImages,
+  promptText,
+  lensfunCandidates = []
+}) {
+  console.log(
+    `[SERPAPI AI MODE] Processing lens ${imageIndex}/${totalImages}`,
+    {
+      imageUrl,
+
+      lensfunCandidateCount:
+        Array.isArray(
+          lensfunCandidates
+        )
+          ? lensfunCandidates.length
+          : 0
+    }
+  );
+
+
+  const response =
+    await fetch(
+      `${MARKETPLACE_CONVERSATION_SERVER}/serpapi-ai-mode-identify-lens`,
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            imageUrl,
+            promptText,
+
+            lensfunCandidates:
+              Array.isArray(
+                lensfunCandidates
+              )
+                ? lensfunCandidates
+                : []
+          })
+      }
+    );
+
+
+  let data;
+
+  try {
+    data =
+      await response.json();
+
+  } catch (error) {
+    throw new Error(
+      "SerpApi AI Mode server returned malformed JSON."
+    );
+  }
+
+
+  if (
+    !response.ok ||
+    data?.ok !== true
+  ) {
+    throw new Error(
+      data?.error ||
+      "SerpApi Google AI Mode lens identification failed."
+    );
+  }
+
+
+  return {
+  imageIndex,
+
+  imageUrl,
+
+  prompt:
+    promptText,
+
+  visualEvidenceSource:
+    "serpapi-google-ai-mode",
+
+  aiOverviewFound:
+    data.found === true,
+
+  /*
+    Mimic old processSingleImage().
+
+    The old Google Lens browser flow simply returned
+    the extracted AI Overview text here.
+  */
+  aiOverviewText:
+    data.found === true
+      ? String(
+          data.identification ||
+          ""
+        ).trim()
+      : "",
+
+  aiOverviewErrorCode:
+    data.found === true
+      ? ""
+      : "SERPAPI_AI_MODE_NO_IDENTIFICATION",
+
+  /*
+    SerpApi is NOT going through the
+    DataForSEO evidence cleaner.
+  */
+  dataForSeoEvidence:
+    null,
+
+  dataForSeoTaskId:
+    "",
+
+  dataForSeoCost:
+    0,
+
+  serpApiSearchId:
+    String(
+      data.serpApiSearchId ||
+      ""
+    ),
+
+  completedAt:
+    new Date()
+      .toISOString()
+};
+}
+
 
 chrome.runtime.onMessage.addListener(
   (
@@ -3067,6 +3199,20 @@ cropError:
     ""
   ).trim(),
 
+visualSearchProvider:
+  String(
+    target
+      .visualSearchProvider ||
+    "dataforseo"
+  ).trim(),
+
+lensfunCandidates:
+  Array.isArray(
+    target.lensfunCandidates
+  )
+    ? target.lensfunCandidates
+    : [],
+  
 sameTypeProductIds:
   Array.isArray(
     target.sameTypeProductIds
@@ -3621,57 +3767,120 @@ try {
       }
     );
 
-    const dataForSeoImageUrl =
+   const visualSearchProvider =
   String(
     target
-      ?.dataForSeoImageUrl ||
-    ""
-  ).trim();
+      ?.visualSearchProvider ||
+    "dataforseo"
+  )
+    .trim()
+    .toLowerCase();
 
 
-if (!dataForSeoImageUrl) {
-  throw new Error(
-    target?.cropError ||
-    `No isolated DataForSEO crop was prepared for ${target.productId}.`
+let baseResult;
+
+
+if (
+  visualSearchProvider ===
+    "serpapi-google-ai-mode"
+) {
+  /*
+    Lensfun returned 0 or 1 candidates.
+
+    IMPORTANT:
+    Use target.imageUrl — the ORIGINAL selected best image.
+    No crop.
+  */
+
+  console.log(
+    "[SERPAPI AI MODE] Using original best Marketplace image:",
+    {
+      productId:
+        target.productId,
+
+      imageUrl:
+        target.imageUrl,
+
+      lensfunCandidates:
+        target.lensfunCandidates
+    }
   );
-}
 
 
-console.log(
-  "[DATAFORSEO CROP] Using isolated crop:",
-  {
-    productId:
-      target.productId,
+  baseResult =
+    await processSerpApiAiModeLensImage({
+      imageUrl:
+        target.imageUrl,
 
-    originalImage:
-      target.imageUrl,
+      imageIndex:
+        target.bestImageIndex,
 
-    cropImage:
-      dataForSeoImageUrl,
+      totalImages:
+        targets.length,
 
-    boundingBox:
-      target.cropBoundingBox
-  }
-);
+      promptText,
 
+      lensfunCandidates:
+        target.lensfunCandidates
+    });
 
-const baseResult =
-  await processSingleImage({
-    imageUrl:
-      dataForSeoImageUrl,
+} else {
+  /*
+    Existing 2+ Lensfun candidate / DataForSEO behavior.
+  */
 
-    imageIndex:
-      target.bestImageIndex,
-
-    totalImages:
-      targets.length,
-
-    promptText,
-
-    cropObjectPath:
+  const dataForSeoImageUrl =
+    String(
       target
-        .dataForSeoCropObjectPath
-  });
+        ?.dataForSeoImageUrl ||
+      ""
+    ).trim();
+
+
+  if (!dataForSeoImageUrl) {
+    throw new Error(
+      target?.cropError ||
+      `No isolated DataForSEO crop was prepared for ${target.productId}.`
+    );
+  }
+
+
+  console.log(
+    "[DATAFORSEO CROP] Using isolated crop:",
+    {
+      productId:
+        target.productId,
+
+      originalImage:
+        target.imageUrl,
+
+      cropImage:
+        dataForSeoImageUrl,
+
+      boundingBox:
+        target.cropBoundingBox
+    }
+  );
+
+
+  baseResult =
+    await processSingleImage({
+      imageUrl:
+        dataForSeoImageUrl,
+
+      imageIndex:
+        target.bestImageIndex,
+
+      totalImages:
+        targets.length,
+
+      promptText,
+
+      cropObjectPath:
+        target
+          .dataForSeoCropObjectPath
+    });
+}
 
       console.log(
   "[DEBUG STEP 4A] Raw processSingleImage result:",
@@ -3884,13 +4093,25 @@ if (
 
 
     result = {
-      galleryIndex:
-        target.galleryIndex,
+  galleryIndex:
+    target.galleryIndex,
 
-        dataForSeoEvidence:
-  baseResult
-    .dataForSeoEvidence ||
-  null,
+  visualEvidenceSource:
+    baseResult
+      .visualEvidenceSource ||
+    "dataforseo",
+
+  serpApiSearchId:
+    baseResult
+      .serpApiSearchId ||
+    "",
+
+  dataForSeoEvidence:
+    baseResult
+      .dataForSeoEvidence ||
+    null,
+
+  // existing fields continue..
 
 dataForSeoTaskId:
   baseResult
