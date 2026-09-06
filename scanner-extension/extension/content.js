@@ -22,6 +22,14 @@ console.log("eBay AI Comp Checker loaded on:", window.location.href);
 */
 const TESTING_MODE = false;
 
+/*
+  Default resale value assigned to a camera lens that never
+  resolved to an exact model (Lensfun + SerpApi both failed to
+  identify it). Keeps the listing evaluable instead of the whole
+  deal auto-Passing just because one lens stayed unidentified.
+*/
+const UNKNOWN_LENS_DEFAULT_RESALE_VALUE = 50;
+
 const MARKETPLACE_OUTREACH_LOCK_KEY =
   "marketplaceDirectOutreachLock";
 
@@ -3080,7 +3088,7 @@ async function messageMarketplaceSellerForVerifiedHit(
   );
 
   if (!isFacebookMarketplaceListingPage()) {
-    console.warn(
+    console.log(
       "[AUTO MESSAGE] Aborted: not on a Marketplace listing page.",
       window.location.href
     );
@@ -3093,7 +3101,7 @@ async function messageMarketplaceSellerForVerifiedHit(
   }
 
   if (!isHitRecommendation(result)) {
-    console.warn(
+    console.log(
       "[AUTO MESSAGE] Aborted: final result is not a hit.",
       result?.recommendation
     );
@@ -3114,7 +3122,7 @@ async function messageMarketplaceSellerForVerifiedHit(
     listingId &&
     messagedIds.includes(listingId)
   ) {
-    console.warn(
+    console.log(
       "[AUTO MESSAGE] Aborted: listing is already marked as messaged.",
       listingId
     );
@@ -3494,7 +3502,7 @@ async function queueMarketplaceSellerForVerifiedHit(
     Only queue actual Marketplace listings.
   */
   if (!isFacebookMarketplaceListingPage()) {
-    console.warn(
+    console.log(
       "[OUTREACH QUEUE] Aborted: not on Marketplace listing page."
     );
 
@@ -5784,15 +5792,44 @@ for (
       break;
     }
 
-    console.warn(
-      "[DIRECT OUTREACH] Message was NOT sent:",
-      {
-        attempt,
-        reason:
-          messageResult?.reason ||
-          "Unknown reason"
-      }
-    );
+    /*
+      Skip logging as a warning when the reason is an expected,
+      non-failure abort (not a hit, wrong page, already messaged).
+      Only genuine automation failures (button/input not found,
+      Facebook not confirming the send, etc.) should be reported
+      as warnings.
+    */
+    const NON_FAILURE_OUTREACH_REASONS = [
+      "Final result is not a hit.",
+      "Not on a Marketplace listing page.",
+      "Already messaged."
+    ];
+
+    const outreachSkipReason =
+      messageResult?.reason ||
+      "Unknown reason";
+
+    if (
+      NON_FAILURE_OUTREACH_REASONS.includes(
+        outreachSkipReason
+      )
+    ) {
+      console.log(
+        "[DIRECT OUTREACH] Message was NOT sent:",
+        {
+          attempt,
+          reason: outreachSkipReason
+        }
+      );
+    } else {
+      console.warn(
+        "[DIRECT OUTREACH] Message was NOT sent:",
+        {
+          attempt,
+          reason: outreachSkipReason
+        }
+      );
+    }
 
   } catch (error) {
     messageError = error;
@@ -11370,6 +11407,65 @@ console.log(
 
           if (query) {
             return true;
+          }
+
+          /*
+            UNRESOLVED CAMERA LENS
+
+            A lens that never resolved through Lensfun/SerpApi
+            still gets sold as part of the deal - don't drop it
+            into the dead-end "Unresolved"/Pass bucket. Give it a
+            conservative default resale value so the lot can still
+            be evaluated normally, and label it clearly so it's
+            obvious on review (and in Google Sheets) that this was
+            a default, not a real identification.
+          */
+          const isUnresolvedLens =
+            String(
+              item?.productType ||
+              ""
+            )
+              .trim()
+              .toLowerCase() ===
+            "camera lens";
+
+          if (isUnresolvedLens) {
+            console.log(
+              "[PRODUCT DATABASE] Lens never resolved an exact model. Assigning default $50 value as \"Unknown Lens\":",
+              item
+            );
+
+            item.model =
+              "Unknown Lens";
+
+            databaseResults.push({
+              item,
+
+              result: {
+                source:
+                  "database",
+
+                expectedSalePrice:
+                  UNKNOWN_LENS_DEFAULT_RESALE_VALUE,
+
+                medianSoldPrice:
+                  null,
+
+                validSoldCount:
+                  0,
+
+                databaseCanonicalName:
+                  "Unknown Lens",
+
+                recommendation:
+                  "Database Value",
+
+                reason:
+                  "Lens could not be identified after the Lensfun/SerpApi resolution pipeline. Assigned a default $50 resale value as \"Unknown Lens\" instead of dropping the item."
+              }
+            });
+
+            return false;
           }
 
           console.log(
