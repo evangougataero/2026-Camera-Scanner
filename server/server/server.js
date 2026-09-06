@@ -998,6 +998,32 @@ function lensfunArrayify(value) {
 
 
 function lensfunText(value) {
+  if (value == null) {
+    return "";
+  }
+
+  /*
+    Lensfun can contain repeated XML elements, especially <model>:
+
+      <model>Nikon AF-S DX Zoom-Nikkor...</model>
+      <model lang="en">Nikkor AF-S...</model>
+
+    fast-xml-parser represents those as an array.
+    Prefer the first non-empty value, which is normally Lensfun's
+    canonical/default model name.
+  */
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const text = lensfunText(item);
+
+      if (text) {
+        return text;
+      }
+    }
+
+    return "";
+  }
+
   if (
     typeof value === "string" ||
     typeof value === "number"
@@ -10770,9 +10796,11 @@ Missing an already-present token is the error; including it is not.
 
 CANON feature tokens: IS, USM, STM, L, DO
 CANON mounts: EF, EF-S, EF-M, RF, RF-S, FD, FL
-NIKON feature tokens: VR, AF-S, AF-P, ED, SWM
-NIKON aperture suffixes (keep attached to maxAperture, not featureTokens): D, G, E
-  e.g. "1:1.4D" -> maxAperture "f/1.4D" ; "1:3.5-5.6G" -> maxAperture "f/3.5-5.6G"
+NIKON feature/identity tokens: VR, AF, AF-S, AF-P, ED, SWM, DX, D, G, E
+NIKON D/G/E suffix rule: D, G, and E are lens identity tokens, NOT part of maxAperture.
+If attached directly to an aperture marking, split them out.
+  e.g. "1:1.8D" -> maxAperture "f/1.8", featureTokens includes "D"
+       "1:3.5-5.6G" -> maxAperture "f/3.5-5.6", featureTokens includes "G"
 NIKON mounts: F, F-mount, Nikon F, Z, Z-mount, NIKKOR Z, CX / 1 NIKKOR
 SIGMA/TAMRON/OTHER feature tokens: OS, VC, OIS, OSS, HSM
 GENERIC generation markers (→ \`generation\`, never featureTokens): II, III, Mark II, G2
