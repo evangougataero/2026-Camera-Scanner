@@ -998,32 +998,6 @@ function lensfunArrayify(value) {
 
 
 function lensfunText(value) {
-  if (value == null) {
-    return "";
-  }
-
-  /*
-    Lensfun can contain repeated XML elements, especially <model>:
-
-      <model>Nikon AF-S DX Zoom-Nikkor...</model>
-      <model lang="en">Nikkor AF-S...</model>
-
-    fast-xml-parser represents those as an array.
-    Prefer the first non-empty value, which is normally Lensfun's
-    canonical/default model name.
-  */
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const text = lensfunText(item);
-
-      if (text) {
-        return text;
-      }
-    }
-
-    return "";
-  }
-
   if (
     typeof value === "string" ||
     typeof value === "number"
@@ -1326,13 +1300,14 @@ function normalizeFocalForComparison(
     .trim();
 }
 
-function extractExplicitLensMountFromText(
-  text
+function inferExplicitLensMountFromEvidence(
+  product
 ) {
   const evidenceText =
-    String(
-      text || ""
-    );
+    normalizeStringArray(
+      product?.extracted_evidence
+    )
+      .join(" ");
 
   /*
     Ordered most-specific first so:
@@ -1361,105 +1336,6 @@ function extractExplicitLensMountFromText(
   }
 
   return null;
-}
-
-function inferExplicitLensMountFromEvidence(
-  product
-) {
-  const evidenceText =
-    normalizeStringArray(
-      product?.extracted_evidence
-    )
-      .join(" ");
-
-  return extractExplicitLensMountFromText(
-    evidenceText
-  );
-}
-
-/*
-  ============================================================
-  MERGE SERPAPI VISUAL IDENTIFICATION INTO STRUCTURED EVIDENCE
-  ============================================================
-
-  SerpApi Google AI Mode reads the ORIGINAL uncropped photo, so
-  when it reports a focal length, aperture, or mount, that is
-  usually the seller's own barrel/text OCR being confirmed or
-  corrected by an actual read of the lens - not a competing
-  guess. Before sending a lens back through Lensfun for a second
-  pass, pull any of those fields out of SerpApi's free-text
-  answer and let them WIN over whatever the pre-visual-fallback
-  evidence had, on a per-field basis. A field SerpApi's answer
-  doesn't mention is left untouched.
-*/
-function extractLensFieldsFromFreeText(
-  text
-) {
-  const cleanText =
-    String(
-      text || ""
-    ).trim();
-
-  if (!cleanText) {
-    return {
-      focalLength: null,
-      maxAperture: null,
-      explicitMount: null
-    };
-  }
-
-  return {
-    focalLength:
-      extractFocalLengthFromText(
-        cleanText
-      ),
-
-    maxAperture:
-      extractMaxApertureFromText(
-        cleanText
-      ),
-
-    explicitMount:
-      extractExplicitLensMountFromText(
-        cleanText
-      )
-  };
-}
-
-function mergeSerpApiIdentityIntoLensEvidence(
-  evidence,
-  visualIdentificationAnswer
-) {
-  const serpApiFields =
-    extractLensFieldsFromFreeText(
-      visualIdentificationAnswer
-    );
-
-  const merged = {
-    ...evidence
-  };
-
-  /*
-    Conflict resolution: SerpApi wins for any field it actually
-    read off the lens, regardless of what the pre-existing
-    evidence said for that same field.
-  */
-  if (serpApiFields.focalLength) {
-    merged.focalLength =
-      serpApiFields.focalLength;
-  }
-
-  if (serpApiFields.maxAperture) {
-    merged.maxAperture =
-      serpApiFields.maxAperture;
-  }
-
-  if (serpApiFields.explicitMount) {
-    merged.explicitMount =
-      serpApiFields.explicitMount;
-  }
-
-  return merged;
 }
 
 function collectStructuredLensEvidence(
@@ -1866,50 +1742,42 @@ if (modelCodes.length) {
 
 
   /*
-    If OCR/SerpApi literally established a mount, treat it as a
-    HARD filter, exactly like brand/focal/aperture/tokens above -
-    filter through every category we have evidence for, all the
-    way to the end, rather than stopping as soon as we're down to
-    one candidate.
-
-    Previously, when mount-filtering would have eliminated every
-    remaining candidate, the code silently kept the (wrong-mount)
-    unfiltered set instead. That's how a listing once resolved to
-    the wrong lens mount: everything else had already narrowed the
-    field to a single candidate, so filtering it by mount emptied
-    the list, and the fallback quietly accepted that single
-    wrong-mount candidate as if mount had never been checked at
-    all. Now, if nothing survives the mount filter, that's a
-    genuine zero-candidate result - correctly signaling "Lensfun
-    couldn't resolve this" instead of a false positive.
+    If OCR literally established a mount,
+    use it as a hard narrowing signal.
   */
   if (explicitMount) {
-    candidates =
-      candidates.filter(
-        candidate => {
-          const candidateMount =
-            normalizeLensfunComparisonText(
-              candidate?.mount
-            );
+   const mountFiltered =
+  candidates.filter(
+    candidate => {
+      const candidateMount =
+        normalizeLensfunComparisonText(
+          candidate?.mount
+        );
 
-          if (!candidateMount) {
-            return false;
-          }
+      if (!candidateMount) {
+        return false;
+      }
 
-          return (
-            candidateMount ===
-              explicitMount ||
+      return (
+        candidateMount ===
+          explicitMount ||
 
-            candidateMount.includes(
-              explicitMount
-            ) ||
+        candidateMount.includes(
+          explicitMount
+        ) ||
 
-            explicitMount.includes(
-              candidateMount
-            )
-          );
-        }
+        explicitMount.includes(
+          candidateMount
+        )
       );
+    }
+  );
+
+
+    if (mountFiltered.length) {
+      candidates =
+        mountFiltered;
+    }
   }
 
 
@@ -2214,41 +2082,14 @@ async function resolveCanonicalLens({
   cameraContext,
   visualIdentificationAnswer
 }) {
-  const baseEvidence =
+  const evidence =
     collectStructuredLensEvidence(
       product
     );
 
-  /*
-    ============================================================
-    MERGE IN SERPAPI'S IDENTIFICATION BEFORE GOING BACK
-    THROUGH LENSFUN
-    ============================================================
-
-    On a repeat cycle (SerpApi already ran once and came back
-    with a visualIdentificationAnswer), fold anything it read
-    off the physical lens into the evidence BEFORE re-querying
-    Lensfun, so the second Lensfun pass benefits from it too -
-    not just the whole-string exact match further below. On the
-    first cycle (no visual answer yet) this is a no-op.
-  */
-  const evidence =
-    visualIdentificationAnswer
-      ? mergeSerpApiIdentityIntoLensEvidence(
-          baseEvidence,
-          visualIdentificationAnswer
-        )
-      : baseEvidence;
-
   console.log(
     "[LENS RESOLVER] Structured evidence:",
-    {
-      evidence,
-
-      mergedFromSerpApi:
-        evidence !==
-        baseEvidence
-    }
+    evidence
   );
 
 
@@ -4158,13 +3999,13 @@ const supabaseAdmin =
 const DEAL_CHECKLIST_ITEMS = [
   {
     key: "everything_functional",
-    label: "Everything functional",
+    label: "Sent message confirming everything works and there is no significant damage",
     enabled: true
   },
 
   {
     key: "seller_profile_ok",
-    label: "Nothing sketchy about seller profile / reviews",
+    label: "Seller does not have more than 1 one-star review",
     enabled: true
   },
 
@@ -10796,11 +10637,9 @@ Missing an already-present token is the error; including it is not.
 
 CANON feature tokens: IS, USM, STM, L, DO
 CANON mounts: EF, EF-S, EF-M, RF, RF-S, FD, FL
-NIKON feature/identity tokens: VR, AF, AF-S, AF-P, ED, SWM, DX, D, G, E
-NIKON D/G/E suffix rule: D, G, and E are lens identity tokens, NOT part of maxAperture.
-If attached directly to an aperture marking, split them out.
-  e.g. "1:1.8D" -> maxAperture "f/1.8", featureTokens includes "D"
-       "1:3.5-5.6G" -> maxAperture "f/3.5-5.6", featureTokens includes "G"
+NIKON feature tokens: VR, AF-S, AF-P, ED, SWM
+NIKON aperture suffixes (keep attached to maxAperture, not featureTokens): D, G, E
+  e.g. "1:1.4D" -> maxAperture "f/1.4D" ; "1:3.5-5.6G" -> maxAperture "f/3.5-5.6G"
 NIKON mounts: F, F-mount, Nikon F, Z, Z-mount, NIKKOR Z, CX / 1 NIKKOR
 SIGMA/TAMRON/OTHER feature tokens: OS, VC, OIS, OSS, HSM
 GENERIC generation markers (→ \`generation\`, never featureTokens): II, III, Mark II, G2
@@ -13127,8 +12966,6 @@ const thresholdBuy =
   Never copy extension or analysis values into these columns.
 */
 const manualColumnJ = "";
-const manualColumnK = "";
-const manualColumnL = "";
 
 /*
   N is listing-level, so only the first row receives the date.
@@ -13159,7 +12996,7 @@ const relistedYN =
   manualColumnJ,   // J
   manualColumnK,   // K
   manualColumnL,   // L
-  checklistLink,   // M — Purchase Checklist
+  checklistColumnM, // M — Purchase Checklist
   hitDateColumnN,  // N
   manualColumnO,   // O
   manualColumnP,   // P
@@ -16176,6 +16013,25 @@ const decision =
 
 const MAX_RESALE_TO_ASK_RATIO = 2.5;
 
+/*
+  ============================================================
+  SCAM DETECTION TOGGLE
+  ============================================================
+
+  Set to false to turn scam flagging off entirely. While off,
+  makeLotDecision() never returns recommendation "Scam" /
+  scamFlag true, regardless of the resale-to-ask ratio - a lot
+  that would have been flagged just falls through to the normal
+  Buy Now / Negotiate / Pass evaluation below instead.
+
+  This is the single source of truth for scam flagging: nothing
+  else on the client computes it independently, it only reads
+  recommendation === "Scam" from this endpoint's response - so
+  flipping this one boolean is enough to disable it everywhere
+  (the "Scam Listings" panel, badges, saved-listing library).
+*/
+const SCAM_DETECTION_ENABLED = true;
+
 function makeLotDecision({
   totalExpectedSalePrice,
   facebookPrice
@@ -16205,6 +16061,7 @@ function makeLotDecision({
     price, prevent the listing from becoming a hit.
   */
   if (
+    SCAM_DETECTION_ENABLED &&
     totalExpectedSalePrice >
     facebookPrice * MAX_RESALE_TO_ASK_RATIO
   ) {
