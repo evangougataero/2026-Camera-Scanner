@@ -2077,6 +2077,336 @@ function hasEnoughEvidenceForLensfun(
   );
 }
 
+/*
+  ============================================================
+  LENSFUN MULTI-CANDIDATE RESALE CONSENSUS
+
+  When Lensfun narrows a lens down to exactly 2 or 3 surviving
+  candidates (after the structured OCR evidence has already
+  been organized/filtered by findLensfunCandidates()), it is
+  often cheaper and just as reliable to price ALL of the
+  remaining candidates instead of spending a SerpApi Google AI
+  Mode call trying to pin down exactly which one it is.
+
+  For each remaining candidate:
+    1. Look it up in the global Supabase "camera_products"
+       resale database (findProductInDatabase).
+    2. If it is not already in the database, run the normal
+       eBay active-listing comp analysis for it
+       (evaluateActiveCompsForTarget), which also appends the
+       newly learned price back into Supabase
+       (saveProductToDatabase) exactly like the standard
+       /evaluate-active-comps flow does.
+
+  If every candidate ends up with a valid resale price AND the
+  spread between the cheapest and priciest candidate is under
+  $20, we don't actually need to know which exact model it is:
+  averaging the 2-3 resale prices is an accurate-enough resale
+  estimate for the primary item, so we accept that average and
+  skip the SerpApi identification step entirely.
+
+  If any candidate can't be priced, or the prices disagree by
+  $20 or more, this returns null so resolveCanonicalLens() falls
+  through to its normal visual-match / SerpApi routing.
+  ============================================================
+*/
+const LENSFUN_CANDIDATE_RESALE_CONSENSUS_MAX_DEVIATION = 20;
+
+/*
+  Builds an eBay-search-ready "target" item for one Lensfun
+  candidate, reusing whatever listing-level context (condition,
+  facebookPrice, negativeSearchTerms, etc.) is already on the
+  ambiguous product, but overriding the identity fields
+  (brand/model/productType/ebaySearchQuery) with THIS candidate's
+  own values.
+*/
+function buildEbayTargetFromLensfunCandidate({
+  candidate,
+  product
+}) {
+  const brand =
+    String(
+      candidate?.maker || ""
+    ).trim();
+
+  const model =
+    String(
+      candidate?.model || ""
+    ).trim();
+
+  const productType =
+    String(
+      product?.productType ||
+      "Lens"
+    ).trim();
+
+  const ebaySearchQuery =
+    [
+      brand,
+      model
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  return {
+    ...product,
+
+    brand,
+
+    model,
+
+    productType,
+
+    ebaySearchQuery,
+
+    /*
+      This candidate IS a specific, named Lensfun model -
+      it is eligible for an eBay search even though the
+      PRIMARY item's exact identity is still ambiguous.
+    */
+    exactIdentityResolved:
+      true,
+
+    negativeSearchTerms:
+      Array.isArray(
+        product?.negativeSearchTerms
+      )
+        ? product.negativeSearchTerms
+        : []
+  };
+}
+
+async function priceLensfunCandidateForConsensus(
+  candidate,
+  product
+) {
+  const candidateItem =
+    buildEbayTargetFromLensfunCandidate({
+      candidate,
+      product
+    });
+
+  if (
+    !hasEnoughIdentityForEbaySearch(
+      candidateItem
+    )
+  ) {
+    return {
+      candidate,
+      candidateItem,
+      estimatedResalePrice:
+        null,
+      source:
+        "insufficient-identity"
+    };
+  }
+
+  const databaseProduct =
+    await findProductInDatabase(
+      candidateItem
+    );
+
+  if (databaseProduct) {
+    return {
+      candidate,
+      candidateItem,
+      estimatedResalePrice:
+        Number(
+          databaseProduct.estimated_resale_price
+        ),
+      source:
+        "supabase"
+    };
+  }
+
+  /*
+    Not in the global database yet - run the normal eBay
+    active-comp analysis for it. This also writes the newly
+    learned price back into Supabase via
+    saveProductToDatabase(), same as /evaluate-active-comps.
+  */
+  const compResult =
+    await evaluateActiveCompsForTarget(
+      candidateItem
+    );
+
+  const expectedSalePrice =
+    Number(
+      compResult?.expectedSalePrice
+    );
+
+  return {
+    candidate,
+    candidateItem,
+    estimatedResalePrice:
+      Number.isFinite(
+        expectedSalePrice
+      ) &&
+      expectedSalePrice > 0
+        ? expectedSalePrice
+        : null,
+    source:
+      "ebay-comp-analysis"
+  };
+}
+
+async function resolveLensfunCandidatesViaResaleConsensus({
+  evidence,
+  product,
+  candidates
+}) {
+  try {
+    const priced =
+      await Promise.all(
+        candidates.map(
+          candidate =>
+            priceLensfunCandidateForConsensus(
+              candidate,
+              product
+            )
+        )
+      );
+
+    const unpriced =
+      priced.filter(
+        entry =>
+          !Number.isFinite(
+            entry.estimatedResalePrice
+          ) ||
+          entry.estimatedResalePrice <= 0
+      );
+
+    if (unpriced.length > 0) {
+      console.log(
+        "[LENS RESOLVER] Candidate resale consensus skipped: could not price every remaining candidate.",
+        {
+          productId:
+            evidence?.productId,
+
+          unpricedModels:
+            unpriced.map(
+              entry =>
+                entry?.candidate?.model
+            )
+        }
+      );
+
+      return null;
+    }
+
+    const prices =
+      priced.map(
+        entry =>
+          entry.estimatedResalePrice
+      );
+
+    const deviation =
+      Math.max(...prices) -
+      Math.min(...prices);
+
+    if (
+      deviation >=
+      LENSFUN_CANDIDATE_RESALE_CONSENSUS_MAX_DEVIATION
+    ) {
+      console.log(
+        "[LENS RESOLVER] Candidate resale prices diverge too much for consensus:",
+        {
+          productId:
+            evidence?.productId,
+
+          prices,
+
+          deviation
+        }
+      );
+
+      return null;
+    }
+
+    const averagedResalePrice =
+      Number(
+        (
+          prices.reduce(
+            (sum, price) =>
+              sum + price,
+            0
+          ) / prices.length
+        ).toFixed(2)
+      );
+
+    /*
+      All remaining candidates priced within $20 of each other,
+      so which exact model it is barely matters for valuation.
+      Use the first candidate as the representative identity,
+      but carry the averaged resale price as an override so
+      downstream code uses the consensus price instead of a
+      single candidate's individually-estimated value.
+    */
+    const identity =
+      lensfunCandidateToIdentity(
+        priced[0].candidate
+      );
+
+    identity.resolutionMode =
+      "lensfun-candidate-resale-consensus";
+
+    identity.resaleValueOverride =
+      averagedResalePrice;
+
+    identity.resaleConsensusCandidateModels =
+      priced.map(
+        entry =>
+          entry?.candidate?.model
+      );
+
+    console.log(
+      "[LENS RESOLVER] Resolved via candidate resale consensus:",
+      {
+        productId:
+          evidence?.productId,
+
+        candidateModels:
+          identity.resaleConsensusCandidateModels,
+
+        prices,
+
+        averagedResalePrice
+      }
+    );
+
+    return {
+      evidence,
+
+      identity,
+
+      candidates,
+
+      mode:
+        "lensfun-candidate-resale-consensus",
+
+      resaleValueOverride:
+        averagedResalePrice,
+
+      reason:
+        `${candidates.length} Lensfun candidates priced within ` +
+        `$${LENSFUN_CANDIDATE_RESALE_CONSENSUS_MAX_DEVIATION} of each ` +
+        `other (spread $${deviation.toFixed(2)}); averaged their ` +
+        `estimated resale prices instead of routing to SerpApi.`
+    };
+
+  } catch (error) {
+    console.warn(
+      "[LENS RESOLVER] Candidate resale consensus failed; falling back to normal routing:",
+      error?.message ||
+      error
+    );
+
+    return null;
+  }
+}
+
 async function resolveCanonicalLens({
   product,
   cameraContext,
@@ -2252,6 +2582,40 @@ if (
       "Exactly one Lensfun candidate remained; accepting it as the resolved lens identity."
   };
 }
+
+
+  /*
+    ============================================================
+    EXACTLY 2 OR 3 CANDIDATES: TRY RESALE CONSENSUS FIRST
+
+    Instead of immediately routing to SerpApi, try pricing all
+    of the remaining candidates individually (Supabase first,
+    eBay comp analysis for any not yet in Supabase). If they all
+    price within $20 of each other, accept the average as the
+    resale value for the primary item and skip SerpApi entirely.
+    ============================================================
+  */
+  if (
+    candidates.length === 2 ||
+    candidates.length === 3
+  ) {
+    const consensusResolution =
+      await resolveLensfunCandidatesViaResaleConsensus({
+        evidence,
+        product,
+        candidates
+      });
+
+    if (consensusResolution) {
+      return consensusResolution;
+    }
+
+    /*
+      Consensus wasn't possible (a candidate couldn't be priced,
+      or the candidates' resale prices disagreed by $20+) - fall
+      through to the normal visual-match / SerpApi routing below.
+    */
+  }
 
 
   /*
@@ -15217,17 +15581,23 @@ const finalQuery =
   };
 }
 
-app.post(
-  "/evaluate-active-comps",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const target =
-        req.body?.target ||
-        {};
+/*
+  ============================================================
+  Extracted from the /evaluate-active-comps route so that
+  server-side callers (e.g. the Lensfun multi-candidate resale
+  consensus resolver) can run the exact same eBay active-comp
+  evaluation without an HTTP round trip back into this same
+  process.
 
+  Returns the same plain result object that the route used to
+  send via res.json(...). Throws on unexpected failure; the
+  route below is responsible for turning that into an HTTP
+  error response.
+  ============================================================
+*/
+async function evaluateActiveCompsForTarget(
+  target
+) {
       /*
         Same hard identity gate as sold comps.
       */
@@ -15236,7 +15606,7 @@ app.post(
           target
         )
       ) {
-        return res.json({
+        return ({
           ok:
             true,
 
@@ -15452,7 +15822,7 @@ app.post(
           minimumValidActiveListings ||
         activeP15 == null
       ) {
-        return res.json({
+        return ({
           source:
             "active-p15",
 
@@ -15569,7 +15939,7 @@ app.post(
       });
 
 
-      return res.json({
+      return ({
         source:
           "active-p15",
 
@@ -15637,6 +16007,27 @@ app.post(
 
         negativeSearchTerms
       });
+}
+
+app.post(
+  "/evaluate-active-comps",
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const target =
+        req.body?.target ||
+        {};
+
+      const result =
+        await evaluateActiveCompsForTarget(
+          target
+        );
+
+      return res.json(
+        result
+      );
 
     } catch (error) {
       console.error(

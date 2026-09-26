@@ -11293,6 +11293,87 @@ console.log(
 );
 
   /*
+    LENSFUN MULTI-CANDIDATE RESALE CONSENSUS
+
+    The dedicated lens resolver already priced 2-3 remaining
+    Lensfun candidates individually (Supabase first, eBay comp
+    analysis for any not yet in Supabase) and found their resale
+    prices agreed within $20 of each other. Use that averaged
+    price directly for this primary item instead of a single
+    database/eBay lookup keyed to just one representative
+    candidate's name.
+  */
+  const resaleConsensusOverride =
+    Number(
+      item
+        ?.lensIdentity
+        ?.resaleValueOverride
+    );
+
+  if (
+    Number.isFinite(
+      resaleConsensusOverride
+    ) &&
+    resaleConsensusOverride > 0
+  ) {
+    console.log(
+      "[PRODUCT DATABASE] Using Lensfun multi-candidate resale consensus average:",
+      {
+        productId:
+          item?.productId,
+
+        candidateModels:
+          item
+            ?.lensIdentity
+            ?.resaleConsensusCandidateModels ||
+          [],
+
+        averagedResalePrice:
+          resaleConsensusOverride
+      }
+    );
+
+    databaseResults.push({
+      item,
+
+      result: {
+        source:
+          "lensfun-candidate-resale-consensus",
+
+        expectedSalePrice:
+          resaleConsensusOverride,
+
+        medianSoldPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        databaseCanonicalName:
+          null,
+
+        recommendation:
+          "Database Value",
+
+        reason:
+          `Averaged the estimated resale price across ${
+            Array.isArray(
+              item
+                ?.lensIdentity
+                ?.resaleConsensusCandidateModels
+            )
+              ? item.lensIdentity
+                  .resaleConsensusCandidateModels
+                  .length
+              : "2-3"
+          } Lensfun candidates that priced within $20 of each other, instead of routing to SerpApi.`
+      }
+    });
+
+    continue;
+  }
+
+  /*
     DATABASE HIT
   */
   if (
