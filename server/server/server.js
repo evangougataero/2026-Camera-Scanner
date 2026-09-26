@@ -12965,7 +12965,23 @@ const thresholdBuy =
 
   Never copy extension or analysis values into these columns.
 */
+/*
+  Columns J:L are reserved for manual entry.
+
+  Never copy extension or analysis values into these columns.
+*/
 const manualColumnJ = "";
+const manualColumnK = "";
+const manualColumnL = "";
+
+/*
+  M contains the purchase checklist link.
+  Only the first row gets it for multi-item listings.
+*/
+const checklistColumnM =
+  index === 0
+    ? checklistLink
+    : "";
 
 /*
   N is listing-level, so only the first row receives the date.
