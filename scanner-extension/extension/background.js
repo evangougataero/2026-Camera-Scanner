@@ -3115,6 +3115,23 @@ if (
   }
 );
 
+/*
+  ============================================================
+  GOOGLE LENS / SERPAPI PROCESSING QUEUE
+
+  PROCESS_SELECTED_GOOGLE_LENS_TARGETS must run strictly one
+  listing at a time. Without this queue, a new message
+  arriving before the previous listing's AI image recognition
+  finished would start its SerpApi/DataForSEO calls
+  concurrently with the still-running one.
+
+  Every incoming request is chained onto this promise, so the
+  next listing's processing cannot start until the previous
+  one has fully finished (including its sendResponse call).
+  ============================================================
+*/
+let googleLensProcessingQueue = Promise.resolve();
+
 chrome.runtime.onMessage.addListener(
   (
     message,
@@ -3128,7 +3145,7 @@ chrome.runtime.onMessage.addListener(
       return;
     }
 
-    (
+    const runSelectedGoogleLensTargets =
       async () => {
         try {
           const targets =
@@ -4358,8 +4375,17 @@ console.log(
               String(error)
           });
         }
-      }
-    )();
+      };
+
+    googleLensProcessingQueue =
+      googleLensProcessingQueue
+        .then(runSelectedGoogleLensTargets)
+        .catch(error => {
+          console.error(
+            "[STEP 4] Queued Google Lens processing crashed:",
+            error
+          );
+        });
 
     return true;
   }
