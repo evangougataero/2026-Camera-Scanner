@@ -1960,69 +1960,37 @@ const MARKETPLACE_SEARCH_TERMS = [
   "digital camera",
   "DSLR",
   "mirrorless camera",
-  "film camera",
-  "vintage camera",
   "old camera",
   "camera bundle",
   "camera equipment",
-  "photography equipment",
   "camera gear",
   "camera with lens",
-  "interchangeable lens camera",
   "professional camera",
   "digital video camera",
+
 
   "camera",
   "Canon",
   "Nikon",
-  "Sony camera",
-  "Fujifilm camera",
-  "Panasonic camera",
-  "Olympus camera",
-  "Pentax camera",
-  "Minolta camera",
+
 
   "Canon EOS",
   "Nikon DSLR",
-  "Sony Alpha",
-  "Fuji camera",
-  "Lumix camera",
-  "Olympus OM",
-  "Pentax DSLR",
+
 
   "camera lens",
   "Canon lens",
   "Nikon lens",
-  "Sony lens",
-  "vintage lens",
-  "zoom lens",
-  "prime lens",
-  "telephoto lens",
-  "wide angle lens",
-  "DSLR lens",
-  "EF lens",
-  "EF-S lens",
-  "RF lens",
-  "FD lens",
-  "F mount lens",
-  "E mount lens",
-  "Micro Four Thirds lens",
-  "18-55mm lens",
-  "50mm lens",
-  "35mm lens",
-  "75-300mm lens",
-  "70-300mm lens",
-  "55-200mm lens",
-  "55-250mm lens",
+
 
   "camara",
   "cannon camera",
   "cannon lens",
   "nikon camara",
   "camera lense",
-  "photo camera",
-  "digital cam",
   "rebel camera"
+
+
 ];
 
 function normalizeMarketplaceSearchTerm(term) {
@@ -10432,6 +10400,95 @@ let finalIdentificationData =
 if (
   lensFallbackTargets.length
 ) {
+  /*
+    ============================================================
+    BRAND GATE: ALL-UNRESOLVED-BRAND SKIP
+
+    We are about to spend a SerpApi Google AI Mode call on visual
+    identification. If NOT ONE primary product in this listing
+    has a resolved brand yet, there's nothing telling us this is
+    even a Nikon/Canon listing worth that spend - skip the whole
+    listing now instead of calling SerpApi.
+    ============================================================
+  */
+  const primaryProductsBeforeSerpApi =
+    Array.isArray(
+      initialIdentificationData
+        ?.primaryProducts
+    )
+      ? initialIdentificationData
+          .primaryProducts
+      : [];
+
+  const allPrimaryBrandsUnresolved =
+    primaryProductsBeforeSerpApi.length >
+      0 &&
+    primaryProductsBeforeSerpApi.every(
+      product =>
+        !String(
+          product?.brand || ""
+        ).trim()
+    );
+
+  if (allPrimaryBrandsUnresolved) {
+    const unresolvedBrandPassResult = {
+      recommendation:
+        "Pass",
+
+      reason:
+        "Immediate skip: no primary product in this listing has a resolved brand yet, right before the SerpApi identification call. Skipping instead of spending the SerpApi call.",
+
+      facebookPrice,
+
+      totalExpectedSalePrice:
+        null,
+
+      profitAtAsk:
+        null,
+
+      profitAt35:
+        null,
+
+      maxBuyPrice:
+        null,
+
+      validSoldCount:
+        0,
+
+      medianSoldPrice:
+        null,
+
+      items:
+        primaryProductsBeforeSerpApi,
+
+      ignoredItems:
+        []
+    };
+
+    console.log(
+      "[BRAND GATE] Skipping listing before SerpApi call - every primary product has an unresolved brand:",
+      primaryProductsBeforeSerpApi.map(
+        product => ({
+          productId:
+            product?.productId,
+
+          productType:
+            product?.productType
+        })
+      )
+    );
+
+    showLotCompPanel(
+      unresolvedBrandPassResult
+    );
+
+    await markMarketplaceAutoAnalysisComplete(
+      unresolvedBrandPassResult
+    );
+
+    return;
+  }
+
   button.innerText =
     `Identifying ${lensFallbackTargets.length} product(s) with Google Lens...`;
 
@@ -11150,6 +11207,115 @@ const reconciledProducts =
 );
 
 return;
+    }
+
+
+    /*
+      ============================================================
+      BRAND GATE: ONLY NIKON / CANON
+
+      Every primary item in this listing must be Nikon or Canon.
+      If even one primary item has a RESOLVED brand that is
+      neither Nikon nor Canon, skip this listing entirely rather
+      than continuing on to eBay/database pricing.
+
+      An item with an unresolved (blank) brand at this point does
+      NOT trip this check by itself - it just hasn't been
+      identified as "another brand" yet. That case is handled
+      separately, earlier in the pipeline, right before the
+      SerpApi call.
+      ============================================================
+    */
+
+    const offBrandPrimaryItems =
+      primaryItems.filter(
+        item => {
+          const brand =
+            String(
+              item?.brand || ""
+            )
+              .trim()
+              .toLowerCase();
+
+          if (!brand) {
+            return false;
+          }
+
+          return (
+            brand !== "nikon" &&
+            brand !== "canon"
+          );
+        }
+      );
+
+    if (offBrandPrimaryItems.length > 0) {
+      const offBrandPassResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          `Immediate skip: at least one primary item is a ${
+            offBrandPrimaryItems
+              .map(
+                item =>
+                  item?.brand ||
+                  "unknown"
+              )
+              .join(", ")
+          } product. Only Nikon or Canon listings are analyzed.`,
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          null,
+
+        profitAtAsk:
+          null,
+
+        profitAt35:
+          null,
+
+        maxBuyPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        medianSoldPrice:
+          null,
+
+        items:
+          primaryItems,
+
+        ignoredItems:
+          [],
+
+        cameraAnalysis:
+          data.cameraAnalysis
+      };
+
+      console.log(
+        "[BRAND GATE] Skipping listing - off-brand primary item(s) detected:",
+        offBrandPrimaryItems.map(
+          item => ({
+            productId:
+              item?.productId,
+
+            brand:
+              item?.brand
+          })
+        )
+      );
+
+      showLotCompPanel(
+        offBrandPassResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        offBrandPassResult
+      );
+
+      return;
     }
 
 
