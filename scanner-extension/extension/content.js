@@ -10412,6 +10412,113 @@ if (
           .primaryProducts
       : [];
 
+  /*
+    ============================================================
+    BRAND GATE: ONLY NIKON / CANON (PRE-SERPAPI)
+
+    Gate 1 above only catches the case where NO primary product
+    has a brand yet. It does nothing if a product's brand was
+    already resolved to something off-brand (e.g. "Burke and
+    James") during Step 5's text/OCR reconciliation - that case
+    was previously falling through and spending a SerpApi Google
+    AI Mode call before the later Nikon/Canon gate (after Step 5B)
+    ever got to reject it.
+
+    If any primary product already has a RESOLVED brand that is
+    neither Nikon nor Canon, skip immediately, before spending
+    any SerpApi calls. A blank/unresolved brand does not trip
+    this check - that's what allPrimaryBrandsUnresolved below,
+    and the post-SerpApi gate, are for.
+    ============================================================
+  */
+  const offBrandPrimaryItemsBeforeSerpApi =
+    primaryProductsBeforeSerpApi.filter(
+      product => {
+        const brand =
+          String(
+            product?.brand || ""
+          )
+            .trim()
+            .toLowerCase();
+
+        if (!brand) {
+          return false;
+        }
+
+        return (
+          brand !== "nikon" &&
+          brand !== "canon"
+        );
+      }
+    );
+
+  if (offBrandPrimaryItemsBeforeSerpApi.length > 0) {
+    const offBrandPassResultBeforeSerpApi = {
+      recommendation:
+        "Pass",
+
+      reason:
+        `Immediate skip: at least one primary item is a ${
+          offBrandPrimaryItemsBeforeSerpApi
+            .map(
+              product =>
+                product?.brand ||
+                "unknown"
+            )
+            .join(", ")
+        } product. Only Nikon or Canon listings are analyzed. Skipping before the SerpApi identification call.`,
+
+      facebookPrice,
+
+      totalExpectedSalePrice:
+        null,
+
+      profitAtAsk:
+        null,
+
+      profitAt35:
+        null,
+
+      maxBuyPrice:
+        null,
+
+      validSoldCount:
+        0,
+
+      medianSoldPrice:
+        null,
+
+      items:
+        primaryProductsBeforeSerpApi,
+
+      ignoredItems:
+        []
+    };
+
+    console.log(
+      "[BRAND GATE] Skipping listing before SerpApi call - off-brand primary item(s) already resolved:",
+      offBrandPrimaryItemsBeforeSerpApi.map(
+        product => ({
+          productId:
+            product?.productId,
+
+          brand:
+            product?.brand
+        })
+      )
+    );
+
+    showLotCompPanel(
+      offBrandPassResultBeforeSerpApi
+    );
+
+    await markMarketplaceAutoAnalysisComplete(
+      offBrandPassResultBeforeSerpApi
+    );
+
+    return;
+  }
+
   const allPrimaryBrandsUnresolved =
     primaryProductsBeforeSerpApi.length >
       0 &&
