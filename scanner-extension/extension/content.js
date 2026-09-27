@@ -1960,14 +1960,8 @@ const MARKETPLACE_SEARCH_TERMS = [
   "digital camera",
   "DSLR",
   "mirrorless camera",
-  "old camera",
   "camera bundle",
-  "camera equipment",
-  "camera gear",
   "camera with lens",
-  "professional camera",
-  "digital video camera",
-
 
   "camera",
   "Canon",
@@ -1989,8 +1983,6 @@ const MARKETPLACE_SEARCH_TERMS = [
   "nikon camara",
   "camera lense",
   "rebel camera"
-
-
 ];
 
 function normalizeMarketplaceSearchTerm(term) {
