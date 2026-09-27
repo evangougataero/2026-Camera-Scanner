@@ -114,8 +114,16 @@ async function releaseMarketplaceOutreachLock(
   }
 }
 
+/*
+  Listings are analyzed strictly one at a time. This used to be
+  set to 2 so a second listing could open in the background while
+  the first one was parked waiting on DataForSEO, but that
+  parallel-processing behavior has been removed for simplicity -
+  do not start another listing until the current one has fully
+  completed.
+*/
 const MAX_CONCURRENT_MARKETPLACE_ANALYSES =
-  2;
+  1;
 
 const MARKETPLACE_ANALYSIS_JOBS_KEY =
   "marketplaceAnalysisJobs";
@@ -4540,7 +4548,7 @@ if (
   MAX_CONCURRENT_MARKETPLACE_ANALYSES
 ) {
   console.log(
-    "[MARKETPLACE BROWSE] Maximum concurrent listing jobs reached. Waiting for capacity:",
+    "[MARKETPLACE BROWSE] A listing is already being analyzed. Waiting for it to finish before starting another:",
     activeAnalysisJobCount
   );
 
@@ -5167,46 +5175,14 @@ async function waitForMarketplaceChildListingToFinish() {
       );
 
 
-    const parkedJobs =
-      activeJobs.filter(
-        job =>
-          String(
-            job?.status || ""
-          ) ===
-            "waiting-dataforseo"
-      );
-
-
     /*
-      DataForSEO is the ONLY point where we deliberately
-      allow another listing to be opened.
+      Listings are processed strictly one at a time now. A
+      listing parked waiting on DataForSEO used to be treated as
+      a signal to open a second listing in the background - that
+      parallel-processing path has been removed. The current
+      listing, parked or not, simply keeps its slot until it
+      reaches a terminal status below.
     */
-    if (
-      parkedJobs.length > 0 &&
-      activeJobs.length <
-        MAX_CONCURRENT_MARKETPLACE_ANALYSES
-    ) {
-      console.log(
-        "[MARKETPLACE BROWSE] DataForSEO wait detected. Opening another listing."
-      );
-
-      await sleep(
-        randomInt(
-          1000,
-          2500
-        )
-      );
-
-      if (
-        !(await isMarketplaceAutoAnalyzerRunning())
-      ) {
-        return;
-      }
-
-      await openNextMarketplaceListing();
-
-      return;
-    }
 
 
     /*
@@ -5239,9 +5215,9 @@ async function waitForMarketplaceChildListingToFinish() {
 
 
     /*
-      Both analysis slots are currently occupied.
+      The single analysis slot is currently occupied.
 
-      Do not open a third listing. The stale-job
+      Do not open another listing. The stale-job
       watchdog above still runs every 750ms.
     */
     if (
