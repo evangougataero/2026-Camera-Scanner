@@ -997,12 +997,97 @@ function lensfunArrayify(value) {
 }
 
 
+/*
+  Returns the primary language subtag of a parsed XML node's
+  lang="..." attribute ("en-US" -> "en").
+
+  Plain strings, numbers, and objects with no lang attribute
+  are "untagged" and return "".
+*/
+function lensfunLang(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return "";
+  }
+
+  return String(
+    value["@_lang"] ||
+    ""
+  )
+    .trim()
+    .toLowerCase()
+    .split(/[-_]/)[0];
+}
+
+
 function lensfunText(value) {
   if (
     typeof value === "string" ||
     typeof value === "number"
   ) {
     return String(value).trim();
+  }
+
+  /*
+    fast-xml-parser turns REPEATED tags into an array, e.g.
+
+      <model>Nikon AF-P DX Nikkor 18-55mm f/3.5-5.6G VR</model>
+      <model lang="en">Nikkor AF-P 18-55mm f/3.5-5.6G DX VR</model>
+
+    parses as
+
+      [
+        "Nikon AF-P DX Nikkor 18-55mm f/3.5-5.6G VR",
+        { "#text": "Nikkor AF-P ...", "@_lang": "en" }
+      ]
+
+    Pick ONE canonical value so a record never loads blank.
+    Preference order:
+
+      1. untagged/default value
+      2. lang="en"
+      3. any other non-empty value
+
+    Ties inside a tier keep document order.
+
+    IMPORTANT: this function is passed straight to .map() for
+    repeated <mount>/<compat> tags, so it must keep a single
+    parameter (.map() would otherwise feed it the array index).
+  */
+  if (Array.isArray(value)) {
+    const entries =
+      value
+        .map(
+          item => ({
+            text:
+              lensfunText(item),
+
+            lang:
+              lensfunLang(item)
+          })
+        )
+        .filter(
+          entry =>
+            entry.text
+        );
+
+    const chosen =
+      entries.find(
+        entry =>
+          !entry.lang
+      ) ||
+      entries.find(
+        entry =>
+          entry.lang === "en"
+      ) ||
+      entries[0];
+
+    return chosen
+      ? chosen.text
+      : "";
   }
 
   if (
@@ -1016,6 +1101,152 @@ function lensfunText(value) {
   }
 
   return "";
+}
+
+
+/*
+  Post-load sanity check.
+
+  A blank maker/model/mount means a record was parsed
+  incorrectly (for example an XML shape the text helpers
+  don't understand). Those records fail matching silently,
+  so report them once at startup instead.
+*/
+function validateLensfunDatabase(
+  database
+) {
+  const isBlank =
+    value =>
+      !String(
+        value || ""
+      ).trim();
+
+  const lenses =
+    database?.lenses || [];
+
+  const cameras =
+    database?.cameras || [];
+
+  const mounts =
+    database?.mounts || [];
+
+  const summary = {
+    lensesMissingMaker:
+      lenses.filter(
+        lens =>
+          isBlank(lens.maker)
+      ).length,
+
+    lensesMissingModel:
+      lenses.filter(
+        lens =>
+          isBlank(lens.model)
+      ).length,
+
+    lensesMissingMount:
+      lenses.filter(
+        lens =>
+          !lens.mounts?.length
+      ).length,
+
+    camerasMissingMaker:
+      cameras.filter(
+        camera =>
+          isBlank(camera.maker)
+      ).length,
+
+    camerasMissingModel:
+      cameras.filter(
+        camera =>
+          isBlank(camera.model)
+      ).length,
+
+    camerasMissingMount:
+      cameras.filter(
+        camera =>
+          isBlank(camera.mount)
+      ).length,
+
+    mountsMissingName:
+      mounts.filter(
+        mount =>
+          isBlank(mount.name)
+      ).length
+  };
+
+  /*
+    Informational only: how many lens records carried repeated
+    <model> tags (localized names) and had to be reduced to one
+    canonical value.
+  */
+  const lensesWithRepeatedModelTags =
+    lenses.filter(
+      lens =>
+        Array.isArray(
+          lens.raw?.model
+        )
+    ).length;
+
+  const invalidCount =
+    Object.values(summary)
+      .reduce(
+        (sum, count) =>
+          sum + count,
+        0
+      );
+
+  if (invalidCount === 0) {
+    console.log(
+      "[LENSFUN] Validation passed: no blank maker/model/mount fields.",
+      {
+        lensesWithRepeatedModelTags
+      }
+    );
+
+    return summary;
+  }
+
+  console.warn(
+    "[LENSFUN] Validation found blank maker/model/mount fields:",
+    {
+      ...summary,
+      lensesWithRepeatedModelTags
+    }
+  );
+
+  const sampleInvalidLenses =
+    lenses
+      .filter(
+        lens =>
+          isBlank(lens.maker) ||
+          isBlank(lens.model) ||
+          !lens.mounts?.length
+      )
+      .slice(0, 5)
+      .map(
+        lens => ({
+          sourceFile:
+            lens.sourceFile,
+
+          maker:
+            lens.maker,
+
+          model:
+            lens.model,
+
+          mounts:
+            lens.mounts
+        })
+      );
+
+  if (sampleInvalidLenses.length) {
+    console.warn(
+      "[LENSFUN] First invalid lens record(s):",
+      sampleInvalidLenses
+    );
+  }
+
+  return summary;
 }
 
 
@@ -1194,6 +1425,11 @@ function loadLensfunDatabase() {
       mounts:
         mounts.length
     }
+  );
+
+
+  validateLensfunDatabase(
+    lensfunDatabase
   );
 }
 
