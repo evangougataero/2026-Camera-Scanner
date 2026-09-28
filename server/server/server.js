@@ -2670,36 +2670,89 @@ async function resolveCanonicalLens({
       evidence
     )
   ) {
+        /*
+      Lensfun cannot be queried (missing maker or a complete focal
+      length). That is NOT automatically an insufficient identity:
+      a brand plus a literal manufacturer model code is already a
+      commercially adequate identity. Assess it separately.
+    */
+    const sufficiencyWithoutLensfun =
+      assessLensIdentitySufficiency(
+        evidence
+      );
+
+    if (
+      sufficiencyWithoutLensfun.sufficient
+    ) {
+      const groundedIdentity =
+        buildGroundedLensIdentity(
+          product,
+          evidence,
+          sufficiencyWithoutLensfun
+        );
+
+      console.log(
+        "[LENS RESOLVER] Lensfun not queryable, but seller/OCR identity is already commercially sufficient. No visual fallback:",
+        {
+          productId:
+            evidence.productId,
+          sufficiency:
+            sufficiencyWithoutLensfun,
+          canonicalModel:
+            groundedIdentity.canonicalModel
+        }
+      );
+
+      return {
+        evidence,
+        identity:
+          groundedIdentity,
+        candidates:
+          [],
+        mode:
+          "seller-ocr-grounded",
+        reason:
+          `Seller/OCR identity is commercially sufficient (${sufficiencyWithoutLensfun.reason}); Lensfun lookup not required.`,
+        reasonCode:
+          "lens-identity-grounded",
+        notFoundInLensfun:
+          false,
+        identityInsufficient:
+          false
+      };
+    }
+
     console.log(
-      "[LENS RESOLVER] Missing maker or focal length. Routing directly to visual fallback:",
+      "[LENS RESOLVER] Identity insufficient (Lensfun not queryable). Routing to visual fallback:",
       {
         productId:
           evidence.productId,
-
         brand:
           evidence.brand,
-
         focalLength:
-          evidence.focalLength
+          evidence.focalLength,
+        sufficiency:
+          sufficiencyWithoutLensfun
       }
     );
 
-
-return {
-  evidence,
-
-  identity:
-    null,
-
-  candidates:
-    [],
-
-  mode:
-    "serpapi-ai-mode-uncropped",
-
-  reason:
-    "Lensfun returned zero matching candidates; use uncropped SerpApi Google AI Mode."
-};
+    return {
+      evidence,
+      identity:
+        null,
+      candidates:
+        [],
+      mode:
+        "serpapi-ai-mode-uncropped",
+      reason:
+        `Lens identity is insufficient for a commercially specific match (${sufficiencyWithoutLensfun.reason}); use uncropped SerpApi Google AI Mode.`,
+      reasonCode:
+        "distinct-product-identity-unresolved",
+      notFoundInLensfun:
+        false,
+      identityInsufficient:
+        true
+    };
   }
 
 
@@ -2753,29 +2806,87 @@ return {
     Lensfun cannot resolve it.
     Go directly to cropped visual search.
   */
-  if (
+    if (
     candidates.length === 0
   ) {
-    console.log(
-      "[LENS RESOLVER] No Lensfun candidates. Routing to visual fallback:",
-      evidence.productId
-    );
+    /*
+      notFoundInLensfun != identityInsufficient.
+      Lensfun is a canonicalization source. If the seller/OCR
+      evidence is already commercially specific, keep that
+      grounded identity instead of paying to rediscover it.
+    */
+    const sufficiencyZeroCandidates =
+      assessLensIdentitySufficiency(
+        evidence
+      );
 
+    if (
+      sufficiencyZeroCandidates.sufficient
+    ) {
+      const groundedIdentity =
+        buildGroundedLensIdentity(
+          product,
+          evidence,
+          sufficiencyZeroCandidates
+        );
+
+      console.log(
+        "[LENS RESOLVER] notFoundInLensfun=true, identityInsufficient=false. Keeping grounded seller/OCR identity; no visual fallback:",
+        {
+          productId:
+            evidence.productId,
+          sufficiency:
+            sufficiencyZeroCandidates,
+          canonicalModel:
+            groundedIdentity.canonicalModel
+        }
+      );
+
+      return {
+        evidence,
+        identity:
+          groundedIdentity,
+        candidates:
+          [],
+        mode:
+          "seller-ocr-grounded",
+        reason:
+          `No Lensfun record, but seller/OCR identity is commercially sufficient (${sufficiencyZeroCandidates.reason}).`,
+        reasonCode:
+          "lens-identity-grounded",
+        notFoundInLensfun:
+          true,
+        identityInsufficient:
+          false
+      };
+    }
+
+    console.log(
+      "[LENS RESOLVER] notFoundInLensfun=true AND identityInsufficient=true. Routing to visual fallback:",
+      {
+        productId:
+          evidence.productId,
+        sufficiency:
+          sufficiencyZeroCandidates
+      }
+    );
 
     return {
       evidence,
-
       identity:
         null,
-
       candidates:
         [],
-
       mode:
         "serpapi-ai-mode-uncropped",
-
       reason:
-        "Lensfun returned zero matching candidates."
+        `Lensfun returned zero candidates and the seller/OCR identity is insufficient (${sufficiencyZeroCandidates.reason}).`,
+      reasonCode:
+        "distinct-product-identity-unresolved",
+      notFoundInLensfun:
+        true,
+      identityInsufficient:
+        true
     };
   }
 
@@ -2935,8 +3046,14 @@ return {
   mode:
     "serpapi-ai-mode-uncropped",
 
-  reason:
-    "Multiple Lensfun candidates remain; use SerpApi Google AI Mode on the original best image to identify the exact lens."
+    reason:
+    "Multiple Lensfun candidates remain; use SerpApi Google AI Mode on the original best image to identify the exact lens.",
+  reasonCode:
+    "lens-commercial-variant-ambiguous",
+  notFoundInLensfun:
+    false,
+  identityInsufficient:
+    true
 };
 }
 
@@ -6747,37 +6864,1308 @@ function cleanNullableIdentityField(value) {
 
 /*
   ============================================================
-  DETERMINISTIC CAMERA MODEL VAGUENESS CHECK
+  DETERMINISTIC CAMERA MODEL SPECIFICITY CHECK
   ============================================================
 
-  Camera lenses get a deterministic fallback backstop via
+  Camera lenses get a deterministic backstop via
   resolveCanonicalLens() regardless of what Step 5's LLM call
-  decided. Camera bodies/cameras have no such resolver, so
-  whether an obviously-vague identity (e.g. "Canon EOS" alone)
-  gets queued for visual fallback previously depended entirely
-  on the LLM choosing to follow that instruction - which it did
-  not reliably do. This gives non-lens products the same kind
-  of deterministic check.
+  decided. Camera bodies/cameras have no such resolver, so this
+  gives non-lens products the same kind of deterministic check.
+
+  IMPORTANT (why this is NOT a "must contain a digit" test):
+  a model does not need a numeral to be an exact model.
+  "Nikkormat EL", "Nikon F", "Canon Canonet" style names are
+  exact; the previous digit heuristic sent them to paid visual
+  identification, which just echoed the same name back.
+
+  The rule is now: a seller-supported model is specific unless it
+  is (a) empty/placeholder text, (b) only a brand/filler word, or
+  (c) a KNOWN generic family/series label ("EOS", "Rebel",
+  "Alpha", "D", "PowerShot"...). Detection of the generic forms
+  is explicit and conservative rather than trying to prove
+  specificity from the presence of a number.
 */
-function isVagueCameraModelName(
+const CAMERA_BRAND_TOKENS =
+  new Set([
+    "canon", "nikon", "sony", "fujifilm", "fuji", "olympus",
+    "pentax", "asahi", "panasonic", "leica", "minolta",
+    "konica", "kodak", "samsung", "ricoh", "casio",
+    "hasselblad", "mamiya", "yashica", "contax", "polaroid",
+    "sigma", "sanyo", "vivitar"
+  ]);
+
+const CAMERA_MODEL_FILLER_TOKENS =
+  new Set([
+    "camera", "cameras", "body", "bodies", "only", "slr",
+    "dslr", "mirrorless", "compact", "kit", "series"
+  ]);
+
+const CAMERA_MODEL_PLACEHOLDER_LABELS =
+  new Set([
+    "unknown", "none", "n a", "na", "unspecified", "model",
+    "tbd", "not sure", "unsure"
+  ]);
+
+/*
+  Known GENERIC family/series labels (normalized: lowercase,
+  punctuation collapsed to single spaces, brand/filler words
+  removed). A label listed here maps to many commercially
+  distinct cameras. Real single models that merely look short
+  ("Nikon F", "Nikkormat EL", "EOS R", "EOS M", "Pen F",
+  "Df") are intentionally NOT listed.
+*/
+const GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND = {
+  any: [],
+  canon: [
+    "eos", "eos rebel", "rebel", "rebel t", "eos rebel t",
+    "eos digital", "eos kiss", "kiss", "powershot",
+    "powershot g", "powershot s", "powershot a",
+    "powershot sx", "powershot elph", "elph", "ixus", "ixy",
+    "canonet"
+  ],
+  nikon: [
+    "d", "d series", "z", "z series", "coolpix", "coolpix p",
+    "coolpix s", "coolpix l", "nikon 1", "1", "j", "v",
+    "nikkormat"
+  ],
+  sony: [
+    "alpha", "α", "alpha a", "a", "cyber shot", "cybershot",
+    "dsc", "nex"
+  ],
+  fujifilm: [
+    "x", "finepix", "fine pix", "gfx", "x pro", "x t", "x e",
+    "x h", "x s", "x a", "x m"
+  ],
+  fuji: [
+    "x", "finepix", "fine pix", "gfx", "x pro", "x t", "x e",
+    "x h", "x s", "x a", "x m"
+  ],
+  olympus: [
+    "om", "om d", "pen", "pen e", "e system", "stylus",
+    "stylus tough", "tough", "mju"
+  ],
+  pentax: [
+    "k", "optio"
+  ],
+  panasonic: [
+    "lumix", "lumix g", "lumix gh", "g", "gh", "gx", "fz",
+    "lx", "dmc"
+  ],
+  minolta: [
+    "maxxum", "dynax", "srt"
+  ]
+};
+
+const ALL_GENERIC_CAMERA_FAMILY_LABELS =
+  new Set(
+    Object.values(
+      GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND
+    ).flat()
+  );
+
+function tokenizeCameraText(
+  value
+) {
+  return String(
+    value || ""
+  )
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(
+      /[^\p{L}\p{N}]+/gu,
+      " "
+    )
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+}
+
+/*
+  Returns a structured assessment so callers can log WHY an
+  identity was considered vague or sufficiently specific.
+*/
+function classifyCameraModelSpecificity(
+  brand,
   modelName
 ) {
-  const cleaned =
-    String(
-      modelName || ""
-    ).trim();
+  const brandTokens =
+    tokenizeCameraText(brand);
 
-  if (!cleaned) {
-    return true;
-  }
+  const brandResolved =
+    brandTokens.length > 0;
+
+  const brandKey =
+    brandTokens[0] || "";
+
+  let tokens =
+    tokenizeCameraText(modelName);
 
   /*
-    A specific camera model name virtually always includes a
-    digit ("60D", "D750", "a6000", "GH5", "X100", "SL2"). A bare
-    series/family name ("EOS", "Rebel", "Alpha", "D",
-    "PowerShot") does not, and maps to many distinct cameras.
+    Model strings frequently repeat the brand
+    ("Nikon Nikkormat EL"). Strip leading brand words only.
   */
-  return !/\d/.test(cleaned);
+  while (
+    tokens.length &&
+    CAMERA_BRAND_TOKENS.has(
+      tokens[0]
+    )
+  ) {
+    tokens.shift();
+  }
+
+  tokens =
+    tokens.filter(
+      token =>
+        !CAMERA_MODEL_FILLER_TOKENS.has(
+          token
+        )
+    );
+
+  const normalizedModel =
+    tokens.join(" ");
+
+  if (!normalizedModel) {
+    return {
+      vague: true,
+      code: "camera-model-missing",
+      reason:
+        "no model text remains after removing brand/filler words",
+      normalizedModel,
+      brandResolved
+    };
+  }
+
+  if (
+    CAMERA_MODEL_PLACEHOLDER_LABELS.has(
+      normalizedModel
+    )
+  ) {
+    return {
+      vague: true,
+      code: "camera-model-placeholder",
+      reason:
+        `"${normalizedModel}" is placeholder text, not a model`,
+      normalizedModel,
+      brandResolved
+    };
+  }
+
+  const familyLabels =
+    new Set(
+      GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND[
+        brandKey
+      ]
+        ? [
+            ...GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND.any,
+            ...GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND[
+              brandKey
+            ]
+          ]
+        : [
+            ...ALL_GENERIC_CAMERA_FAMILY_LABELS
+          ]
+    );
+
+  if (
+    familyLabels.has(
+      normalizedModel
+    )
+  ) {
+    return {
+      vague: true,
+      code:
+        "camera-model-known-generic-family",
+      reason:
+        `"${normalizedModel}" is a known generic ${
+          brandKey || "camera"
+        } family/series label that maps to many distinct models`,
+      normalizedModel,
+      brandResolved
+    };
+  }
+
+  const hasDigit =
+    /\d/.test(normalizedModel);
+
+  /*
+    Without a digit, the model text alone cannot show WHICH
+    manufacturer's "EL"/"F"/"OM" it is, so a resolved brand is
+    required for alphabetic-only designations.
+  */
+  if (
+    !hasDigit &&
+    !brandResolved
+  ) {
+    return {
+      vague: true,
+      code:
+        "camera-model-brand-unresolved",
+      reason:
+        `alphabetic model "${normalizedModel}" cannot be trusted without a resolved brand`,
+      normalizedModel,
+      brandResolved
+    };
+  }
+
+  return {
+    vague: false,
+    code:
+      hasDigit
+        ? "camera-model-specific-designator"
+        : "camera-model-specific-named-model",
+    reason:
+      hasDigit
+        ? `"${normalizedModel}" carries an explicit model designator and is not a known generic family label`
+        : `"${normalizedModel}" is a plausible distinct model name (brand resolved) and is not a known generic family label`,
+    normalizedModel,
+    brandResolved
+  };
+}
+
+/*
+  Backward-compatible boolean wrapper. Pass the brand whenever
+  it is known: alphabetic-only models require a resolved brand.
+*/
+function isVagueCameraModelName(
+  modelName,
+  brand = null
+) {
+  return classifyCameraModelSpecificity(
+    brand,
+    modelName
+  ).vague;
+}
+
+/*
+  ============================================================
+  GALLERY PHANTOM / DUPLICATE PRODUCT VALIDATION
+  ============================================================
+
+  Step 2 (gallery analysis) can occasionally emit an extra
+  physical-product ID (e.g. lens_3) for an object that is really
+  just another detection of a product that already has its own ID.
+  Every gallery ID is otherwise treated as authoritative physical
+  existence, which then (a) gets restored by Step 5 structural
+  recovery and (b) sends an evidence-free product to paid visual
+  identification.
+
+  This stage is deliberately CONSERVATIVE. A gallery product is
+  flagged as a likely duplicate/phantom only when ALL of these hold:
+
+    1. it is a camera lens with no identity evidence of its own
+       (no brand/mount/focal/aperture/codes/tokens/generation);
+    2. its product-specific OCR contributes nothing that is not
+       already explained by other lenses (no unique focal length);
+    3. the seller reliably enumerates lenses (a structured item
+       list or an explicit quantity) and states no more lenses
+       than the OTHER, well-supported lens IDs already account for;
+    4. each seller-described lens can be traced to one of those
+       well-supported gallery IDs (when the seller listed items);
+    5. every image containing it also contains one of those
+       already-supported lenses (it never stands alone).
+
+  A seller simply omitting a product never suppresses anything:
+  with no reliable seller enumeration, or with a lens that shows
+  up in its own image, or with unique OCR, the product is kept.
+*/
+const SELLER_LENS_ACCESSORY_PATTERN =
+  /\b(hood|hoods|cap|caps|cover|covers|filter|filters|adapter|adaptor|converter|teleconverter|case|bag|pouch|strap|cleaning|cloth|shade|tube|extension)\b/i;
+
+const SELLER_NON_LENS_GEAR_PATTERN =
+  /\b(flash|speedlite|speedlight|tripod|monopod)\b/i;
+
+const SELLER_QUANTITY_WORDS = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5
+};
+
+function extractFocalInfoFromText(
+  text
+) {
+  const keys = new Set();
+  const endpoints = new Set();
+
+  let remaining =
+    String(text || "");
+
+  const rangePattern =
+    /(\d{1,3}(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d{1,3}(?:\.\d+)?)\s*mm/gi;
+
+  remaining =
+    remaining.replace(
+      rangePattern,
+      (
+        match,
+        low,
+        high
+      ) => {
+        keys.add(
+          `${Number(low)}-${Number(high)}mm`
+        );
+        endpoints.add(Number(low));
+        endpoints.add(Number(high));
+        return " ";
+      }
+    );
+
+  const singlePattern =
+    /(\d{1,3}(?:\.\d+)?)\s*mm/gi;
+
+  let match;
+
+  while (
+    (match =
+      singlePattern.exec(
+        remaining
+      )) !== null
+  ) {
+    keys.add(
+      `${Number(match[1])}mm`
+    );
+    endpoints.add(
+      Number(match[1])
+    );
+  }
+
+  return {
+    keys,
+    endpoints
+  };
+}
+
+function parseSellerLensEnumeration({
+  listingTitle,
+  listingDescription,
+  explicitFacts
+}) {
+  const description =
+    String(
+      listingDescription || ""
+    ).replace(
+      /[•●▪◦]/g,
+      "\n• "
+    );
+
+  const rawLines = [];
+
+  for (
+    const line of
+      description.split(/\r?\n/)
+  ) {
+    const trimmed =
+      line.trim();
+
+    if (!trimmed) {
+      continue;
+    }
+
+    const isBullet =
+      /^(?:[•\-\*–—·]|\d+[.)])\s+/.test(
+        trimmed
+      );
+
+    rawLines.push({
+      text:
+        trimmed.replace(
+          /^(?:[•\-\*–—·]|\d+[.)])\s+/,
+          ""
+        ),
+      isBullet,
+      source: "description"
+    });
+  }
+
+  const titleText =
+    String(
+      listingTitle || ""
+    ).trim();
+
+  if (titleText) {
+    rawLines.push({
+      text: titleText,
+      isBullet: false,
+      source: "title"
+    });
+  }
+
+  const explicitlyIncluded =
+    Array.isArray(
+      explicitFacts?.explicitlyIncluded
+    )
+      ? explicitFacts.explicitlyIncluded
+      : [];
+
+  for (
+    const entry of explicitlyIncluded
+  ) {
+    const text =
+      typeof entry === "string"
+        ? entry
+        : String(
+            entry?.text ||
+            entry?.item ||
+            entry?.name ||
+            ""
+          );
+
+    if (text.trim()) {
+      rawLines.push({
+        text: text.trim(),
+        isBullet: false,
+        source: "explicitFacts"
+      });
+    }
+  }
+
+  const items = [];
+  const itemKeys = new Set();
+  const signaturesSeenInDescription =
+    new Set();
+
+  for (const line of rawLines) {
+    const focal =
+      extractFocalInfoFromText(
+        line.text
+      );
+
+    const looksLikeLens =
+      focal.keys.size > 0 ||
+      /\blens\b/i.test(line.text);
+
+    if (
+      !looksLikeLens ||
+      SELLER_LENS_ACCESSORY_PATTERN.test(
+        line.text
+      ) ||
+      SELLER_NON_LENS_GEAR_PATTERN.test(
+        line.text
+      )
+    ) {
+      continue;
+    }
+
+    const signature =
+      focal.keys.size
+        ? Array.from(focal.keys)
+            .sort()
+            .join("|")
+        : line.text
+            .toLowerCase()
+            .replace(/\s+/g, " ");
+
+    /*
+      explicitFacts restates the description; don't
+      double count the same lens across those sources.
+    */
+    if (
+      line.source ===
+        "explicitFacts" &&
+      signaturesSeenInDescription.has(
+        signature
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      line.source !==
+      "explicitFacts"
+    ) {
+      signaturesSeenInDescription.add(
+        signature
+      );
+    }
+
+    focal.keys.forEach(
+      key => itemKeys.add(key)
+    );
+
+    items.push({
+      text: line.text,
+      focalKeys:
+        Array.from(focal.keys),
+      lensCount:
+        Math.max(
+          1,
+          focal.keys.size
+        )
+    });
+  }
+
+  const enumeratedCount =
+    items.reduce(
+      (sum, item) =>
+        sum + item.lensCount,
+      0
+    );
+
+  const combinedText =
+    `${titleText}\n${String(listingDescription || "")}`;
+
+  let explicitCount = null;
+
+  const quantityPattern =
+    /\b(one|two|three|four|five|[1-5])\s+(?:[\w-]+\s+){0,2}lenses\b/gi;
+
+  let quantityMatch;
+
+  while (
+    (quantityMatch =
+      quantityPattern.exec(
+        combinedText
+      )) !== null
+  ) {
+    const token =
+      quantityMatch[1]
+        .toLowerCase();
+
+    const value =
+      SELLER_QUANTITY_WORDS[token] ||
+      Number(token);
+
+    if (
+      Number.isFinite(value) &&
+      (
+        explicitCount === null ||
+        value > explicitCount
+      )
+    ) {
+      explicitCount = value;
+    }
+  }
+
+  const bulletLineCount =
+    rawLines.filter(
+      line =>
+        line.isBullet &&
+        line.source ===
+          "description"
+    ).length;
+
+  const reliable =
+    explicitCount !== null ||
+    bulletLineCount >= 3;
+
+  return {
+    items,
+    itemFocalKeys:
+      Array.from(itemKeys),
+    enumeratedCount,
+    explicitCount,
+    bulletLineCount,
+    reliable,
+    sellerLensCount:
+      reliable
+        ? Math.max(
+            enumeratedCount,
+            explicitCount || 0
+          )
+        : 0
+  };
+}
+
+function buildGalleryProductRegistry(
+  galleryResults
+) {
+  const registry = new Map();
+  const imageProducts = new Map();
+
+  for (
+    const gallery of
+      Array.isArray(galleryResults)
+        ? galleryResults
+        : []
+  ) {
+    const analysis =
+      gallery?.galleryAnalysis || {};
+
+    for (
+      const product of
+        Array.isArray(analysis.products)
+          ? analysis.products
+          : []
+    ) {
+      const productId =
+        String(
+          product?.productId || ""
+        ).trim();
+
+      const productType =
+        String(
+          product?.productType || ""
+        ).trim();
+
+      if (!productId || !productType) {
+        continue;
+      }
+
+      const entry =
+        registry.get(productId) || {
+          productId,
+          productType,
+          visibleInImages: new Set(),
+          maxReadability: 0
+        };
+
+      for (
+        const index of
+          Array.isArray(
+            product?.visibleInImages
+          )
+            ? product.visibleInImages
+            : []
+      ) {
+        if (Number.isFinite(Number(index))) {
+          entry.visibleInImages.add(
+            Number(index)
+          );
+        }
+      }
+
+      registry.set(productId, entry);
+    }
+
+    for (
+      const image of
+        Array.isArray(analysis.images)
+          ? analysis.images
+          : []
+    ) {
+      const imageIndex =
+        Number(image?.imageIndex);
+
+      if (!Number.isFinite(imageIndex)) {
+        continue;
+      }
+
+      for (
+        const visible of
+          Array.isArray(
+            image?.visibleProducts
+          )
+            ? image.visibleProducts
+            : []
+      ) {
+        const productId =
+          String(
+            visible?.productId || ""
+          ).trim();
+
+        const entry =
+          registry.get(productId);
+
+        if (!entry) {
+          continue;
+        }
+
+        entry.visibleInImages.add(
+          imageIndex
+        );
+
+        entry.maxReadability =
+          Math.max(
+            entry.maxReadability,
+            Number(
+              visible?.modelReadabilityScore
+            ) || 0
+          );
+
+        const set =
+          imageProducts.get(
+            imageIndex
+          ) || new Set();
+
+        set.add(productId);
+
+        imageProducts.set(
+          imageIndex,
+          set
+        );
+      }
+    }
+  }
+
+  return {
+    registry,
+    imageProducts
+  };
+}
+
+function isLensProductType(
+  productType
+) {
+  return /lens/i.test(
+    String(productType || "")
+  );
+}
+
+function getStructuredLensIdentityForProduct(
+  primaryProducts,
+  productId
+) {
+  const product =
+    (Array.isArray(primaryProducts)
+      ? primaryProducts
+      : []
+    ).find(
+      item =>
+        String(
+          item?.productId || ""
+        ).trim() === productId
+    );
+
+  return normalizeLensIdentity(
+    product?.lensIdentity || {}
+  );
+}
+
+function lensIdentityHasAnyEvidence(
+  identity
+) {
+  return Boolean(
+    identity?.brand ||
+    identity?.canonicalModel ||
+    identity?.mountSeries ||
+    identity?.focalLength ||
+    identity?.maxAperture ||
+    identity?.generation ||
+    (identity?.modelCodes || []).length ||
+    (identity?.featureTokens || []).length
+  );
+}
+
+function lensIdentityIsWellSupported(
+  identity
+) {
+  return Boolean(
+    identity?.canonicalModel ||
+    (
+      identity?.brand &&
+      (
+        isCompleteLensfunFocalEvidence(
+          identity?.focalLength
+        ) ||
+        (identity?.modelCodes || []).length
+      )
+    )
+  );
+}
+
+/*
+  True when the product's own OCR text contributes a focal
+  length number that is NOT already explained by another lens's
+  identity. OCR can leak text from a neighbouring lens in the
+  same photo, so text that merely repeats another lens's numbers
+  is NOT unique evidence.
+*/
+function productHasUniqueLensOcr({
+  productId,
+  productOcrResults,
+  otherLensIdentities
+}) {
+  const ocrText =
+    (Array.isArray(productOcrResults)
+      ? productOcrResults
+      : []
+    )
+      .filter(
+        entry =>
+          String(
+            entry?.productId || ""
+          ).trim() === productId
+      )
+      .map(
+        entry =>
+          String(entry?.ocrText || "")
+      )
+      .join("\n");
+
+  const ownEndpoints =
+    extractFocalInfoFromText(
+      ocrText
+    ).endpoints;
+
+  if (!ownEndpoints.size) {
+    return false;
+  }
+
+  const claimedEndpoints =
+    new Set();
+
+  for (
+    const identity of
+      otherLensIdentities
+  ) {
+    extractFocalInfoFromText(
+      identity?.focalLength || ""
+    ).endpoints.forEach(
+      value =>
+        claimedEndpoints.add(value)
+    );
+  }
+
+  return Array.from(
+    ownEndpoints
+  ).some(
+    value =>
+      !claimedEndpoints.has(value)
+  );
+}
+
+function evaluateLikelyPhantomGalleryProducts({
+  galleryResults,
+  primaryProducts,
+  productOcrResults,
+  listingTitle,
+  listingDescription,
+  explicitFacts,
+  priorSuppressed = []
+}) {
+  const {
+    registry,
+    imageProducts
+  } =
+    buildGalleryProductRegistry(
+      galleryResults
+    );
+
+  const seller =
+    parseSellerLensEnumeration({
+      listingTitle,
+      listingDescription,
+      explicitFacts
+    });
+
+  const suppressed = [];
+  const diagnostics = [];
+  const suppressedIds = new Set();
+
+  /*
+    A product rejected on an earlier pass stays rejected: Step 5
+    recovery on the post-visual pass must not resurrect it.
+  */
+  for (
+    const prior of
+      Array.isArray(priorSuppressed)
+        ? priorSuppressed
+        : []
+  ) {
+    const productId =
+      String(
+        prior?.productId || ""
+      ).trim();
+
+    if (
+      productId &&
+      registry.has(productId) &&
+      !suppressedIds.has(productId)
+    ) {
+      suppressedIds.add(productId);
+
+      suppressed.push({
+        ...prior,
+        productId,
+        suppressedAsLikelyDuplicate: true,
+        carriedOverFromEarlierPass: true
+      });
+    }
+  }
+
+  const lensEntries =
+    Array.from(registry.values())
+      .filter(
+        entry =>
+          isLensProductType(
+            entry.productType
+          ) &&
+          !suppressedIds.has(
+            entry.productId
+          )
+      );
+
+  const identityById =
+    new Map(
+      lensEntries.map(
+        entry => [
+          entry.productId,
+          getStructuredLensIdentityForProduct(
+            primaryProducts,
+            entry.productId
+          )
+        ]
+      )
+    );
+
+  const supported =
+    lensEntries.filter(
+      entry =>
+        lensIdentityIsWellSupported(
+          identityById.get(
+            entry.productId
+          )
+        )
+    );
+
+  const candidates =
+    lensEntries.filter(
+      entry =>
+        !lensIdentityIsWellSupported(
+          identityById.get(
+            entry.productId
+          )
+        ) &&
+        !lensIdentityHasAnyEvidence(
+          identityById.get(
+            entry.productId
+          )
+        )
+    );
+
+  for (const candidate of candidates) {
+    const images =
+      Array.from(
+        candidate.visibleInImages
+      ).sort(
+        (a, b) => a - b
+      );
+
+    const otherIdentities =
+      lensEntries
+        .filter(
+          entry =>
+            entry.productId !==
+            candidate.productId
+        )
+        .map(
+          entry =>
+            identityById.get(
+              entry.productId
+            )
+        );
+
+    const uniqueOcr =
+      productHasUniqueLensOcr({
+        productId:
+          candidate.productId,
+        productOcrResults,
+        otherLensIdentities:
+          otherIdentities
+      });
+
+    const sellerCount =
+      seller.sellerLensCount;
+
+    const sellerCountAccounted =
+      sellerCount > 0 &&
+      supported.length >=
+        sellerCount;
+
+    const sellerKeys =
+      new Set(
+        seller.itemFocalKeys
+      );
+
+    const tracedSupported =
+      supported.filter(
+        entry => {
+          const identityKeys =
+            extractFocalInfoFromText(
+              identityById.get(
+                entry.productId
+              )?.focalLength || ""
+            ).keys;
+
+          return Array.from(
+            identityKeys
+          ).some(
+            key =>
+              sellerKeys.has(key)
+          );
+        }
+      );
+
+    const sellerItemsTraceable =
+      seller.items.length === 0
+        ? true
+        : tracedSupported.length >=
+          sellerCount;
+
+    const coVisibleSupported =
+      new Set();
+
+    let everyImageHasSupportedLens =
+      images.length > 0;
+
+    for (const imageIndex of images) {
+      const present =
+        imageProducts.get(
+          imageIndex
+        ) || new Set();
+
+      const supportedHere =
+        supported.filter(
+          entry =>
+            present.has(
+              entry.productId
+            ) ||
+            entry.visibleInImages.has(
+              imageIndex
+            )
+        );
+
+      if (!supportedHere.length) {
+        everyImageHasSupportedLens =
+          false;
+      }
+
+      supportedHere.forEach(
+        entry =>
+          coVisibleSupported.add(
+            entry.productId
+          )
+      );
+    }
+
+    const checks = {
+      noOwnIdentityEvidence: true,
+      noUniqueOcr: !uniqueOcr,
+      sellerReliablyEnumeratesLenses:
+        seller.reliable &&
+        sellerCount > 0,
+      sellerCountAlreadyAccountedFor:
+        sellerCountAccounted,
+      sellerItemsTraceableToGalleryIds:
+        sellerItemsTraceable,
+      onlyAppearsWithSupportedLenses:
+        everyImageHasSupportedLens
+    };
+
+    const shouldSuppress =
+      Object.values(checks).every(
+        Boolean
+      );
+
+    const diagnostic = {
+      productId:
+        candidate.productId,
+      images,
+      maxModelReadability:
+        candidate.maxReadability,
+      sellerLensCount:
+        sellerCount || null,
+      supportedLensIds:
+        supported.map(
+          entry => entry.productId
+        ),
+      checks,
+      decision:
+        shouldSuppress
+          ? "suppress-as-likely-duplicate"
+          : "keep"
+    };
+
+    diagnostics.push(diagnostic);
+
+    if (!shouldSuppress) {
+      continue;
+    }
+
+    suppressedIds.add(
+      candidate.productId
+    );
+
+    suppressed.push({
+      productId:
+        candidate.productId,
+      productType:
+        candidate.productType,
+      suppressedAsLikelyDuplicate:
+        true,
+      reason:
+        `Seller enumerates ${sellerCount} lens(es) and ${supported.length} other lens ID(s) already account for them; this ID has no brand/model/focal/OCR identity of its own and only appears in images that also show those lenses.`,
+      possibleDuplicateOf:
+        Array.from(
+          coVisibleSupported
+        ),
+      evidence: {
+        images,
+        maxModelReadability:
+          candidate.maxReadability,
+        sellerLensCount:
+          sellerCount,
+        supportedLensIds:
+          supported.map(
+            entry => entry.productId
+          )
+      }
+    });
+  }
+
+  return {
+    suppressed,
+    diagnostics,
+    seller
+  };
+}
+
+/*
+  ============================================================
+  LENS IDENTITY SUFFICIENCY
+  ============================================================
+
+  "notFoundInLensfun" and "identityInsufficient" are DIFFERENT
+  things. Lensfun is a canonicalization/validation source, not
+  the sole authority on whether a seller/OCR-supplied lens model
+  is usable. Only insufficient identity justifies paid visual
+  identification.
+
+  Structured evidence only (Step 5 remains the one boundary that
+  reads raw text): a lens identity is commercially adequate when
+  the brand is known AND either
+    - a literal manufacturer model code is present, or
+    - a complete focal length + maximum aperture are present
+      together with at least one discriminator (mount, feature
+      token, or generation marker).
+*/
+function assessLensIdentitySufficiency(
+  evidence
+) {
+  const brand =
+    String(
+      evidence?.brand || ""
+    ).trim();
+
+  const focalComplete =
+    isCompleteLensfunFocalEvidence(
+      evidence?.focalLength
+    );
+
+  const aperture =
+    String(
+      evidence?.maxAperture || ""
+    ).trim();
+
+  const modelCodes =
+    Array.isArray(
+      evidence?.modelCodes
+    )
+      ? evidence.modelCodes
+      : [];
+
+  const featureTokens =
+    Array.isArray(
+      evidence?.featureTokens
+    )
+      ? evidence.featureTokens
+      : [];
+
+  const discriminators = [
+    evidence?.explicitMount
+      ? "mount"
+      : null,
+    featureTokens.length
+      ? "featureTokens"
+      : null,
+    evidence?.generation
+      ? "generation"
+      : null
+  ].filter(Boolean);
+
+  if (!brand) {
+    return {
+      sufficient: false,
+      code: "brand-missing",
+      reason:
+        "no resolved lens brand"
+    };
+  }
+
+  if (modelCodes.length) {
+    return {
+      sufficient: true,
+      code:
+        "manufacturer-model-code",
+      reason:
+        `brand plus literal model code(s) ${modelCodes.join(", ")}`
+    };
+  }
+
+  if (!focalComplete) {
+    return {
+      sufficient: false,
+      code:
+        "focal-length-missing-or-incomplete",
+      reason:
+        "no complete focal length"
+    };
+  }
+
+  if (!aperture) {
+    return {
+      sufficient: false,
+      code: "aperture-missing",
+      reason:
+        "complete focal length but no maximum aperture"
+    };
+  }
+
+  if (!discriminators.length) {
+    return {
+      sufficient: false,
+      code: "no-discriminator",
+      reason:
+        "brand/focal/aperture only; no mount, feature token, or generation to separate commercial variants"
+    };
+  }
+
+  return {
+    sufficient: true,
+    code:
+      "brand-focal-aperture-plus-discriminator",
+    reason:
+      `brand, focal length, aperture and ${discriminators.join("+")}`
+  };
+}
+
+function buildGroundedLensIdentity(
+  product,
+  evidence,
+  sufficiency
+) {
+  const base =
+    normalizeLensIdentity(
+      product?.lensIdentity || {}
+    );
+
+  const canonicalModel =
+    [
+      evidence?.focalLength,
+      evidence?.maxAperture,
+      ...(evidence?.featureTokens || []),
+      ...(evidence?.modelCodes || []),
+      evidence?.generation
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  return {
+    ...base,
+    mountSeries:
+      base.mountSeries ||
+      evidence?.explicitMount ||
+      null,
+    canonicalModel:
+      canonicalModel || null,
+    resolutionMode:
+      "seller-ocr-grounded",
+    groundedBy:
+      sufficiency?.code || null
+  };
 }
 
 function normalizeLensModelCodes(
@@ -11325,8 +12713,8 @@ vague for a reliable resale lookup. For camera bodies, a bare series/family
 name with no specific model number is vague, not an identity — "Canon EOS",
 "Rebel", "Sony Alpha", and "Nikon D" each match many distinct camera models,
 so treat them as unresolved rather than guessing which one. A specific model
-("EOS 60D", "Alpha a6000", "D750") is sufficient even if other fields are
-unknown. For lenses, "18-55mm" with no mount/aperture/feature tokens is
+("EOS 60D", "Alpha a6000", "D750", "Nikkormat EL", "Nikon F") is sufficient
+even if other fields are unknown - a model does NOT need a numeral to be exact. For lenses, "18-55mm" with no mount/aperture/feature tokens is
 similarly vague. Do NOT request it just because some field is unknown — e.g.
 "EF-S 18-55mm f/3.5-5.6 IS II" is specific enough already. Skip re-requesting
 if visual evidence was already supplied and used.
@@ -11745,12 +13133,93 @@ if (!isPostDataForSeoPass) {
 
 
 /*
+  ============================================================
+  GALLERY PHANTOM / DUPLICATE VALIDATION
+  ============================================================
+  Runs BEFORE structural recovery so that a product this stage
+  explicitly rejects is not blindly resurrected below, and so it
+  cannot reach paid visual identification. Conservative by design
+  (see evaluateLikelyPhantomGalleryProducts): a product the seller
+  merely failed to mention is kept.
+  Rejections from an earlier pass are carried in
+  req.body.suppressedGalleryProducts so the post-visual pass
+  cannot bring them back either.
+*/
+const priorSuppressedGalleryProducts =
+  Array.isArray(
+    req.body?.suppressedGalleryProducts
+  )
+    ? req.body.suppressedGalleryProducts
+    : [];
+
+const phantomValidation =
+  evaluateLikelyPhantomGalleryProducts({
+    galleryResults,
+    primaryProducts:
+      parsedPrimaryProducts,
+    productOcrResults,
+    listingTitle,
+    listingDescription,
+    explicitFacts,
+    priorSuppressed:
+      priorSuppressedGalleryProducts
+  });
+
+const suppressedGalleryProducts =
+  phantomValidation.suppressed;
+
+const suppressedGalleryProductIds =
+  new Set(
+    suppressedGalleryProducts.map(
+      entry => entry.productId
+    )
+  );
+
+console.log(
+  "[PHANTOM VALIDATION] Gallery duplicate check:",
+  {
+    sellerLensEnumeration: {
+      reliable:
+        phantomValidation.seller.reliable,
+      sellerLensCount:
+        phantomValidation.seller.sellerLensCount,
+      enumeratedCount:
+        phantomValidation.seller.enumeratedCount,
+      explicitCount:
+        phantomValidation.seller.explicitCount,
+      itemFocalKeys:
+        phantomValidation.seller.itemFocalKeys
+    },
+    diagnostics:
+      phantomValidation.diagnostics,
+    suppressed:
+      suppressedGalleryProducts
+  }
+);
+
+if (suppressedGalleryProductIds.size) {
+  parsedPrimaryProducts =
+    parsedPrimaryProducts.filter(
+      product =>
+        !suppressedGalleryProductIds.has(
+          String(
+            product?.productId || ""
+          ).trim()
+        )
+    );
+}
+
+/*
   Detect gallery-visible physical products
   that vanished during reconciliation.
+  Products rejected by phantom validation are NOT "missing".
 */
 const missingGalleryProducts =
   galleryPhysicalProducts.filter(
     galleryProduct =>
+      !suppressedGalleryProductIds.has(
+        galleryProduct.productId
+      ) &&
       !parsedPrimaryProducts.some(
         finalProduct =>
           String(
@@ -12256,22 +13725,55 @@ let needsGoogleLens =
 
 /*
   ============================================================
-  DETERMINISTIC CAMERA BODY / CAMERA VAGUENESS GUARD
+  DETERMINISTIC CAMERA BODY / CAMERA SPECIFICITY GUARD
   ============================================================
+  Step 5's LLM output is NOT trusted to decide paid visual
+  identification for camera bodies/cameras, in either direction:
 
-  Do not rely solely on the LLM having followed the
-  "vague series name" instruction in the Step 5 prompt above.
-  Force any camera body/camera whose model is missing or a bare
-  series/family name into needsGoogleLens here, deterministically,
-  the same way resolveCanonicalLens() below deterministically
-  backstops camera lenses.
+    - a vague/missing model is forced INTO needsGoogleLens;
+    - a specific model (e.g. "Nikkormat EL", "Nikon F") has any
+      LLM-requested visual fallback REMOVED, because a paid call
+      cannot add information to an identity the seller/OCR
+      already established;
+    - entries for productIds that are not final primary products
+      (hallucinated or phantom-suppressed) are dropped.
 
   Skipped on the post-DataForSEO gate pass: needsGoogleLens is
-  intentionally already [] there (see isPostDataForSeoPass above)
-  and this pass reuses baseline products rather than fresh
-  Step-5 output.
+  intentionally already [] there and that pass reuses baseline
+  products rather than fresh Step-5 output.
 */
 if (!isPostDataForSeoPass) {
+  const finalPrimaryProductIds =
+    new Set(
+      primaryProducts.map(
+        product =>
+          String(
+            product?.productId || ""
+          ).trim()
+      )
+    );
+
+  needsGoogleLens =
+    needsGoogleLens.filter(
+      item => {
+        const known =
+          finalPrimaryProductIds.has(
+            String(
+              item?.productId || ""
+            ).trim()
+          );
+
+        if (!known) {
+          console.warn(
+            "[STEP 5 GUARD] Dropping needsGoogleLens entry for a product that is not a final primary product (hallucinated or phantom-suppressed):",
+            item?.productId
+          );
+        }
+
+        return known;
+      }
+    );
+
   for (
     const product of primaryProducts
   ) {
@@ -12294,45 +13796,34 @@ if (!isPostDataForSeoPass) {
         product?.productId || ""
       ).trim();
 
-    if (
-      !productId ||
-      !isVagueCameraModelName(
-        product?.model
-      ) ||
-      wasVisualFallbackAttemptedForProduct(
-        productId
-      )
-    ) {
+    if (!productId) {
       continue;
     }
 
-    console.warn(
-      "[STEP 5 GUARD] Forcing vague camera body/camera model into needsGoogleLens:",
+    const assessment =
+      classifyCameraModelSpecificity(
+        product?.brand,
+        product?.model
+      );
+
+    console.log(
+      `[CAMERA IDENTITY] ${
+        assessment.vague
+          ? "VAGUE"
+          : "SPECIFIC"
+      }:`,
       {
         productId,
-
+        brand:
+          product?.brand || null,
         model:
-          product?.model,
-
-        productType:
-          product?.productType
+          product?.model || null,
+        code:
+          assessment.code,
+        reason:
+          assessment.reason
       }
     );
-
-    const fallbackEntry = {
-      galleryIndex:
-        Number(
-          product?.galleryIndex
-        ) || 1,
-
-      productId,
-
-      reason:
-        `Camera model "${product?.model || "(none)"}" is a bare series/family name, not a specific model; visual identification is required.`,
-
-      visualFallbackMode:
-        "serpapi-ai-mode-uncropped"
-    };
 
     const existingIndex =
       needsGoogleLens.findIndex(
@@ -12342,6 +13833,69 @@ if (!isPostDataForSeoPass) {
           ).trim() ===
           productId
       );
+
+    if (!assessment.vague) {
+      if (existingIndex >= 0) {
+        console.warn(
+          "[CAMERA IDENTITY] Removing LLM-requested visual fallback for an already-specific camera identity (SerpApi cannot add information):",
+          {
+            productId,
+            brand:
+              product?.brand,
+            model:
+              product?.model,
+            code:
+              assessment.code
+          }
+        );
+
+        needsGoogleLens.splice(
+          existingIndex,
+          1
+        );
+      }
+
+      continue;
+    }
+
+    if (
+      wasVisualFallbackAttemptedForProduct(
+        productId
+      )
+    ) {
+      continue;
+    }
+
+    console.warn(
+      "[STEP 5 GUARD] Forcing vague camera body/camera identity into needsGoogleLens:",
+      {
+        productId,
+        model:
+          product?.model,
+        productType:
+          product?.productType,
+        code:
+          assessment.code,
+        reason:
+          assessment.reason
+      }
+    );
+
+    const fallbackEntry = {
+      galleryIndex:
+        Number(
+          product?.galleryIndex
+        ) || 1,
+      productId,
+      reason:
+        `Camera identity "${[product?.brand, product?.model].filter(Boolean).join(" ") || "(none)"}" is not specific enough (${assessment.reason}); visual identification is required.`,
+      visualFallbackMode:
+        "serpapi-ai-mode-uncropped",
+      serpApiReasonCode:
+        "camera-model-genuinely-vague",
+      cameraSpecificityCode:
+        assessment.code
+    };
 
     if (existingIndex >= 0) {
       needsGoogleLens[existingIndex] = {
@@ -12764,20 +14318,32 @@ if (
         fallbackProductId
     );
 
-  const fallbackEntry = {
+    const fallbackEntry = {
     galleryIndex:
       Number(
         product?.galleryIndex
       ) || 1,
-
     productId:
       fallbackProductId,
-
     reason:
       resolution?.reason ||
       "Visual identification is required.",
-
-    visualFallbackMode
+    visualFallbackMode,
+    serpApiReasonCode:
+      resolution?.reasonCode ||
+      "distinct-product-identity-unresolved",
+    lensfunCandidateCount:
+      Array.isArray(
+        resolution?.candidates
+      )
+        ? resolution.candidates.length
+        : 0,
+    notFoundInLensfun:
+      resolution?.notFoundInLensfun ===
+      true,
+    identityInsufficient:
+      resolution?.identityInsufficient ===
+      true
   };
 
   if (
@@ -12842,11 +14408,14 @@ if (
             product?.productId || ""
           ).trim(),
 
-        reason:
+                reason:
           "Dedicated lens resolver failed and visual fallback is required.",
-
         visualFallbackMode:
-          "serpapi-ai-mode-uncropped"
+          "serpapi-ai-mode-uncropped",
+        serpApiReasonCode:
+          "lens-resolver-error",
+        identityInsufficient:
+          true
       });
     }
   }
@@ -12869,6 +14438,208 @@ needsGoogleLens =
         item?.productId
       )
   );
+
+/*
+  ============================================================
+  PAID-CALL METADATA
+  ============================================================
+  Every surviving needsGoogleLens entry must carry an affirmative,
+  deterministically derived reason plus the evidence snapshot the
+  client-side [SERPAPI GATE] uses for its final sanity check. An
+  LLM-supplied entry without a server-derived reason is not
+  enough to justify a paid call.
+*/
+{
+  const lensProductsForEvidence =
+    primaryProducts.filter(
+      product =>
+        isLensProductType(
+          product?.productType
+        )
+    );
+
+  needsGoogleLens =
+    needsGoogleLens.map(
+      item => {
+        const productId =
+          String(
+            item?.productId || ""
+          ).trim();
+
+        const product =
+          primaryProducts.find(
+            candidate =>
+              String(
+                candidate?.productId || ""
+              ).trim() ===
+              productId
+          );
+
+        const isLens =
+          isLensProductType(
+            product?.productType
+          );
+
+        const lensIdentity =
+          isLens
+            ? normalizeLensIdentity(
+                product?.lensIdentity ||
+                {}
+              )
+            : null;
+
+        const currentIdentity =
+          isLens
+            ? [
+                lensIdentity?.brand,
+                buildNormalizedLensModel(
+                  lensIdentity
+                )
+              ]
+                .filter(Boolean)
+                .join(" ") ||
+              null
+            : [
+                product?.brand,
+                product?.model
+              ]
+                .filter(Boolean)
+                .join(" ") ||
+              null;
+
+        const ocrText =
+          productOcrResults
+            .filter(
+              entry =>
+                String(
+                  entry?.productId || ""
+                ).trim() ===
+                productId
+            )
+            .map(
+              entry =>
+                String(
+                  entry?.ocrText || ""
+                ).trim()
+            )
+            .filter(Boolean)
+            .join("\n");
+
+        const hasOwnStructuredEvidence =
+          isLens
+            ? lensIdentityHasAnyEvidence(
+                lensIdentity
+              )
+            : Boolean(
+                product?.brand ||
+                product?.model
+              );
+
+        const hasUniqueOcrEvidence =
+          isLens
+            ? productHasUniqueLensOcr({
+                productId,
+                productOcrResults,
+                otherLensIdentities:
+                  lensProductsForEvidence
+                    .filter(
+                      other =>
+                        String(
+                          other?.productId ||
+                          ""
+                        ).trim() !==
+                        productId
+                    )
+                    .map(
+                      other =>
+                        normalizeLensIdentity(
+                          other?.lensIdentity ||
+                          {}
+                        )
+                    )
+              })
+            : Boolean(ocrText);
+
+        const serpApiReasonCode =
+          item?.serpApiReasonCode ||
+          (
+            isLens
+              ? (
+                  lensIdentityIsWellSupported(
+                    lensIdentity
+                  )
+                    ? null
+                    : "distinct-product-identity-unresolved"
+                )
+              : "camera-model-genuinely-vague"
+          );
+
+        return {
+          ...item,
+          serpApiReasonCode,
+          currentIdentity,
+          identitySource:
+            isLens
+              ? (
+                  lensIdentity
+                    ?.resolutionMode ||
+                  "step5-structured-evidence"
+                )
+              : "step5-seller-ocr",
+          lensfunCandidateCount:
+            isLens
+              ? (
+                  item
+                    ?.lensfunCandidateCount ??
+                  (
+                    lensfunCandidatesByProductId.get(
+                      productId
+                    ) || []
+                  ).length
+                )
+              : null,
+          sellerEvidence:
+            Array.isArray(
+              product?.extracted_evidence
+            ) &&
+            product
+              .extracted_evidence
+              .length > 0,
+          ocrEvidence:
+            Boolean(ocrText),
+          hasOwnIdentityEvidence:
+            hasOwnStructuredEvidence,
+          hasUniqueOcrEvidence,
+          sellerLensCount:
+            phantomValidation
+              .seller
+              .sellerLensCount ||
+            null,
+          likelyDuplicate:
+            false
+        };
+      }
+    )
+    .filter(
+      item => {
+        if (item.serpApiReasonCode) {
+          return true;
+        }
+
+        console.warn(
+          "[SERPAPI GATE][server] Dropping needsGoogleLens entry with no deterministic affirmative reason:",
+          {
+            productId:
+              item?.productId,
+            llmReason:
+              item?.reason
+          }
+        );
+
+        return false;
+      }
+    );
+}
 
 const result = {
   primaryProducts:
@@ -12969,8 +14740,8 @@ const result = {
           product.productType
       ),
 
-  needsGoogleLens,
-
+    needsGoogleLens,
+  suppressedGalleryProducts,
   lensfunCandidateConstraints:
     Array.from(
       lensfunCandidatesByProductId

@@ -1954,6 +1954,519 @@ async function runLocalGoogleLensTargets(
   return results;
 }
 
+/*
+  ============================================================
+  FINAL DETERMINISTIC SERPAPI PAID-CALL GATE
+  ============================================================
+
+  needsGoogleLens is a REQUEST, not a permission. The server
+  already prunes/derives entries deterministically, but this is
+  the last checkpoint before money is spent, so it re-verifies
+  each target and requires an affirmative reason code:
+
+    camera-model-genuinely-vague
+    lens-commercial-variant-ambiguous
+    distinct-product-identity-unresolved
+    (lens-resolver-error: resolver crashed; legacy behaviour kept)
+
+  It also:
+    - refuses products the server rejected as likely duplicates;
+    - refuses an evidence-free extra detection that cannot be
+      isolated from already-resolved same-type products in every
+      image it appears in (a broad group search could only
+      rediscover the known product or mis-map a group answer);
+    - builds the exclusion context (ALL already-resolved
+      same-type products visible in the target image, from any
+      source - not only earlier visual results) that the visual
+      prompt must use.
+*/
+const SERPAPI_ALLOWED_REASON_CODES =
+  new Set([
+    "camera-model-genuinely-vague",
+    "lens-commercial-variant-ambiguous",
+    "distinct-product-identity-unresolved",
+    "lens-resolver-error"
+  ]);
+
+function normalizeGateType(
+  value
+) {
+  return String(
+    value || ""
+  )
+    .trim()
+    .toLowerCase();
+}
+
+function collectSameTypeImageOccupancy(
+  galleries,
+  productId
+) {
+  const occupancy = [];
+
+  for (
+    const gallery of
+      Array.isArray(galleries)
+        ? galleries
+        : []
+  ) {
+    const analysis =
+      gallery?.galleryAnalysis || {};
+
+    for (
+      const image of
+        Array.isArray(analysis.images)
+          ? analysis.images
+          : []
+    ) {
+      const visible =
+        Array.isArray(
+          image?.visibleProducts
+        )
+          ? image.visibleProducts
+          : [];
+
+      const self =
+        visible.find(
+          item =>
+            String(
+              item?.productId || ""
+            ).trim() === productId
+        );
+
+      if (!self) {
+        continue;
+      }
+
+      occupancy.push({
+        imageIndex:
+          Number(image?.imageIndex),
+        sameTypeIds:
+          visible
+            .filter(
+              item =>
+                normalizeGateType(
+                  item?.productType
+                ) ===
+                normalizeGateType(
+                  self?.productType
+                )
+            )
+            .map(
+              item =>
+                String(
+                  item?.productId || ""
+                ).trim()
+            )
+            .filter(Boolean)
+      });
+    }
+  }
+
+  return occupancy;
+}
+
+function describeResolvedPrimaryProduct(
+  product
+) {
+  const brand =
+    String(
+      product?.brand || ""
+    ).trim();
+
+  const model =
+    String(
+      product?.model || ""
+    ).trim();
+
+  const identity =
+    [brand, model]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+
+  return {
+    productId:
+      String(
+        product?.productId || ""
+      ).trim(),
+    productType:
+      String(
+        product?.productType || ""
+      ).trim(),
+    identity,
+    identitySource:
+      product?.lensIdentity
+        ?.resolutionMode ||
+      "seller-ocr"
+  };
+}
+
+function evaluateSerpApiPaidCallGate({
+  target,
+  unresolvedEntry,
+  primaryProducts,
+  needsGoogleLens,
+  suppressedGalleryProducts,
+  galleries,
+  lensfunCandidates
+}) {
+  const productId =
+    String(
+      target?.productId || ""
+    ).trim();
+
+  const product =
+    primaryProducts.find(
+      item =>
+        String(
+          item?.productId || ""
+        ).trim() === productId
+    ) || null;
+
+  const needsIds =
+    new Set(
+      needsGoogleLens.map(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim()
+      )
+    );
+
+  const isLens =
+    normalizeGateType(
+      product?.productType ||
+      target?.productType
+    ).includes("lens");
+
+  const isSufficientlyResolved =
+    id => {
+      const candidate =
+        primaryProducts.find(
+          item =>
+            String(
+              item?.productId || ""
+            ).trim() === id
+        );
+
+      return Boolean(
+        candidate &&
+        !needsIds.has(id) &&
+        String(
+          candidate?.model || ""
+        ).trim()
+      );
+    };
+
+  const sameTypeProductIds =
+    (
+      Array.isArray(
+        target?.sameTypeProductIds
+      )
+        ? target.sameTypeProductIds
+        : [productId]
+    )
+      .map(
+        id =>
+          String(id || "").trim()
+      )
+      .filter(Boolean);
+
+  const resolvedProductsInSameImage =
+    sameTypeProductIds
+      .filter(
+        id =>
+          id !== productId &&
+          isSufficientlyResolved(id)
+      )
+      .map(
+        id =>
+          describeResolvedPrimaryProduct(
+            primaryProducts.find(
+              item =>
+                String(
+                  item?.productId || ""
+                ).trim() === id
+            )
+          )
+      );
+
+  const resolvedIds =
+    new Set(
+      resolvedProductsInSameImage.map(
+        item => item.productId
+      )
+    );
+
+  const suppressedIds =
+    new Set(
+      (Array.isArray(
+        suppressedGalleryProducts
+      )
+        ? suppressedGalleryProducts
+        : []
+      ).map(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim()
+      )
+    );
+
+  const unresolvedSameTypeProductIds =
+    sameTypeProductIds.filter(
+      id =>
+        !resolvedIds.has(id) &&
+        !suppressedIds.has(id)
+    );
+
+  const reasonCode =
+    String(
+      unresolvedEntry
+        ?.serpApiReasonCode ||
+      ""
+    ).trim();
+
+  const occupancy =
+    collectSameTypeImageOccupancy(
+      galleries,
+      productId
+    );
+
+  const isolatedInSomeImage =
+    occupancy.some(
+      entry =>
+        entry.sameTypeIds.filter(
+          id => id !== productId
+        ).length === 0
+    );
+
+  const everyImageHasResolvedSibling =
+    occupancy.length > 0 &&
+    occupancy.every(
+      entry =>
+        entry.sameTypeIds.some(
+          id =>
+            id !== productId &&
+            isSufficientlyResolved(id)
+        )
+    );
+
+  const noIndependentEvidence =
+    unresolvedEntry
+      ?.hasOwnIdentityEvidence ===
+      false &&
+    unresolvedEntry
+      ?.hasUniqueOcrEvidence ===
+      false;
+
+  const totalResolvedSameType =
+    primaryProducts.filter(
+      item =>
+        normalizeGateType(
+          item?.productType
+        ) ===
+          normalizeGateType(
+            product?.productType
+          ) &&
+        isSufficientlyResolved(
+          String(
+            item?.productId || ""
+          ).trim()
+        )
+    ).length;
+
+  const sellerExpectsMore =
+    Number(
+      unresolvedEntry
+        ?.sellerLensCount || 0
+    ) > totalResolvedSameType;
+
+  let allowed = true;
+  let reason = reasonCode;
+  let suppressAsPhantom = false;
+
+  if (!product) {
+    allowed = false;
+    reason =
+      "product-not-in-final-primary-products";
+  } else if (
+    suppressedIds.has(productId)
+  ) {
+    allowed = false;
+    reason =
+      "likely-duplicate-suppressed-by-server";
+  } else if (
+    !SERPAPI_ALLOWED_REASON_CODES.has(
+      reasonCode
+    )
+  ) {
+    allowed = false;
+    reason =
+      "no-affirmative-reason";
+  } else if (
+    reasonCode ===
+      "lens-commercial-variant-ambiguous" &&
+    (
+      !Array.isArray(
+        lensfunCandidates
+      ) ||
+      lensfunCandidates.length < 2
+    )
+  ) {
+    allowed = false;
+    reason =
+      "variant-ambiguity-claimed-without-multiple-lensfun-candidates";
+  } else if (
+    isLens &&
+    reasonCode ===
+      "distinct-product-identity-unresolved" &&
+    unresolvedEntry
+      ?.identityInsufficient !==
+      true
+  ) {
+    allowed = false;
+    reason =
+      "identity-not-actually-insufficient";
+  } else if (
+    isLens &&
+    noIndependentEvidence &&
+    !isolatedInSomeImage &&
+    everyImageHasResolvedSibling &&
+    !sellerExpectsMore
+  ) {
+    allowed = false;
+    suppressAsPhantom = true;
+    reason =
+      "likely-phantom-no-independent-evidence-and-not-isolatable";
+  }
+
+  const gateLog = {
+    productId,
+    allowed,
+    reason,
+    currentIdentity:
+      unresolvedEntry
+        ?.currentIdentity ||
+      null,
+    identitySource:
+      unresolvedEntry
+        ?.identitySource ||
+      null,
+    lensfunCandidateCount:
+      Array.isArray(
+        lensfunCandidates
+      )
+        ? lensfunCandidates.length
+        : (
+            unresolvedEntry
+              ?.lensfunCandidateCount ??
+            null
+          ),
+    sellerEvidence:
+      unresolvedEntry
+        ?.sellerEvidence ??
+      null,
+    ocrEvidence:
+      unresolvedEntry
+        ?.ocrEvidence ??
+      null,
+    likelyDuplicate:
+      suppressedIds.has(
+        productId
+      ) ||
+      suppressAsPhantom,
+    resolvedProductsInSameImage
+  };
+
+  console.log(
+    "[SERPAPI GATE]",
+    gateLog
+  );
+
+  return {
+    allowed,
+    reason,
+    suppressAsPhantom,
+    resolvedProductsInSameImage,
+    unresolvedSameTypeProductIds,
+    occupancy,
+    isolatedInSomeImage
+  };
+}
+
+/*
+  Exclusion context handed to the visual-search layer so that
+  paid output is never spent rediscovering products that are
+  already resolved (seller text/OCR, Lensfun exact or resale
+  consensus, earlier visual result, accepted DataForSEO...).
+*/
+function buildVisualExclusionContext({
+  target,
+  gateResult
+}) {
+  const resolved =
+    gateResult
+      .resolvedProductsInSameImage;
+
+  const unresolvedIds =
+    gateResult
+      .unresolvedSameTypeProductIds;
+
+  const noun =
+    normalizeGateType(
+      target?.productType
+    ).includes("lens")
+      ? "lens"
+      : (
+          normalizeGateType(
+            target?.productType
+          ) || "product"
+        );
+
+  const scope =
+    resolved.length
+      ? (
+          unresolvedIds.length > 1
+            ? "group-with-exclusions"
+            : "single-with-exclusions"
+        )
+      : (
+          unresolvedIds.length > 1
+            ? "group"
+            : "single"
+        );
+
+  const exclusionText =
+    resolved.length
+      ? `Other ${noun}s visible in this photo are ALREADY IDENTIFIED and must be ignored and NOT reported: ${
+          resolved
+            .map(
+              item =>
+                item.identity ||
+                item.productId
+            )
+            .join("; ")
+        }. Identify ONLY the remaining unidentified ${noun}${
+          unresolvedIds.length > 1
+            ? "s"
+            : ""
+        }. Reply with its full exact model name, or exactly UNKNOWN if it cannot be reliably identified.`
+      : "";
+
+  return {
+    alreadyResolvedSameImageProducts:
+      resolved,
+    unresolvedSameTypeProductIds:
+      unresolvedIds,
+    visualIdentificationScope:
+      scope,
+    visualPromptExclusionText:
+      exclusionText
+  };
+}
+
 const LISTING_JSON_RETRY_KEY =
   "marketplaceMalformedJsonRetryByListingId";
 
@@ -10277,7 +10790,7 @@ const lensfunCandidateConstraints =
     : [];
 
 
-const lensFallbackTargets =
+const lensFallbackTargetCandidates =
   bestTargets
     .map(
       target => {
@@ -10340,6 +10853,150 @@ const lensFallbackTargets =
     )
     .filter(Boolean);
 
+
+/*
+  ============================================================
+  FINAL PAID-CALL GATE (see evaluateSerpApiPaidCallGate)
+  ============================================================
+  needsGoogleLens is a request, not a permission. Every target
+  must earn an affirmative reason before SerpApi is called.
+*/
+const gatePrimaryProducts =
+  Array.isArray(
+    initialIdentificationData
+      ?.primaryProducts
+  )
+    ? initialIdentificationData
+        .primaryProducts
+    : [];
+
+const gateSuppressedGalleryProducts =
+  Array.isArray(
+    initialIdentificationData
+      ?.suppressedGalleryProducts
+  )
+    ? initialIdentificationData
+        .suppressedGalleryProducts
+    : [];
+
+const gatePhantomSuppressedProducts =
+  [];
+
+const lensFallbackTargets =
+  lensFallbackTargetCandidates
+    .map(
+      target => {
+        const unresolvedEntry =
+          needsGoogleLens.find(
+            item =>
+              String(
+                item?.productId || ""
+              ) ===
+              String(
+                target?.productId || ""
+              )
+          );
+
+        const gateResult =
+          evaluateSerpApiPaidCallGate({
+            target,
+            unresolvedEntry,
+            primaryProducts:
+              gatePrimaryProducts,
+            needsGoogleLens,
+            suppressedGalleryProducts:
+              gateSuppressedGalleryProducts,
+            galleries,
+            lensfunCandidates:
+              target
+                ?.lensfunCandidates
+          });
+
+        if (!gateResult.allowed) {
+          if (
+            gateResult.suppressAsPhantom
+          ) {
+            gatePhantomSuppressedProducts
+              .push({
+                productId:
+                  String(
+                    target?.productId ||
+                    ""
+                  ).trim(),
+                productType:
+                  target?.productType ||
+                  null,
+                suppressedAsLikelyDuplicate:
+                  true,
+                reason:
+                  "No independent evidence of a distinct physical product (no identity fields, no unique OCR, never appears without an already-resolved lens) and the seller does not describe more lenses than are already resolved.",
+                possibleDuplicateOf:
+                  gateResult
+                    .resolvedProductsInSameImage
+                    .map(
+                      item =>
+                        item.productId
+                    ),
+                suppressedBy:
+                  "serpapi-gate"
+              });
+          }
+
+          return null;
+        }
+
+        return {
+          ...target,
+          serpApiReasonCode:
+            gateResult.reason,
+          ...buildVisualExclusionContext({
+            target,
+            gateResult
+          })
+        };
+      }
+    )
+    .filter(Boolean);
+
+/*
+  A likely-phantom detection rejected at the gate must not stay
+  in the product list (it would otherwise be priced as an
+  "Unknown Lens" default) and must not be resurrected by the
+  second reconcile pass's structural recovery.
+*/
+if (
+  gatePhantomSuppressedProducts.length
+) {
+  const gateSuppressedIds =
+    new Set(
+      gatePhantomSuppressedProducts.map(
+        item => item.productId
+      )
+    );
+
+  initialIdentificationData
+    .primaryProducts =
+      gatePrimaryProducts.filter(
+        product =>
+          !gateSuppressedIds.has(
+            String(
+              product?.productId ||
+              ""
+            ).trim()
+          )
+      );
+
+  initialIdentificationData
+    .suppressedGalleryProducts = [
+      ...gateSuppressedGalleryProducts,
+      ...gatePhantomSuppressedProducts
+    ];
+
+  console.warn(
+    "[SERPAPI GATE] Removed likely-phantom product(s) from the primary product list:",
+    gatePhantomSuppressedProducts
+  );
+}
 
 console.log(
   "[STEP 5A] Products requiring Google Lens:",
@@ -10902,6 +11559,19 @@ preDataForSeoPrimaryProducts:
   )
     ? initialIdentificationData
         .primaryProducts
+    : [],
+/*
+  Products rejected as likely duplicates/phantoms must stay
+  rejected: the server's structural recovery would otherwise
+  restore them from the gallery registry on this pass.
+*/
+suppressedGalleryProducts:
+  Array.isArray(
+    initialIdentificationData
+      ?.suppressedGalleryProducts
+  )
+    ? initialIdentificationData
+        .suppressedGalleryProducts
     : [],
 
     preDataForSeoLensfunCandidates:
