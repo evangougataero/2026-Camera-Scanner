@@ -1457,6 +1457,23 @@ const MAX_FACEBOOK_ASK_PRICE = 300;
   false:
     Scanner immediately messages the seller itself.
 */
+/*
+  ============================================================
+  AUTO MESSAGE MASTER SWITCH
+  ============================================================
+
+  true:
+    Verified hits are messaged (directly, or queued for the
+    separate outreach extension, depending on the mode below).
+
+  false:
+    Scanner never touches the seller-message UI and never
+    queues outreach. Hits are still analyzed and saved as
+    normal. Use this for shipping-only listings that have no
+    message box.
+*/
+const AUTO_MESSAGE_ENABLED = false;
+
 const USE_SEPARATE_OUTREACH_EXTENSION = false;
 
 /*
@@ -3559,6 +3576,12 @@ if (restoredDefaultMessage) {
 async function messageMarketplaceSellerForVerifiedHit(
   result
 ) {
+  if (!AUTO_MESSAGE_ENABLED) {
+    console.log("[AUTO MESSAGE] Skipped: AUTO_MESSAGE_ENABLED is false.");
+
+    return { sent: false, reason: "Auto message disabled." };
+  }
+
   console.log(
     "[AUTO MESSAGE] Starting seller-message check.",
     {
@@ -3968,6 +3991,12 @@ return {
 async function queueMarketplaceSellerForVerifiedHit(
   result
 ) {
+  if (!AUTO_MESSAGE_ENABLED) {
+    console.log("[OUTREACH QUEUE] Skipped: AUTO_MESSAGE_ENABLED is false.");
+
+    return { queued: false, reason: "Auto message disabled." };
+  }
+
   console.log(
     "[OUTREACH QUEUE] Starting hit queue check.",
     {
@@ -6132,7 +6161,16 @@ if (
         "Analysis completed."
     };
 
-  if (USE_SEPARATE_OUTREACH_EXTENSION) {
+  if (!AUTO_MESSAGE_ENABLED) {
+    /*
+      MODE 0:
+      Auto message is switched off. Do not message the seller,
+      do not queue outreach, and do not take the outreach lock.
+    */
+    console.log(
+      "[AUTO MESSAGE] Disabled (AUTO_MESSAGE_ENABLED = false). Skipping seller outreach."
+    );
+  } else if (USE_SEPARATE_OUTREACH_EXTENSION) {
     /*
       MODE 1:
       Do NOT message seller here.
