@@ -16904,6 +16904,7 @@ Comp matching rules:
 - Count a candidate as a related wrong model only when it is a different but closely related product that is polluting the target search.
 - Accessories, hoods, caps, manuals, boxes, adapters, and unrelated products are invalid, but they do not count as related wrong models.
 - Damaged or parts-only listings do not count as related wrong models.
+- Listings whose title says "like in box", "LIKE IN BOX", "LIB", or similar wording (e.g. "like new in box") are invalid and must be omitted from validIndexes. They do not count as related wrong models.
 - relatedWrongModelCount must count only closely related but commercially different models.
 - validExactModelCount must equal the number of listings retained in validIndexes.
 
