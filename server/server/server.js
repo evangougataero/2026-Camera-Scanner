@@ -1690,6 +1690,41 @@ function expandLensfunCandidateVariants(
   );
 }
 
+/*
+  Legacy manual-focus mounts where a Lensfun entry for a DIFFERENT
+  mount family must never be accepted as a stand-in.
+*/
+function isLegacyManualMountWithoutLensfunMatch(
+  explicitMount
+) {
+  const key =
+    String(explicitMount || "")
+      .toLowerCase()
+      .replace(/\b(mount|bayonet)\b/g, " ")
+      .replace(
+        /\b(minolta|olympus|pentax|yashica|contax|exakta|konica|canon)\b/g,
+        " "
+      )
+      .replace(/[^a-z0-9/]+/g, "");
+
+  return new Set([
+    "md",
+    "mc",
+    "md/mc",
+    "mc/md",
+    "sr",
+    "m42",
+    "om",
+    "fd",
+    "fl",
+    "c/y",
+    "exakta",
+    "t",
+    "t2",
+    "c"
+  ]).has(key);
+}
+
 function findLensfunCandidates(
   evidence
 ) {
@@ -2013,6 +2048,24 @@ if (modelCodes.length) {
     if (mountFiltered.length) {
       candidates =
         mountFiltered;
+    } else if (
+      isLegacyManualMountWithoutLensfunMatch(
+        explicitMount
+      )
+    ) {
+      /*
+        The lens is explicitly a legacy manual-focus mount (e.g.
+        Minolta MD) and Lensfun has nothing for that mount. Do NOT
+        fall back to same-focal-length lenses from a different
+        mount family (e.g. "Minolta AF 70-210mm f/4 Macro") - that
+        is a different physical product with a different value.
+      */
+      console.log(
+        "[LENSFUN] Explicit legacy mount has no Lensfun entries; returning no candidates instead of cross-mount matches:",
+        explicitMount
+      );
+
+      candidates = [];
     }
   }
 
@@ -2141,10 +2194,30 @@ if (modelCodes.length) {
 function normalizeLensAnswerForExactMatch(
   value
 ) {
+  /*
+    Canonicalize notation differences that made a correct visual
+    answer fail to match its own Lensfun candidate:
+      "1:1.4"  / "f/1.4" / "f 1.4" / "F1.4"   -> "f1.4"
+      "1:3.5-5.6"                              -> "f3.5-5.6"
+      a bare "Lens" word ("Nikon Lens Series E") is ignored.
+    Both sides go through this function, so matching is still an
+    exact, unique comparison - just notation-insensitive.
+  */
   return String(
     value || ""
   )
     .toLowerCase()
+    .replace(/[–—]/g, "-")
+    .replace(
+      /\b1\s*:\s*(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?/g,
+      (match, low, high) =>
+        `f${low}${high ? `-${high}` : ""}`
+    )
+    .replace(
+      /\bf\s*\/?\s*(\d+(?:\.\d+)?)/g,
+      "f$1"
+    )
+    .replace(/\blens\b/g, " ")
     .replace(
       /[^a-z0-9]+/g,
       ""
@@ -11674,10 +11747,15 @@ for (
   );
 }
 
-      const response =
+      const runGalleryModelCall = async attempt =>
   await createLoggedOpenAiResponse({
     step:
-      `Step 2 gallery analysis ${groupIndex + 1}`,
+      `Step 2 gallery analysis ${groupIndex + 1}` +
+      (
+        attempt > 1
+          ? ` (retry ${attempt - 1})`
+          : ""
+      ),
 
     request: {
       model:
@@ -11723,6 +11801,8 @@ content: [
     }
   });
 
+      const response =
+        await runGalleryModelCall(1);
 
         const rawText =
           String(
@@ -11740,19 +11820,53 @@ content: [
         );
 
 
-        let parsed;
-
-
-        try {
-          parsed =
-            JSON.parse(
-              rawText
-            );
-
-        } catch (error) {
-          console.error(
-            `[STEP 2] Invalid JSON from gallery ${groupIndex + 1}:`,
+        /*
+          Lenient parse first (tolerates trailing garbage or a
+          missing closing brace). If that still fails, retry the
+          model call once before giving up on the whole listing.
+        */
+        let parsed =
+          parseGalleryAnalysisJson(
             rawText
+          );
+
+        let finalRawText = rawText;
+
+        if (!parsed) {
+          console.warn(
+            `[STEP 2] Gallery ${groupIndex + 1} returned unusable JSON. Retrying once:`,
+            rawText
+          );
+
+          const retryResponse =
+            await runGalleryModelCall(2);
+
+          const retryRawText =
+            String(
+              retryResponse.output_text ||
+              ""
+            ).trim();
+
+          console.log(
+            `[STEP 2] Raw gallery ${groupIndex + 1} retry response:`
+          );
+
+          console.log(
+            retryRawText
+          );
+
+          finalRawText = retryRawText;
+
+          parsed =
+            parseGalleryAnalysisJson(
+              retryRawText
+            );
+        }
+
+        if (!parsed) {
+          console.error(
+            `[STEP 2] Invalid JSON from gallery ${groupIndex + 1} after retry:`,
+            finalRawText
           );
 
 
@@ -11762,7 +11876,8 @@ content: [
               error:
                 `OpenAI returned invalid Step-2 JSON for gallery ${groupIndex + 1}.`,
 
-              rawText
+              rawText:
+                finalRawText
             });
         }
 
@@ -11826,6 +11941,330 @@ galleryResults.push({
     }
   }
 );
+
+/*
+  ============================================================
+  LENIENT MODEL-JSON PARSING
+
+  The model occasionally appends stray characters after an
+  otherwise valid JSON object (e.g. `{...} מס`), or drops the
+  final closing brace. A strict JSON.parse() then failed the
+  whole listing. This tries, in order:
+    1. strict parse (after trimming code fences);
+    2. the first brace-balanced object in the text;
+    3. cut after the last closing bracket and close whatever
+       containers are still open.
+  Returns null when nothing usable can be recovered.
+  ============================================================
+*/
+function extractFirstJsonObject(rawText) {
+  const source =
+    String(rawText || "")
+      .replace(/^\s*```(?:json)?/i, "")
+      .replace(/```\s*$/, "")
+      .trim();
+
+  if (!source) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(source);
+  } catch (error) {
+    // fall through to recovery
+  }
+
+  const start = source.indexOf("{");
+
+  if (start === -1) {
+    return null;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        try {
+          return JSON.parse(
+            source.slice(start, i + 1)
+          );
+        } catch (error) {
+          break;
+        }
+      }
+    }
+  }
+
+  const lastClose =
+    Math.max(
+      source.lastIndexOf("}"),
+      source.lastIndexOf("]")
+    );
+
+  if (lastClose <= start) {
+    return null;
+  }
+
+  let candidate =
+    source
+      .slice(start, lastClose + 1)
+      .replace(/,\s*$/, "");
+
+  const stack = [];
+  inString = false;
+  escaped = false;
+
+  for (const ch of candidate) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{" || ch === "[") {
+      stack.push(ch);
+    } else if (ch === "}" || ch === "]") {
+      stack.pop();
+    }
+  }
+
+  if (inString) {
+    return null;
+  }
+
+  candidate +=
+    stack
+      .reverse()
+      .map(opener => opener === "{" ? "}" : "]")
+      .join("");
+
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    return null;
+  }
+}
+
+function parseGalleryAnalysisJson(rawText) {
+  const parsed =
+    extractFirstJsonObject(rawText);
+
+  if (
+    parsed &&
+    Array.isArray(parsed.products) &&
+    Array.isArray(parsed.images)
+  ) {
+    return parsed;
+  }
+
+  return null;
+}
+
+/*
+  ============================================================
+  NON-SELLABLE "PHANTOM LENS" FILTER
+
+  Gallery analysis and reconciliation sometimes invent a lens
+  product that is not a separately sellable lens:
+    - the built-in lens of a camcorder / compact camera
+      (e.g. "Carl Zeiss Vario-Tessar" on a Sony Handycam);
+    - lens attachments and adapters (microscope adapter,
+      0.43x wide / 2.2x tele converters, extension tubes).
+  A fake lens with no identity then blocks or pollutes an
+  otherwise valid body listing. Products identified here are
+  removed and reported as suppressed so structural recovery
+  does not resurrect them and later passes keep them out.
+
+  Deliberately conservative: a real detachable lens has a mount
+  or a complete focal length, and is never removed by the
+  accessory/built-in rules.
+  ============================================================
+*/
+const FIXED_LENS_CAMERA_PATTERN =
+  /\b(handycam|camcorder|hdr-?[a-z0-9]+|dcr-?[a-z0-9]+|hdc-?[a-z0-9]+|cyber-?\s?shot|dsc-?[a-z0-9]+|coolpix|powershot|ixus|elph|finepix|optio|exilim|easyshare|mavica)\b/i;
+
+const LENS_ACCESSORY_PATTERN =
+  /\b(microscope|adapter|adaptor|converter|teleconverter|tele-?converter|extension tube|macro tube|step-?up ring|close-?up (?:lens|filter)|diopter)\b|\b0?\.\d+x\b|\b\d(?:\.\d+)?x\s*(?:af\s*)?(?:telephoto|tele|wide)/i;
+
+const BUILT_IN_OPTICS_PATTERN =
+  /\b(vario-?(?:tessar|sonnar|elmar)|carl zeiss|built-?in lens)\b/i;
+
+function isMissingLensField(value) {
+  const text =
+    String(value ?? "")
+      .trim();
+
+  return (
+    !text ||
+    /^(unknown|null|none|n\/a)$/i.test(text)
+  );
+}
+
+function identifyNonSellableLensProducts({
+  primaryProducts,
+  googleLensResults
+}) {
+  const products =
+    Array.isArray(primaryProducts)
+      ? primaryProducts
+      : [];
+
+  const isLens =
+    product =>
+      String(
+        product?.productType || ""
+      )
+        .trim()
+        .toLowerCase() === "camera lens";
+
+  const lenses =
+    products.filter(isLens);
+
+  if (!lenses.length) {
+    return [];
+  }
+
+  const cameras =
+    products.filter(
+      product => !isLens(product)
+    );
+
+  const allCamerasFixedLens =
+    cameras.length > 0 &&
+    cameras.every(
+      camera =>
+        FIXED_LENS_CAMERA_PATTERN.test(
+          `${camera?.brand || ""} ${camera?.model || ""}`
+        )
+    );
+
+  const removals = [];
+
+  for (const lens of lenses) {
+    const productId =
+      String(
+        lens?.productId || ""
+      ).trim();
+
+    const identity =
+      lens?.lensIdentity &&
+      typeof lens.lensIdentity === "object"
+        ? lens.lensIdentity
+        : {};
+
+    const visualText =
+      (
+        Array.isArray(googleLensResults)
+          ? googleLensResults
+          : []
+      )
+        .filter(
+          result =>
+            String(
+              result?.targetProductId || ""
+            ).trim() === productId
+        )
+        .map(
+          result =>
+            `${result?.identifiedModel || ""} ${result?.aiOverviewText || ""}`
+        )
+        .join(" ");
+
+    const evidenceText =
+      [
+        ...(
+          Array.isArray(lens?.extracted_evidence)
+            ? lens.extracted_evidence
+            : []
+        ),
+        identity.brand,
+        identity.mountSeries,
+        visualText
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+    const hasFocal =
+      /\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*mm/i
+        .test(
+          String(identity.focalLength || "")
+        );
+
+    const hasAperture =
+      !isMissingLensField(
+        identity.maxAperture
+      );
+
+    const hasMount =
+      !isMissingLensField(
+        identity.mountSeries
+      );
+
+    let reason = null;
+
+    if (allCamerasFixedLens && !hasMount) {
+      reason =
+        "built-in lens of a fixed-lens camera/camcorder, not a separately sellable lens";
+    } else if (
+      !hasFocal &&
+      LENS_ACCESSORY_PATTERN.test(evidenceText)
+    ) {
+      reason =
+        "lens attachment/adapter accessory, not a primary sellable lens";
+    } else if (
+      cameras.length > 0 &&
+      !hasFocal &&
+      !hasAperture &&
+      !hasMount &&
+      BUILT_IN_OPTICS_PATTERN.test(evidenceText)
+    ) {
+      reason =
+        "built-in lens optics markings with no detachable-lens identity";
+    }
+
+    if (reason) {
+      removals.push({
+        productId,
+        productType: "camera lens",
+        suppressedAsNonSellableLens: true,
+        reason
+      });
+    }
+  }
+
+  return removals;
+}
 
 const STEP5_RECONCILIATION_SCHEMA = {
   type: "object",
@@ -12883,9 +13322,15 @@ if (isPostDataForSeoPass) {
 
   try {
     parsed =
-      JSON.parse(
+      extractFirstJsonObject(
         rawText
       );
+
+    if (!parsed) {
+      throw new Error(
+        "Unrecoverable Step-5 JSON."
+      );
+    }
 
   } catch (error) {
     return res
@@ -13167,6 +13612,38 @@ const phantomValidation =
 
 const suppressedGalleryProducts =
   phantomValidation.suppressed;
+
+/*
+  Remove built-in lenses / lens attachments that were mistaken
+  for separately sellable lens products. They join the suppressed
+  list so recovery will not bring them back and the caller carries
+  them into later passes.
+*/
+const nonSellableLensRemovals =
+  identifyNonSellableLensProducts({
+    primaryProducts:
+      parsedPrimaryProducts,
+    googleLensResults
+  });
+
+for (const removal of nonSellableLensRemovals) {
+  console.warn(
+    "[NON-SELLABLE LENS] Removing phantom lens product:",
+    removal
+  );
+
+  if (
+    !suppressedGalleryProducts.some(
+      entry =>
+        entry?.productId ===
+        removal.productId
+    )
+  ) {
+    suppressedGalleryProducts.push(
+      removal
+    );
+  }
+}
 
 const suppressedGalleryProductIds =
   new Set(

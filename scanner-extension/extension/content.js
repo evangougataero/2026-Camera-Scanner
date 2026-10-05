@@ -7943,6 +7943,162 @@ function parsePriceValue(value) {
   back to the old whole-page DOM scrape.
   ============================================================
 */
+/*
+  ============================================================
+  STRIP EXTENSION HUD + MARKETPLACE SIDEBAR FROM SCREENSHOT OCR
+
+  Every listing screenshot OCR starts with the extension's own
+  status panel ("Auto Scan", "Search term", "Term switches", the
+  current search term and counters) followed by the Facebook
+  Marketplace sidebar (Buying / Selling / Location / Categories
+  ... Free Stuff). None of that is seller-written evidence, and
+  the search term in particular (e.g. "nikon") was being picked
+  up as a product brand.
+
+  Strategy:
+    1. If the text opens with the HUD header, drop everything up
+       to and including the sidebar's last item ("Free Stuff").
+       Fallbacks: the sidebar's first item ("Buying"), then the
+       "Term switches" label plus the value lines after it.
+    2. Drop known stray chrome lines that appear lower down.
+    3. If stripping would leave almost nothing, return the
+       original text unchanged.
+  ============================================================
+*/
+function stripMarketplaceHudFromOcr(rawText) {
+  const original = String(rawText || "");
+
+  if (!original.trim()) {
+    return original;
+  }
+
+  const lines = original.split(/\r?\n/);
+
+  const norm = line =>
+    String(line || "")
+      .trim()
+      .toLowerCase();
+
+  const head = lines
+    .slice(0, 12)
+    .map(norm);
+
+  const hasHudHeader =
+    head.includes("auto scan") ||
+    head.includes("analyzing listing") ||
+    head.includes("term switches") ||
+    head.includes("listings clicked");
+
+  let startIndex = 0;
+
+  if (hasHudHeader) {
+    const searchLimit =
+      Math.min(lines.length, 80);
+
+    const indexWithin =
+      pattern => {
+        for (let i = 0; i < searchLimit; i += 1) {
+          if (pattern.test(norm(lines[i]))) {
+            return i;
+          }
+        }
+
+        return -1;
+      };
+
+    const freeStuffIndex =
+      indexWithin(/^free stuff$/);
+
+    const buyingIndex =
+      indexWithin(/^buying$/);
+
+    const termSwitchesIndex =
+      indexWithin(/^term switches$/);
+
+    if (freeStuffIndex !== -1) {
+      startIndex = freeStuffIndex + 1;
+    } else if (buyingIndex !== -1) {
+      startIndex = buyingIndex + 1;
+    } else if (termSwitchesIndex !== -1) {
+      startIndex = termSwitchesIndex + 1;
+
+      /*
+        Skip the HUD value lines that follow the labels
+        (elapsed time, counters, remaining time, search term).
+      */
+      let skipped = 0;
+
+      while (
+        startIndex < lines.length &&
+        skipped < 7 &&
+        /^(live|\d+|\d+h \d+m \d+s|\d+m \d+s|[0-9o]+m \d+s?|[a-z0-9_-]{1,15})$/i
+          .test(
+            String(lines[startIndex] || "").trim()
+          ) &&
+        String(lines[startIndex] || "").trim().length <= 30
+      ) {
+        startIndex += 1;
+        skipped += 1;
+      }
+    }
+  }
+
+  const strayChrome =
+    new Set([
+      "auto scan",
+      "analyzing listing",
+      "session listings",
+      "scam listings",
+      "saved deals",
+      "library saving: on",
+      "library saving: off",
+      "stop scan",
+      "random keyword scan",
+      "collecting listing...",
+      "collecting listing",
+      "today's picks",
+      "just listed"
+    ]);
+
+  const cleaned =
+    lines
+      .slice(startIndex)
+      .filter(
+        line => {
+          const value = norm(line);
+
+          if (!value) {
+            return true;
+          }
+
+          if (strayChrome.has(value)) {
+            return false;
+          }
+
+          /*
+            "Seattle 500 mi" location chip and
+            "Seattle, Washington. Within 500 mi" sidebar line.
+          */
+          if (
+            /^[a-z .,'-]+ \d+ mi$/.test(value) ||
+            /^[a-z .,'-]+\. within \d+ mi$/.test(value)
+          ) {
+            return false;
+          }
+
+          return true;
+        }
+      )
+      .join("\n")
+      .trim();
+
+  if (cleaned.length < 40) {
+    return original;
+  }
+
+  return cleaned;
+}
+
 function extractFacebookAskingPriceFromOcr(ocrText, title) {
   const lines =
     String(ocrText || "")
@@ -10260,7 +10416,7 @@ if (
 }
 
 
-const listingScreenshotOcr =
+const listingScreenshotOcrRaw =
   String(
     listingOcrData
       ?.results
@@ -10275,7 +10431,7 @@ console.log(
 );
 
 console.log(
-  listingScreenshotOcr
+  listingScreenshotOcrRaw
 );
 
 /*
@@ -10287,7 +10443,7 @@ console.log(
 */
 const ocrAnchoredPrice =
   extractFacebookAskingPriceFromOcr(
-    listingScreenshotOcr,
+    listingScreenshotOcrRaw,
     title
   );
 
@@ -10308,7 +10464,7 @@ if (ocrAnchoredPrice != null) {
     it rather than evaluate the deal against a wrong ask.
   */
   const ocrAmounts =
-    collectOcrDollarAmounts(listingScreenshotOcr);
+    collectOcrDollarAmounts(listingScreenshotOcrRaw);
 
   if (
     ocrAmounts.size > 0 &&
@@ -10337,6 +10493,27 @@ if (ocrAnchoredPrice != null) {
   Google Cloud Vision OCR is now the sole source
   of listing description/text evidence.
 */
+/*
+  The screenshot also captures the extension's own HUD panel
+  (Auto Scan / Search term: nikon / Listings clicked ...) and the
+  Facebook Marketplace sidebar. Strip that before the text is
+  treated as seller evidence, otherwise the scan's search term
+  (e.g. "nikon") leaks into brand identification. The RAW text
+  above is still used for price anchoring only.
+*/
+const listingScreenshotOcr =
+  stripMarketplaceHudFromOcr(
+    listingScreenshotOcrRaw
+  );
+
+console.log(
+  "[STEP 1A] OCR text after HUD/sidebar stripping:"
+);
+
+console.log(
+  listingScreenshotOcr
+);
+
 description =
   listingScreenshotOcr;
 
@@ -11195,8 +11372,13 @@ if (
     and the post-SerpApi gate, are for.
     ============================================================
   */
-  const offBrandPrimaryItemsBeforeSerpApi =
-    primaryProductsBeforeSerpApi.filter(
+  /*
+    UPDATED RULE: the listing only needs AT LEAST ONE primary
+    item resolved to Nikon or Canon. Other primary items may be
+    any brand (or unresolved) and are still priced.
+  */
+  const hasNikonOrCanonBeforeSerpApi =
+    primaryProductsBeforeSerpApi.some(
       product => {
         const brand =
           String(
@@ -11205,16 +11387,22 @@ if (
             .trim()
             .toLowerCase();
 
-        if (!brand) {
-          return false;
-        }
-
         return (
-          brand !== "nikon" &&
-          brand !== "canon"
+          brand === "nikon" ||
+          brand === "canon"
         );
       }
     );
+
+  const offBrandPrimaryItemsBeforeSerpApi =
+    hasNikonOrCanonBeforeSerpApi
+      ? []
+      : primaryProductsBeforeSerpApi.filter(
+          product =>
+            String(
+              product?.brand || ""
+            ).trim()
+        );
 
   if (offBrandPrimaryItemsBeforeSerpApi.length > 0) {
     const offBrandPassResultBeforeSerpApi = {
@@ -11222,7 +11410,7 @@ if (
         "Pass",
 
       reason:
-        `Immediate skip: at least one primary item is a ${
+        `Immediate skip: no primary item is Nikon or Canon (found ${
           offBrandPrimaryItemsBeforeSerpApi
             .map(
               product =>
@@ -11230,7 +11418,7 @@ if (
                 "unknown"
             )
             .join(", ")
-        } product. Only Nikon or Canon listings are analyzed. Skipping before the SerpApi identification call.`,
+        }). At least one Nikon or Canon primary item is required. Skipping before the SerpApi identification call.`,
 
       facebookPrice,
 
@@ -12103,8 +12291,14 @@ return;
       ============================================================
     */
 
-    const offBrandPrimaryItems =
-      primaryItems.filter(
+    /*
+      UPDATED RULE: only ONE primary item needs to be Nikon or
+      Canon. Other items (any brand, or unresolved) continue on
+      to database / eBay pricing. Skip only when NO primary item
+      is Nikon or Canon.
+    */
+    const hasNikonOrCanonPrimaryItem =
+      primaryItems.some(
         item => {
           const brand =
             String(
@@ -12113,32 +12307,40 @@ return;
               .trim()
               .toLowerCase();
 
-          if (!brand) {
-            return false;
-          }
-
           return (
-            brand !== "nikon" &&
-            brand !== "canon"
+            brand === "nikon" ||
+            brand === "canon"
           );
         }
       );
 
-    if (offBrandPrimaryItems.length > 0) {
+    const offBrandPrimaryItems =
+      primaryItems.filter(
+        item =>
+          String(
+            item?.brand || ""
+          ).trim()
+      );
+
+    if (
+      primaryItems.length > 0 &&
+      !hasNikonOrCanonPrimaryItem
+    ) {
       const offBrandPassResult = {
         recommendation:
           "Pass",
 
         reason:
-          `Immediate skip: at least one primary item is a ${
-            offBrandPrimaryItems
-              .map(
-                item =>
-                  item?.brand ||
-                  "unknown"
-              )
-              .join(", ")
-          } product. Only Nikon or Canon listings are analyzed.`,
+          `Immediate skip: no primary item is Nikon or Canon (found ${
+            offBrandPrimaryItems.length
+              ? offBrandPrimaryItems
+                  .map(
+                    item =>
+                      item?.brand
+                  )
+                  .join(", ")
+              : "no resolved brand"
+          }). At least one Nikon or Canon primary item is required.`,
 
         facebookPrice,
 
@@ -12171,7 +12373,7 @@ return;
       };
 
       console.log(
-        "[BRAND GATE] Skipping listing - off-brand primary item(s) detected:",
+        "[BRAND GATE] Skipping listing - no Nikon/Canon primary item:",
         offBrandPrimaryItems.map(
           item => ({
             productId:
