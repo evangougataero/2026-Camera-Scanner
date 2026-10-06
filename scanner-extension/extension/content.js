@@ -7945,6 +7945,77 @@ function parsePriceValue(value) {
 */
 /*
   ============================================================
+  CANON POWERSHOT SKIP
+
+  Canon PowerShot point-and-shoots are not a category we buy.
+  Detected from the listing title (before any API spend) and
+  again from the resolved primary products (before the SerpApi
+  call and before pricing). Any detection skips the listing.
+  ============================================================
+*/
+function isCanonPowerShotText(text) {
+  return /power\s*-?\s*shot/i.test(
+    String(text || "")
+  );
+}
+
+function findCanonPowerShotPrimaryItems(items) {
+  return (
+    Array.isArray(items)
+      ? items
+      : []
+  ).filter(
+    item =>
+      isCanonPowerShotText(
+        `${item?.brand || ""} ${item?.model || ""} ${item?.nonLensIdentity?.modelName || ""}`
+      )
+  );
+}
+
+function buildCanonPowerShotPassResult({
+  facebookPrice,
+  items,
+  detectedFrom
+}) {
+  return {
+    recommendation:
+      "Pass",
+
+    reason:
+      `Immediate skip: Canon PowerShot detected (${detectedFrom}). PowerShot listings are not analyzed.`,
+
+    facebookPrice,
+
+    totalExpectedSalePrice:
+      null,
+
+    profitAtAsk:
+      null,
+
+    profitAt35:
+      null,
+
+    maxBuyPrice:
+      null,
+
+    validSoldCount:
+      0,
+
+    medianSoldPrice:
+      null,
+
+    items:
+      Array.isArray(items)
+        ? items
+        : [],
+
+    ignoredItems:
+      []
+  };
+}
+
+/*
+  ============================================================
   STRIP EXTENSION HUD + MARKETPLACE SIDEBAR FROM SCREENSHOT OCR
 
   Every listing screenshot OCR starts with the extension's own
@@ -10526,6 +10597,35 @@ const listingText =
   listingScreenshotOcr;
 
 
+/*
+  Cheapest possible skip: the listing title already says
+  PowerShot, so don't spend the facts / gallery / OCR calls.
+*/
+if (isCanonPowerShotText(title)) {
+  const titlePowerShotPassResult =
+    buildCanonPowerShotPassResult({
+      facebookPrice,
+      items: [],
+      detectedFrom:
+        `title: "${title}"`
+    });
+
+  console.log(
+    "[POWERSHOT GATE] Skipping listing from title before any analysis:",
+    title
+  );
+
+  showLotCompPanel(
+    titlePowerShotPassResult
+  );
+
+  await markMarketplaceAutoAnalysisComplete(
+    titlePowerShotPassResult
+  );
+
+  return;
+}
+
 button.innerText =
   "Analyzing listing facts...";
 
@@ -11377,6 +11477,53 @@ if (
     item resolved to Nikon or Canon. Other primary items may be
     any brand (or unresolved) and are still priced.
   */
+  const powerShotItemsBeforeSerpApi =
+    findCanonPowerShotPrimaryItems(
+      primaryProductsBeforeSerpApi
+    );
+
+  if (powerShotItemsBeforeSerpApi.length > 0) {
+    const powerShotPassResultBeforeSerpApi =
+      buildCanonPowerShotPassResult({
+        facebookPrice,
+        items:
+          primaryProductsBeforeSerpApi,
+        detectedFrom:
+          powerShotItemsBeforeSerpApi
+            .map(
+              item =>
+                `${item?.brand || ""} ${item?.model || ""}`.trim()
+            )
+            .join(", ")
+      });
+
+    console.log(
+      "[POWERSHOT GATE] Skipping listing before SerpApi call:",
+      powerShotItemsBeforeSerpApi.map(
+        item => ({
+          productId:
+            item?.productId,
+
+          brand:
+            item?.brand,
+
+          model:
+            item?.model
+        })
+      )
+    );
+
+    showLotCompPanel(
+      powerShotPassResultBeforeSerpApi
+    );
+
+    await markMarketplaceAutoAnalysisComplete(
+      powerShotPassResultBeforeSerpApi
+    );
+
+    return;
+  }
+
   const hasNikonOrCanonBeforeSerpApi =
     primaryProductsBeforeSerpApi.some(
       product => {
@@ -12297,6 +12444,53 @@ return;
       to database / eBay pricing. Skip only when NO primary item
       is Nikon or Canon.
     */
+    const powerShotPrimaryItems =
+      findCanonPowerShotPrimaryItems(
+        primaryItems
+      );
+
+    if (powerShotPrimaryItems.length > 0) {
+      const powerShotPassResult =
+        buildCanonPowerShotPassResult({
+          facebookPrice,
+          items:
+            primaryItems,
+          detectedFrom:
+            powerShotPrimaryItems
+              .map(
+                item =>
+                  `${item?.brand || ""} ${item?.model || ""}`.trim()
+              )
+              .join(", ")
+        });
+
+      console.log(
+        "[POWERSHOT GATE] Skipping listing - Canon PowerShot primary item:",
+        powerShotPrimaryItems.map(
+          item => ({
+            productId:
+              item?.productId,
+
+            brand:
+              item?.brand,
+
+            model:
+              item?.model
+          })
+        )
+      );
+
+      showLotCompPanel(
+        powerShotPassResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        powerShotPassResult
+      );
+
+      return;
+    }
+
     const hasNikonOrCanonPrimaryItem =
       primaryItems.some(
         item => {
