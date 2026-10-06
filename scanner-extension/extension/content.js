@@ -10671,6 +10671,75 @@ if (!factsResponse.ok) {
 
 
     /*
+      ============================================================
+      DAMAGE GATE
+
+      The facts prompt decides whether the seller describes
+      SIGNIFICANT damage (broken, cracked, won't turn on, error,
+      AF/aperture/shutter fault, dead buttons, water damage ...)
+      versus minor cosmetic wear (small scratches, scuffs, paint
+      wear, dust, worn rubber), which is allowed. Skip before the
+      gallery / OCR / SerpApi / eBay spend.
+      ============================================================
+    */
+    if (explicitFacts?.skipDueToDamage === true) {
+      const damagePassResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          `Immediate skip: significant damage stated in listing${
+            explicitFacts?.damageReason
+              ? ` (${explicitFacts.damageReason})`
+              : ""
+          }.`,
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          null,
+
+        profitAtAsk:
+          null,
+
+        profitAt35:
+          null,
+
+        maxBuyPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        medianSoldPrice:
+          null,
+
+        items:
+          [],
+
+        ignoredItems:
+          []
+      };
+
+      console.log(
+        "[DAMAGE GATE] Skipping listing - significant damage:",
+        explicitFacts?.damageReason ||
+          "(no reason given)"
+      );
+
+      showLotCompPanel(
+        damagePassResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        damagePassResult
+      );
+
+      return;
+    }
+
+
+    /*
       If you later add condition to the new
       /analyze-listing-facts endpoint, this automatically uses it.
 

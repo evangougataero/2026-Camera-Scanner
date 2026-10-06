@@ -11054,7 +11054,9 @@ Return exactly one JSON object in this format:
 {
   "explicitlyIncluded": [],
   "explicitlyExcluded": [],
-  "listingNotes": []
+  "listingNotes": [],
+  "skipDueToDamage": false,
+  "damageReason": ""
 }
 
 explicitlyIncluded:
@@ -11072,6 +11074,38 @@ Only add something to explicitlyExcluded when the seller explicitly says it is n
 listingNotes:
 - Other explicit seller-written facts that may later help determine listing contents.
 - Keep these concise.
+
+skipDueToDamage / damageReason:
+- skipDueToDamage is a boolean. Set it to true ONLY when the seller-written text states SIGNIFICANT damage or a functional fault on the main camera body or on a lens/optic that is being sold. Otherwise false.
+- damageReason: when skipDueToDamage is true, a short quote or paraphrase of the damage the seller stated (max 15 words). Otherwise an empty string.
+- Base this ONLY on what the seller wrote. Never infer damage from silence, from the price, or from the product type.
+
+SIGNIFICANT damage / faults (set skipDueToDamage to true):
+- broken, cracked, shattered, snapped, or bent parts (body, screen, lens glass, mount);
+- will not turn on / does not power on / dead / no power;
+- an error message, or an error code the camera shows;
+- autofocus not working / AF motor failure / focus problems;
+- aperture stuck, sticky, or not working;
+- shutter problems (stuck, will not fire, wrong speeds, sticking, noise/failing);
+- buttons, dials, or the screen/viewfinder not working;
+- water damage, liquid damage, or fell in water;
+- lens fungus/mold, separated elements, or heavy haze;
+- sold explicitly "for parts", "for repair", or "not working".
+
+MINOR / cosmetic wear (these do NOT count; keep skipDueToDamage false):
+- small scratches, scuffs, or scrapes;
+- paint or brassing wear;
+- minor dust (including dust inside a lens that does not affect photos);
+- worn or peeling rubber/grip/eyecup;
+- tiny cosmetic marks, dings, or normal signs of use;
+- damage to a minor accessory only (a scuffed strap, a cracked lens cap, a worn bag).
+
+Important judgment rules:
+- Negated or reassuring statements are NOT damage: "no damage", "not broken", "no cracks", "works perfectly", "fully functional", "no issues".
+- "Untested" or "not sure if it works" alone is NOT significant damage. Only flag it if the seller also states a specific fault.
+- If the seller says a significant fault was FIXED or does not affect use (e.g. "lens cap gets sticky but does not affect use"), treat it as minor.
+- If a mention is ambiguous, or you cannot tell whether it is significant, return false.
+- Also mention any damage or fault (significant or minor) concisely in listingNotes.
 
 Additional rules:
 - Every element in explicitlyIncluded, explicitlyExcluded, and listingNotes MUST be a plain JSON string.
@@ -11236,8 +11270,29 @@ const result = {
               )
           )
           .filter(Boolean)
-      : []
+      : [],
+
+
+  /*
+    Significant-damage flag decided by the model per the prompt
+    rules above. Only a real boolean true (or the string "true")
+    counts; anything else is treated as "do not skip".
+  */
+  skipDueToDamage:
+    parsed.skipDueToDamage === true ||
+    String(
+      parsed.skipDueToDamage
+    ).trim().toLowerCase() === "true",
+
+  damageReason:
+    String(
+      parsed.damageReason || ""
+    ).trim()
 };
+
+if (!result.skipDueToDamage) {
+  result.damageReason = "";
+}
 
 
 
