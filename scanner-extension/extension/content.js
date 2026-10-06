@@ -3023,6 +3023,98 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/*
+  ============================================================
+  BUY NOW BUTTON CHECK (shipping mode)
+
+  When AUTO_MESSAGE_ENABLED is false the scanner is in
+  shipping-only mode: a listing is only actionable if it has a
+  "Buy now" checkout button. Listings that only offer Message /
+  Make an offer are skipped before any analysis spend.
+
+  The Marketplace buttons are generated, obfuscated-class
+  elements, so detection is by visible label, not by class:
+  a visible <button>, [role="button"], link or <span> whose text
+  (or aria-label) is exactly "Buy now" - the button label itself
+  is a bare <span class="x1lliihq ...">Buy now</span>.
+  ============================================================
+*/
+function hasMarketplaceBuyNowButton() {
+  const candidates =
+    document.querySelectorAll(
+      'button, [role="button"], a[role="button"], a, [aria-label], span'
+    );
+
+  for (const element of candidates) {
+    const label =
+      String(
+        element.getAttribute("aria-label") ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const text =
+      String(
+        element.innerText ||
+        element.textContent ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
+
+    if (
+      label !== "buy now" &&
+      text !== "buy now"
+    ) {
+      continue;
+    }
+
+    if (isVisibleMarketplaceElement(element)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/*
+  The listing panel renders progressively, so wait for either the
+  Buy now button or evidence that the listing has loaded without
+  one. Returns:
+    true  -> Buy now button found
+    false -> listing loaded and there is no Buy now button
+    null  -> could not tell (listing never finished rendering)
+*/
+async function waitForMarketplaceBuyNowDecision({
+  minWaitMs = 2500,
+  maxWaitMs = 7000
+} = {}) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    if (hasMarketplaceBuyNowButton()) {
+      return true;
+    }
+
+    const elapsed =
+      Date.now() - startedAt;
+
+    if (
+      elapsed >= minWaitMs &&
+      String(
+        getListingTitle() || ""
+      ).trim()
+    ) {
+      return false;
+    }
+
+    await sleep(300);
+  }
+
+  return null;
+}
+
 function isVisibleMarketplaceElement(element) {
   if (!element) return false;
 
@@ -10347,6 +10439,81 @@ function convertPrimaryProductToCompItem(
     "Collecting listing...";
 
   try {
+    /*
+      ============================================================
+      BUY NOW GATE (shipping mode only)
+
+      With auto messaging off, only listings that show a "Buy now"
+      button can be acted on. Checked first, before any image,
+      OCR, OpenAI, SerpApi or eBay work.
+      ============================================================
+    */
+    if (!AUTO_MESSAGE_ENABLED) {
+      const buyNowDecision =
+        await waitForMarketplaceBuyNowDecision();
+
+      if (buyNowDecision === false) {
+        const noBuyNowPassResult = {
+          recommendation:
+            "Pass",
+
+          reason:
+            "Immediate skip: no Buy now button on this listing (shipping mode requires Buy now).",
+
+          facebookPrice:
+            null,
+
+          totalExpectedSalePrice:
+            null,
+
+          profitAtAsk:
+            null,
+
+          profitAt35:
+            null,
+
+          maxBuyPrice:
+            null,
+
+          validSoldCount:
+            0,
+
+          medianSoldPrice:
+            null,
+
+          items:
+            [],
+
+          ignoredItems:
+            []
+        };
+
+        console.log(
+          "[BUY NOW GATE] Skipping listing - no Buy now button detected."
+        );
+
+        showLotCompPanel(
+          noBuyNowPassResult
+        );
+
+        await markMarketplaceAutoAnalysisComplete(
+          noBuyNowPassResult
+        );
+
+        return;
+      }
+
+      if (buyNowDecision === null) {
+        console.warn(
+          "[BUY NOW GATE] Listing never finished rendering; could not check for Buy now. Continuing."
+        );
+      } else {
+        console.log(
+          "[BUY NOW GATE] Buy now button found. Continuing."
+        );
+      }
+    }
+
     /*
       ============================================================
       BASE MARKETPLACE DATA
