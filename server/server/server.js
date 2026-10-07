@@ -8478,7 +8478,8 @@ async function findProductInDatabase(item) {
         brand,
         model,
         product_type,
-        estimated_resale_price
+        estimated_resale_price,
+        price_standard_deviation
       `)
       .eq(
         "canonical_name",
@@ -8500,7 +8501,8 @@ async function findProductInDatabase(item) {
 
 async function saveProductToDatabase({
   item,
-  estimatedResalePrice
+  estimatedResalePrice,
+  priceStandardDeviation
 }) {
   const canonicalName =
     getCanonicalNameForItem(item);
@@ -8518,6 +8520,35 @@ async function saveProductToDatabase({
     return false;
   }
 
+  /*
+    Persist the price standard deviation next to the cached price.
+
+    Without this, a later cache HIT has no standard deviation to put
+    in Google Sheets column F. Only written when it is a real number
+    so a missing value never overwrites a previously saved one.
+  */
+  const stdDevNumber =
+    priceStandardDeviation == null ||
+    priceStandardDeviation === ""
+      ? NaN
+      : Number(
+          priceStandardDeviation
+        );
+
+  const stdDevColumn =
+    Number.isFinite(
+      stdDevNumber
+    )
+      ? {
+          price_standard_deviation:
+            Number(
+              stdDevNumber.toFixed(
+                2
+              )
+            )
+        }
+      : {};
+
   const {
     error
   } =
@@ -8527,6 +8558,8 @@ async function saveProductToDatabase({
       )
       .upsert(
         {
+          ...stdDevColumn,
+
           canonical_name:
             canonicalName,
 
@@ -8570,7 +8603,10 @@ async function saveProductToDatabase({
   console.log(
     "[PRODUCT DATABASE] Saved globally to Supabase:",
     canonicalName,
-    "$" + price
+    "$" + price,
+    Number.isFinite(stdDevNumber)
+      ? "stdDev $" + stdDevNumber.toFixed(2)
+      : "(no stdDev)"
   );
 
   return true;
@@ -10084,7 +10120,17 @@ if (
                   Number(
                     databaseProduct
                       .estimated_resale_price
-                  )
+                  ),
+
+                priceStandardDeviation:
+                  databaseProduct
+                    .price_standard_deviation ==
+                  null
+                    ? null
+                    : Number(
+                        databaseProduct
+                          .price_standard_deviation
+                      )
               };
             }
           )
@@ -18475,7 +18521,9 @@ async function evaluateActiveCompsForTarget(
           target,
 
         estimatedResalePrice:
-          expectedSalePrice
+          expectedSalePrice,
+
+        priceStandardDeviation
       });
 
 
