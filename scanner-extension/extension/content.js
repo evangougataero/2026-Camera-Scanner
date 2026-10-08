@@ -1,7605 +1,2042 @@
-import "dotenv/config";
-import express from "express";
-import cors from "cors";
-import OpenAI from "openai";
-import sharp from "sharp";
-import { google } from "googleapis";
-import fs from "fs";
-import path from "path";
-import Database from "better-sqlite3";
-import {
-  randomUUID,
-  createHash
-} from "crypto";
-import vision from "@google-cloud/vision";
-import {
-  createClient
-} from "@supabase/supabase-js";
-
-import {
-  AsyncLocalStorage
-} from "async_hooks";
-
-import util from "util";
-
-
-import {
-  XMLParser
-} from "fast-xml-parser";
-import {
-  fileURLToPath
-} from "url";
+console.log("eBay AI Comp Checker loaded on:", window.location.href);
 
 /*
   ============================================================
-  DATAFORSEO
+  EBAY TESTING MODE
   ============================================================
+
+  false = NORMAL SCANNER
+    - use global Supabase product resale database
+    - database misses use ACTIVE eBay listings only
+    - estimate resale from active-listing P15
+    - save new estimates back to global product database
+    - do NOT write ebay_active_training_data
+
+  true = TRAINING MODE
+    - disable global product database lookup
+    - disable global product database writes
+    - use old SOLD eBay workflow
+    - server also collects ACTIVE listings
+    - write sold + active observations to
+      ebay_active_training_data
 */
+const TESTING_MODE = false;
 
-const DATAFORSEO_LOGIN =
-  String(
-    process.env.DATAFORSEO_LOGIN ||
-    ""
-  ).trim();
+/*
+  Default resale value assigned to a camera lens that never
+  resolved to an exact model (Lensfun + SerpApi both failed to
+  identify it). Keeps the listing evaluable instead of the whole
+  deal auto-Passing just because one lens stayed unidentified.
+*/
+const UNKNOWN_LENS_DEFAULT_RESALE_VALUE = 50;
 
-const DATAFORSEO_PASSWORD =
-  String(
-    process.env.DATAFORSEO_PASSWORD ||
-    ""
-  ).trim();
+/*
+  Cached Supabase rows saved before price_standard_deviation existed
+  have a price but no standard deviation. true = re-run eBay once for
+  those products so the standard deviation gets saved and shows in
+  Google Sheets. false = keep using the cached price with a blank F.
+*/
+const REFRESH_DB_ROWS_MISSING_STD_DEV = true;
 
+const MARKETPLACE_OUTREACH_LOCK_KEY =
+  "marketplaceDirectOutreachLock";
 
-function getDataForSeoAuthHeader() {
+  async function acquireMarketplaceOutreachLock(
+  listingId
+) {
+  while (true) {
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_OUTREACH_LOCK_KEY
+      );
+
+    const lock =
+      stored[
+        MARKETPLACE_OUTREACH_LOCK_KEY
+      ];
+
+    const now =
+      Date.now();
+
+    /*
+      Recover from abandoned locks after 2 minutes.
+    */
+    if (
+      !lock ||
+      !lock.listingId ||
+      now - Number(lock.acquiredAt || 0) >
+        2 * 60 * 1000
+    ) {
+      await chrome.storage.local.set({
+        [MARKETPLACE_OUTREACH_LOCK_KEY]: {
+          listingId,
+          acquiredAt:
+            now
+        }
+      });
+
+      const verify =
+        await chrome.storage.local.get(
+          MARKETPLACE_OUTREACH_LOCK_KEY
+        );
+
+      if (
+        verify[
+          MARKETPLACE_OUTREACH_LOCK_KEY
+        ]?.listingId === listingId
+      ) {
+        console.log(
+          "[DIRECT OUTREACH] Acquired outreach lock:",
+          listingId
+        );
+
+        return;
+      }
+    }
+
+    await sleep(1000);
+  }
+}
+
+async function releaseMarketplaceOutreachLock(
+  listingId
+) {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_OUTREACH_LOCK_KEY
+    );
+
   if (
-    !DATAFORSEO_LOGIN ||
-    !DATAFORSEO_PASSWORD
+    stored[
+      MARKETPLACE_OUTREACH_LOCK_KEY
+    ]?.listingId === listingId
   ) {
-    throw new Error(
-      "Missing DATAFORSEO_LOGIN or DATAFORSEO_PASSWORD in .env"
+    await chrome.storage.local.remove(
+      MARKETPLACE_OUTREACH_LOCK_KEY
+    );
+
+    console.log(
+      "[DIRECT OUTREACH] Released outreach lock:",
+      listingId
     );
   }
+}
+
+/*
+  Listings are analyzed strictly one at a time. This used to be
+  set to 2 so a second listing could open in the background while
+  the first one was parked waiting on DataForSEO, but that
+  parallel-processing behavior has been removed for simplicity -
+  do not start another listing until the current one has fully
+  completed.
+*/
+const MAX_CONCURRENT_MARKETPLACE_ANALYSES =
+  1;
+
+const MARKETPLACE_ANALYSIS_JOBS_KEY =
+  "marketplaceAnalysisJobs";
+
+const MARKETPLACE_FINISH_LOCK_KEY =
+  "marketplaceAnalysisFinishLock";
+
+  const MARKETPLACE_ANALYSIS_JOB_PREFIX =
+  "marketplaceAnalysisJob:";
+
+const MARKETPLACE_BACKGROUND_JOB_STATUSES =
+  new Set([
+    "waiting-dataforseo",
+    "resume-ready",
+    "finishing"
+  ]);
+
+const MARKETPLACE_JOB_STALE_MS = {
+  analyzing: 4 * 60 * 1000,
+  "waiting-dataforseo": 12 * 60 * 1000,
+  "resume-ready": 2 * 60 * 1000,
+  finishing: 6 * 60 * 1000
+};
+
+const MARKETPLACE_DEFAULT_JOB_STALE_MS =
+  4 * 60 * 1000;
+
+const MARKETPLACE_ORPHAN_GRACE_MS =
+  90 * 1000;
+
+
+function getMarketplaceAnalysisJobStorageKey(
+  jobId
+) {
+  return (
+    MARKETPLACE_ANALYSIS_JOB_PREFIX +
+    String(jobId || "")
+  );
+}
+
+
+function isMarketplaceAnalysisJobTerminal(
+  job
+) {
+  return [
+    "complete",
+    "failed"
+  ].includes(
+    String(
+      job?.status || ""
+    )
+  );
+}
+
+
+function isMarketplaceBackgroundAnalysisJob(
+  job
+) {
+  return MARKETPLACE_BACKGROUND_JOB_STATUSES.has(
+    String(
+      job?.status || ""
+    )
+  );
+}
+
+
+function getMarketplaceAnalysisJobLastActivityAt(
+  job
+) {
+  return Math.max(
+    Number(job?.updatedAt || 0),
+    Number(job?.dataForSeoReturnedAt || 0),
+    Number(job?.parkedAt || 0),
+    Number(job?.startedAt || 0),
+    Number(job?.createdAt || 0)
+  );
+}
+
+
+function isMarketplaceAnalysisJobStale(
+  job,
+  now = Date.now()
+) {
+  if (
+    !job ||
+    isMarketplaceAnalysisJobTerminal(job)
+  ) {
+    return false;
+  }
+
+  const lastActivityAt =
+    getMarketplaceAnalysisJobLastActivityAt(
+      job
+    );
+
+  if (!lastActivityAt) {
+    return true;
+  }
+
+  const status =
+    String(
+      job?.status || ""
+    );
+
+  const staleAfterMs =
+    MARKETPLACE_JOB_STALE_MS[
+      status
+    ] ||
+    MARKETPLACE_DEFAULT_JOB_STALE_MS;
 
   return (
-    "Basic " +
-    Buffer
-      .from(
-        `${DATAFORSEO_LOGIN}:${DATAFORSEO_PASSWORD}`
-      )
-      .toString("base64")
+    now - lastActivityAt >=
+    staleAfterMs
   );
 }
 
+async function getMarketplaceAnalysisJobs() {
+  const stored =
+    await chrome.storage.local.get(
+      null
+    );
 
-function sleepDataForSeo(ms) {
-  return new Promise(
-    resolve =>
-      setTimeout(resolve, ms)
-  );
+  return Object.entries(
+    stored
+  )
+    .filter(
+      ([key, value]) =>
+        key.startsWith(
+          MARKETPLACE_ANALYSIS_JOB_PREFIX
+        ) &&
+        value?.jobId
+    )
+    .map(
+      ([, value]) =>
+        value
+    );
 }
 
-async function searchDataForSeoByImage(
-  imageUrl
+
+function getCurrentMarketplaceAnalysisJobId() {
+  const listingId =
+    getFacebookMarketplaceItemId(
+      window.location.href
+    );
+
+  return listingId
+    ? `listing-${listingId}`
+    : null;
+}
+
+
+async function getMarketplaceAnalysisJobById(
+  jobId
 ) {
-  const cleanImageUrl =
-    String(
-      imageUrl || ""
-    ).trim();
+  if (!jobId) {
+    return null;
+  }
 
+  const key =
+    getMarketplaceAnalysisJobStorageKey(
+      jobId
+    );
+
+  const stored =
+    await chrome.storage.local.get(
+      key
+    );
+
+  return (
+    stored[key] ||
+    null
+  );
+}
+
+
+async function patchMarketplaceAnalysisJobById(
+  jobId,
+  patch = {},
+  options = {}
+) {
+  if (!jobId) {
+    return null;
+  }
+
+  const existing =
+    await getMarketplaceAnalysisJobById(
+      jobId
+    );
 
   if (
-    !/^https?:\/\//i.test(
-      cleanImageUrl
-    )
+    !existing &&
+    options.createIfMissing === false
   ) {
-    throw new Error(
-      "DataForSEO requires a public HTTP/HTTPS image URL."
+    return null;
+  }
+
+  const currentUrl =
+    String(
+      options.currentUrl ||
+      patch.url ||
+      ""
+    ).split("?")[0];
+
+  const now =
+    Date.now();
+
+  const updated = {
+    ...(
+      existing || {
+        jobId,
+
+        listingId:
+          getFacebookMarketplaceItemId(
+            currentUrl
+          ) ||
+          String(jobId)
+            .replace(
+              /^listing-/,
+              ""
+            ),
+
+        url:
+          currentUrl,
+
+        createdAt:
+          now
+      }
+    ),
+
+    ...patch,
+
+    jobId,
+
+    updatedAt:
+      now
+  };
+
+  await chrome.storage.local.set({
+    [
+      getMarketplaceAnalysisJobStorageKey(
+        jobId
+      )
+    ]:
+      updated
+  });
+
+  return updated;
+}
+
+
+async function upsertMarketplaceAnalysisJob(
+  patch = {}
+) {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  if (!jobId) {
+    return null;
+  }
+
+  return patchMarketplaceAnalysisJobById(
+    jobId,
+    patch,
+    {
+      currentUrl:
+        window.location.href
+          .split("?")[0]
+    }
+  );
+}
+
+
+async function removeCurrentMarketplaceAnalysisJob() {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  if (!jobId) {
+    return;
+  }
+
+  await chrome.storage.local.remove(
+    getMarketplaceAnalysisJobStorageKey(
+      jobId
+    )
+  );
+}
+
+
+async function countActiveMarketplaceAnalysisJobs() {
+  const jobs =
+    await getMarketplaceAnalysisJobs();
+
+  return jobs.filter(
+    job =>
+      !isMarketplaceAnalysisJobTerminal(
+        job
+      )
+  ).length;
+}
+
+
+async function failMarketplaceAnalysisJobById(
+  jobId,
+  failureReason,
+  stage = "watchdog"
+) {
+  return patchMarketplaceAnalysisJobById(
+    jobId,
+    {
+      status:
+        "failed",
+
+      stage,
+
+      failureReason:
+        String(
+          failureReason ||
+          "Analysis job failed."
+        ),
+
+      failedAt:
+        Date.now()
+    },
+    {
+      createIfMissing:
+        false
+    }
+  );
+}
+
+
+async function pruneStaleMarketplaceAnalysisJobs() {
+  const jobs =
+    await getMarketplaceAnalysisJobs();
+
+  const now =
+    Date.now();
+
+  for (const job of jobs) {
+    if (
+      !isMarketplaceAnalysisJobStale(
+        job,
+        now
+      )
+    ) {
+      continue;
+    }
+
+    console.warn(
+      "[PIPELINE WATCHDOG] Stale job:",
+      job
     );
+
+    await failMarketplaceAnalysisJobById(
+      job.jobId,
+      `Job remained stuck in "${job.status}" past its watchdog limit.`,
+      "stale-watchdog"
+    );
+
+    const lockStored =
+      await chrome.storage.local.get(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+
+    if (
+      lockStored[
+        MARKETPLACE_FINISH_LOCK_KEY
+      ] === job.jobId
+    ) {
+      await chrome.storage.local.remove(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+    }
+  }
+}
+
+
+async function clearMarketplaceAnalysisJobRegistry() {
+  const stored =
+    await chrome.storage.local.get(
+      null
+    );
+
+  const keys = Object.keys(
+    stored
+  ).filter(
+    key =>
+      key.startsWith(
+        MARKETPLACE_ANALYSIS_JOB_PREFIX
+      )
+  );
+
+  await chrome.storage.local.remove([
+    ...keys,
+
+    // Remove data left by the old implementation too.
+    MARKETPLACE_ANALYSIS_JOBS_KEY,
+
+    MARKETPLACE_FINISH_LOCK_KEY
+  ]);
+}
+
+async function acquireMarketplaceFinishLock() {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  if (!jobId) {
+    return;
   }
 
 
-  const authHeader =
-    getDataForSeoAuthHeader();
+  while (true) {
+    /*
+      Prevent a crashed lock owner from blocking
+      all future listings forever.
+    */
+    await pruneStaleMarketplaceAnalysisJobs();
+
+
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+
+    const currentOwner =
+      String(
+        stored[
+          MARKETPLACE_FINISH_LOCK_KEY
+        ] ||
+        ""
+      ).trim();
+
+
+    if (
+      !currentOwner ||
+      currentOwner ===
+        jobId
+    ) {
+      await chrome.storage.local.set({
+        [MARKETPLACE_FINISH_LOCK_KEY]:
+          jobId
+      });
+
+
+      const verify =
+        await chrome.storage.local.get(
+          MARKETPLACE_FINISH_LOCK_KEY
+        );
+
+
+      if (
+        verify[
+          MARKETPLACE_FINISH_LOCK_KEY
+        ] ===
+          jobId
+      ) {
+        console.log(
+          "[PIPELINE LOCK] Acquired finish lock:",
+          jobId
+        );
+
+        return;
+      }
+    }
+
+
+    const ownerJob =
+      await getMarketplaceAnalysisJobById(
+        currentOwner
+      );
+
+
+    if (
+      currentOwner &&
+      (
+        !ownerJob ||
+        isMarketplaceAnalysisJobTerminal(
+          ownerJob
+        ) ||
+        isMarketplaceAnalysisJobStale(
+          ownerJob
+        )
+      )
+    ) {
+      console.warn(
+        "[PIPELINE LOCK] Removing stale lock:",
+        {
+          currentOwner,
+          ownerStatus:
+            ownerJob?.status ||
+            "missing"
+        }
+      );
+
+      await chrome.storage.local.remove(
+        MARKETPLACE_FINISH_LOCK_KEY
+      );
+
+      continue;
+    }
+
+
+    console.log(
+      "[PIPELINE LOCK] Waiting for older listing:",
+      {
+        jobId,
+        currentOwner,
+        ownerStatus:
+          ownerJob?.status ||
+          "missing"
+      }
+    );
+
+
+    await sleep(
+      500
+    );
+  }
+}
+
+
+async function releaseMarketplaceFinishLock() {
+  const jobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_FINISH_LOCK_KEY
+    );
+
+  if (
+    stored[
+      MARKETPLACE_FINISH_LOCK_KEY
+    ] === jobId
+  ) {
+    await chrome.storage.local.remove(
+      MARKETPLACE_FINISH_LOCK_KEY
+    );
+
+    console.log(
+      "[PIPELINE LOCK] Released finish lock:",
+      jobId
+    );
+  }
+}
+
+async function runActiveEbayApiWorkflow(
+  button
+) {
+  const stored =
+    await chrome.storage.local.get(
+      "ebayCompContext"
+    );
+
+  let context =
+    stored.ebayCompContext;
+
+  if (!context) {
+    throw new Error(
+      "Active eBay workflow started without ebayCompContext."
+    );
+  }
+
+  const items =
+    Array.isArray(
+      context.items
+    )
+      ? context.items
+      : [];
+
+  let currentItemIndex =
+    Number(
+      context.currentItemIndex || 0
+    );
+
+
+  while (
+    currentItemIndex <
+    items.length
+  ) {
+    const currentItem =
+      items[
+        currentItemIndex
+      ];
+
+    button.innerText =
+      `Checking active eBay market ${currentItemIndex + 1}/${items.length}...`;
+
+    console.log(
+      "[ACTIVE EBAY] Evaluating:",
+      currentItem.ebaySearchQuery
+    );
+
+
+    const response =
+      await fetchLocalServer(
+        "/evaluate-active-comps",
+        {
+          method:
+            "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              target: {
+                ...currentItem,
+
+                facebookPrice:
+                  context.facebookPrice,
+
+                originalFacebookTitle:
+                  context.originalFacebookTitle,
+
+                facebookDescription:
+                  context.facebookDescription
+              }
+            })
+        }
+      );
+
+
+    const itemResult =
+      await readJsonSafely(
+        response
+      );
+
+
+    if (
+      !response.ok ||
+      itemResult.error
+    ) {
+      throw new LocalServerError(
+        itemResult,
+        "Active eBay valuation failed."
+      );
+    }
+
+
+    console.log(
+      "[ACTIVE EBAY] Result:",
+      itemResult
+    );
+
+
+    context = {
+      ...context,
+
+      results: [
+        ...(context.results || []),
+
+        {
+          item:
+            currentItem,
+
+          result:
+            itemResult
+        }
+      ],
+
+      currentItemIndex:
+        currentItemIndex + 1
+    };
+
+
+    await chrome.storage.local.set({
+      ebayCompContext:
+        context
+    });
+
+
+    currentItemIndex += 1;
+  }
 
 
   /*
-    ============================================================
-    STEP 1 — CREATE SEARCH-BY-IMAGE TASK
-    ============================================================
-  */
+    All database misses have now received
+    active-market valuations.
 
-  const createResponse =
-    await fetch(
-      "https://api.dataforseo.com/v3/serp/google/search_by_image/task_post",
+    Run the existing final lot calculation.
+  */
+  const finalResponse =
+    await fetchLocalServer(
+      "/evaluate-lot",
       {
         method:
           "POST",
 
         headers: {
-          Authorization:
-            authHeader,
-
           "Content-Type":
             "application/json"
         },
 
         body:
-          JSON.stringify([
-            {
-              image_url:
-                cleanImageUrl,
-
-              location_code:
-                2840,
-
-              language_code:
-                "en",
-
-              priority:
-                2
-            }
-          ])
+          JSON.stringify({
+            context
+          })
       }
     );
 
 
-  const createData =
-    await createResponse.json();
-
-
-  const createdTask =
-    createData?.tasks?.[0];
+  const finalResult =
+    await readJsonSafely(
+      finalResponse
+    );
 
 
   if (
-    !createdTask?.id
+    !finalResponse.ok ||
+    finalResult.error
   ) {
-    throw new Error(
-      createdTask?.status_message ||
-      createData?.status_message ||
-      "DataForSEO did not return a task ID."
+    throw new LocalServerError(
+      finalResult,
+      "Final active-market lot evaluation failed."
     );
   }
 
 
-  const taskId =
-    String(
-      createdTask.id
-    );
-
-
   console.log(
-    "[DATAFORSEO] Search By Image task created:",
-    {
-      taskId,
-
-      cost:
-        createdTask?.cost
-    }
+    "[ACTIVE EBAY] Final lot evaluation:",
+    finalResult
   );
 
 
-  /*
-    ============================================================
-    STEP 2 — WAIT FOR COMPLETED RESULT
-    ============================================================
-  */
-
-  const startedAt =
-    Date.now();
-
-  const timeoutMs =
-    10 * 60 * 1000;
-
-  const pollIntervalMs =
-    5000;
-
-
-  while (
-    Date.now() - startedAt <
-    timeoutMs
+  if (
+    String(
+      finalResult.recommendation ||
+      ""
+    )
+      .trim()
+      .toLowerCase() ===
+    "scam"
   ) {
-    await sleepDataForSeo(
-      pollIntervalMs
+    await saveScamListing({
+      context,
+      result:
+        finalResult
+    });
+  }
+
+
+  await saveDealToLibrary({
+    context,
+    result:
+      finalResult
+  });
+
+
+  if (
+    !isHitRecommendation(
+      finalResult
+    )
+  ) {
+    await markMarketplaceAnalysisRunCompleted();
+  }
+
+
+  await markMarketplaceAutoAnalysisComplete(
+    finalResult
+  );
+
+
+  showLotCompPanel(
+    finalResult
+  );
+}
+
+function getListingTitle() {
+  const badTitles = [
+    "notifications",
+    "marketplace",
+    "facebook",
+    "menu",
+    "search",
+    "watch",
+    "groups",
+    "friends",
+    "home",
+    "create",
+    "gaming",
+    "saved",
+    "inbox",
+    "sell",
+    "buy and sell groups",
+    "today's picks",
+    "top picks",
+    "recommended for you",
+    "message seller",
+    "seller information",
+    "details",
+    "description"
+  ];
+
+  function cleanText(text) {
+    return text ? text.replace(/\s+/g, " ").trim() : "";
+  }
+
+  function isGoodTitle(text) {
+    const cleaned = cleanText(text);
+    const lower = cleaned.toLowerCase();
+
+    if (!cleaned) return false;
+    if (cleaned.length < 5) return false;
+    if (cleaned.length > 120) return false;
+
+    if (badTitles.includes(lower)) return false;
+    if (lower.includes("facebook")) return false;
+    if (lower.includes("marketplace")) return false;
+    if (lower.includes("notifications")) return false;
+    if (lower.includes("log in")) return false;
+    if (lower.includes("sign up")) return false;
+    if (lower.includes("message seller")) return false;
+    if (lower.includes("seller information")) return false;
+
+    return true;
+  }
+
+  // Best first attempt: browser tab title
+  if (document.title) {
+    const titleFromPage = cleanText(
+      document.title
+        .replace("| Facebook Marketplace", "")
+        .replace("| Marketplace", "")
+        .replace("| Facebook", "")
+    );
+
+    if (isGoodTitle(titleFromPage)) {
+      return titleFromPage;
+    }
+  }
+
+  // Try all h1s, not just the first one
+  const h1s = Array.from(document.querySelectorAll("h1"))
+    .map(el => cleanText(el.innerText))
+    .filter(isGoodTitle);
+
+  if (h1s.length > 0) {
+    return h1s[0];
+  }
+
+  // Last fallback: scan visible text
+  const candidates = Array.from(document.querySelectorAll("span, div"))
+    .map(el => cleanText(el.innerText))
+    .filter(isGoodTitle)
+    .filter(text => !text.includes("\n"));
+
+  console.log("Title candidates:", candidates.slice(0, 50));
+
+  return candidates[0] || "";
+}
+
+/*
+  ============================================================
+  REMOTE EBAY WORKER
+  ============================================================
+
+  IMPORTANT:
+  This decision is made ONCE per Marketplace listing.
+
+  It is NOT randomized separately for:
+    - each product
+    - each bundle item
+    - pollution reruns
+
+  Therefore a selected Marketplace listing uses the
+  remote eBay worker for its entire eBay workflow.
+*/
+
+const REMOTE_EBAY_HANDOFF_ENABLED =
+  false;
+
+/*
+  10 = approximately 1 out of every 10 listings that
+  actually require an eBay search.
+
+  Change this number to your desired denominator.
+*/
+const REMOTE_EBAY_ONE_IN_N_LISTINGS = 2;
+
+const REMOTE_EBAY_JOB_POLL_INTERVAL_MS =
+  1000;
+
+const REMOTE_EBAY_JOB_TIMEOUT_MS =
+  5 * 60 * 1000;
+
+  function shouldUseRemoteEbayForListing() {
+  if (
+    !REMOTE_EBAY_HANDOFF_ENABLED
+  ) {
+    return false;
+  }
+
+  const denominator =
+    Math.max(
+      1,
+      Math.floor(
+        Number(
+          REMOTE_EBAY_ONE_IN_N_LISTINGS
+        ) || 1
+      )
+    );
+
+  if (
+    denominator === 1
+  ) {
+    return true;
+  }
+
+  return (
+    Math.floor(
+      Math.random() *
+        denominator
+    ) === 0
+  );
+}
+
+  function parseMessengerThreadTimestampText(
+  text
+) {
+  const value =
+    String(text || "")
+      .trim()
+      .replace(/\u202f/g, " ")
+      .replace(/\s+/g, " ");
+
+
+  if (!value) {
+    return null;
+  }
+
+
+  const now =
+    new Date();
+
+
+  /*
+    Example:
+    Sun 6:50 PM
+    Monday/weekday-style timestamps from Messenger.
+  */
+  const weekdayMatch =
+    value.match(
+      /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(\d{1,2}):(\d{2})\s*(AM|PM)$/i
     );
 
 
-    const resultResponse =
-      await fetch(
-        `https://api.dataforseo.com/v3/serp/google/search_by_image/task_get/advanced/${encodeURIComponent(
-          taskId
+  if (weekdayMatch) {
+    const weekdayNames = [
+      "Sun",
+      "Mon",
+      "Tue",
+      "Wed",
+      "Thu",
+      "Fri",
+      "Sat"
+    ];
+
+
+    const targetWeekday =
+      weekdayNames.findIndex(
+        day =>
+          day.toLowerCase() ===
+          weekdayMatch[1].toLowerCase()
+      );
+
+
+    let hour =
+      Number(
+        weekdayMatch[2]
+      );
+
+
+    const minute =
+      Number(
+        weekdayMatch[3]
+      );
+
+
+    const meridiem =
+      weekdayMatch[4]
+        .toUpperCase();
+
+
+    if (
+      meridiem === "PM" &&
+      hour !== 12
+    ) {
+      hour += 12;
+    }
+
+
+    if (
+      meridiem === "AM" &&
+      hour === 12
+    ) {
+      hour = 0;
+    }
+
+
+    const result =
+      new Date(now);
+
+
+    /*
+      Go backward to the most recent occurrence
+      of that weekday.
+    */
+    let daysBack =
+      (
+        now.getDay() -
+        targetWeekday +
+        7
+      ) % 7;
+
+
+    result.setDate(
+      now.getDate() -
+      daysBack
+    );
+
+
+    result.setHours(
+      hour,
+      minute,
+      0,
+      0
+    );
+
+
+    /*
+      If the calculated time is somehow in the future,
+      use the previous week's occurrence.
+    */
+    if (
+      result.getTime() >
+      now.getTime()
+    ) {
+      result.setDate(
+        result.getDate() - 7
+      );
+    }
+
+
+    return result.toISOString();
+  }
+
+
+
+
+  /*
+    Messenger may also show something like:
+    6:50 PM
+  */
+  const timeOnlyMatch =
+    value.match(
+      /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i
+    );
+
+
+  if (timeOnlyMatch) {
+    let hour =
+      Number(
+        timeOnlyMatch[1]
+      );
+
+
+    const minute =
+      Number(
+        timeOnlyMatch[2]
+      );
+
+
+    const meridiem =
+      timeOnlyMatch[3]
+        .toUpperCase();
+
+
+    if (
+      meridiem === "PM" &&
+      hour !== 12
+    ) {
+      hour += 12;
+    }
+
+
+    if (
+      meridiem === "AM" &&
+      hour === 12
+    ) {
+      hour = 0;
+    }
+
+
+    const result =
+      new Date(now);
+
+
+    result.setHours(
+      hour,
+      minute,
+      0,
+      0
+    );
+
+
+    /*
+      If today's interpretation is in the future,
+      assume yesterday.
+    */
+    if (
+      result.getTime() >
+      now.getTime()
+    ) {
+      result.setDate(
+        result.getDate() - 1
+      );
+    }
+
+
+    return result.toISOString();
+  }
+
+
+
+
+  return null;
+}
+
+function getLatestMessengerThreadTimestamp() {
+  const timestampSpans =
+    Array.from(
+      document.querySelectorAll(
+        "span"
+      )
+    )
+      .map(
+        element => ({
+          element,
+
+
+          text:
+            String(
+              element.textContent ||
+              ""
+            )
+              .trim()
+              .replace(/\u202f/g, " ")
+              .replace(/\s+/g, " ")
+        })
+      )
+      .filter(
+        entry =>
+          /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+\d{1,2}:\d{2}\s*(AM|PM)$/i.test(
+            entry.text
+          ) ||
+          /^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(
+            entry.text
+          )
+      );
+
+
+
+
+  if (!timestampSpans.length) {
+    return {
+      text: "",
+      iso:
+        null
+    };
+  }
+
+
+
+
+  /*
+    The last matching timestamp in DOM order
+    should correspond to the latest rendered
+    timestamp group in the conversation.
+  */
+  const latest =
+    timestampSpans[
+      timestampSpans.length -
+      1
+    ];
+
+
+
+
+  return {
+    text:
+      latest.text,
+
+
+    iso:
+      parseMessengerThreadTimestampText(
+        latest.text
+      )
+  };
+}
+
+const MARKETPLACE_MAPPED_CONVERSATIONS_KEY =
+  "marketplaceMappedConversationIds";
+
+
+async function getMappedMarketplaceConversationIds() {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_MAPPED_CONVERSATIONS_KEY
+    );
+
+  return new Set(
+    Array.isArray(
+      stored[
+        MARKETPLACE_MAPPED_CONVERSATIONS_KEY
+      ]
+    )
+      ? stored[
+          MARKETPLACE_MAPPED_CONVERSATIONS_KEY
+        ]
+      : []
+  );
+}
+
+
+async function rememberMappedMarketplaceConversation(
+  conversationId
+) {
+  if (!conversationId) {
+    return;
+  }
+
+  const mapped =
+    await getMappedMarketplaceConversationIds();
+
+  mapped.add(
+    String(
+      conversationId
+    )
+  );
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_MAPPED_CONVERSATIONS_KEY]:
+      [...mapped]
+  });
+}
+
+const MARKETPLACE_AUTO_STATE_KEY = "marketplaceAutoAnalyzerState";
+
+function createMarketplaceOutreachSessionId() {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID();
+  }
+
+  return (
+    Date.now() +
+    "_" +
+    Math.random()
+      .toString(36)
+      .slice(2)
+  );
+}
+
+const MARKETPLACE_ANALYSIS_RUN_KEY =
+  "marketplaceCurrentAnalysisRun";
+
+const SCAM_LISTINGS_KEY = "scamMarketplaceListings";
+
+const SESSION_LISTINGS_KEY = "sessionListingsLibrary";
+
+const LIBRARY_SAVING_ENABLED_KEY =
+  "marketplaceLibrarySavingEnabled";
+
+const MARKETPLACE_MESSAGED_LISTING_IDS_KEY =
+  "marketplaceMessagedListingIds";
+
+  async function isLibrarySavingEnabled() {
+  const stored = await chrome.storage.local.get(
+    LIBRARY_SAVING_ENABLED_KEY
+  );
+
+  return stored[LIBRARY_SAVING_ENABLED_KEY] === true;
+}
+
+async function setLibrarySavingEnabled(enabled) {
+  await chrome.storage.local.set({
+    [LIBRARY_SAVING_ENABLED_KEY]: enabled === true
+  });
+}
+
+// other normal functions continue below
+
+const MARKETPLACE_HIT_MESSAGE =
+  "Hi, I’d love to buy this. I’m not local, but I’ll cover the full shipping cost if you're willing.";
+
+function isHitRecommendation(result) {
+  const recommendation =
+    String(
+      result?.recommendation || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    recommendation === "buy now" ||
+    recommendation === "negotiate"
+  );
+}
+
+const LISTING_ANALYSIS_RETRY_KEY =
+  "marketplaceAnalysisRetryByListingId";
+
+const MAX_LISTING_ANALYSIS_RETRIES = 1;
+
+const MAX_FACEBOOK_ASK_PRICE = 300;
+
+/*
+  ============================================================
+  HIT OUTREACH MODE
+  ============================================================
+
+  true:
+    Scanner DOES NOT message the seller.
+    Hit is queued for the separate outreach extension.
+
+  false:
+    Scanner immediately messages the seller itself.
+*/
+/*
+  ============================================================
+  AUTO MESSAGE MASTER SWITCH
+  ============================================================
+
+  true:
+    Verified hits are messaged (directly, or queued for the
+    separate outreach extension, depending on the mode below).
+
+  false:
+    Scanner never touches the seller-message UI and never
+    queues outreach. Hits are still analyzed and saved as
+    normal. Use this for shipping-only listings that have no
+    message box.
+*/
+const AUTO_MESSAGE_ENABLED = false;
+
+const USE_SEPARATE_OUTREACH_EXTENSION = false;
+
+/*
+  ============================================================
+  REMOTE GOOGLE LENS WORKER
+  ============================================================
+*/
+
+const REMOTE_GOOGLE_LENS_JOB_POLL_INTERVAL_MS =
+  1000;
+
+const REMOTE_GOOGLE_LENS_JOB_TIMEOUT_MS =
+  5 * 60 * 1000;
+
+
+async function createRemoteGoogleLensJob({
+  targets
+}) {
+  const facebookUrl =
+    getCurrentFacebookListingUrl()
+      .split("?")[0];
+
+  const marketplaceListingId =
+    getFacebookMarketplaceItemId(
+      facebookUrl
+    );
+
+  const response =
+    await fetchLocalServer(
+      "/google-lens-worker/jobs",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            targets,
+
+            marketplaceListingId,
+
+            marketplaceUrl:
+              facebookUrl
+          })
+      }
+    );
+
+  const data =
+    await readJsonSafely(
+      response
+    );
+
+  if (
+    !response.ok ||
+    data?.ok !== true ||
+    !data?.jobId
+  ) {
+    throw new Error(
+      data?.error ||
+      "Could not queue remote Google Lens job."
+    );
+  }
+
+  console.log(
+    "[REMOTE GOOGLE LENS] Job queued:",
+    {
+      jobId:
+        data.jobId,
+
+      targets:
+        targets.length
+    }
+  );
+
+  return data;
+}
+
+/*
+  ============================================================
+  GOOGLE LENS ROUTING
+  ============================================================
+
+  1 = every Lens-required listing goes remote
+  2 = approximately 1 out of 2
+  5 = approximately 1 out of 5
+  10 = approximately 1 out of 10
+
+  Listings not selected use THIS extension's local
+  Google Lens implementation.
+*/
+
+const REMOTE_GOOGLE_LENS_HANDOFF_ENABLED =
+  false;
+
+const REMOTE_GOOGLE_LENS_ONE_IN_N_LISTINGS =
+  2;
+
+
+function shouldUseRemoteGoogleLensForListing() {
+  if (
+    !REMOTE_GOOGLE_LENS_HANDOFF_ENABLED
+  ) {
+    return false;
+  }
+
+  const denominator =
+    Math.max(
+      1,
+      Math.floor(
+        Number(
+          REMOTE_GOOGLE_LENS_ONE_IN_N_LISTINGS
+        ) || 1
+      )
+    );
+
+  if (
+    denominator === 1
+  ) {
+    return true;
+  }
+
+  return (
+    Math.floor(
+      Math.random() *
+        denominator
+    ) === 0
+  );
+}
+
+
+async function waitForRemoteGoogleLensJob(
+  jobId
+) {
+  const startedAt =
+    Date.now();
+
+  while (
+    Date.now() -
+      startedAt <
+    REMOTE_GOOGLE_LENS_JOB_TIMEOUT_MS
+  ) {
+    const response =
+      await fetchLocalServer(
+        `/google-lens-worker/jobs/${encodeURIComponent(
+          jobId
         )}`,
         {
           method:
             "GET",
 
-          headers: {
-            Authorization:
-              authHeader,
-
-            "Content-Type":
-              "application/json"
-          }
+          cache:
+            "no-store"
         }
       );
 
-
-    const resultData =
-      await resultResponse.json();
-
-
-    const task =
-      resultData?.tasks?.[0];
-
-
-    /*
-      Task still pending.
-    */
-    if (
-      Number(
-        task?.status_code
-      ) === 40601 ||
-      Number(
-        task?.status_code
-      ) === 40602
-    ) {
-      console.log(
-        "[DATAFORSEO] Task pending:",
-        {
-          taskId,
-
-          status:
-            task?.status_message
-        }
+    const data =
+      await readJsonSafely(
+        response
       );
 
-      continue;
-    }
-
-
-    const result =
-      Array.isArray(
-        task?.result
-      )
-        ? task.result[0]
-        : null;
-
-
     if (
-      Number(
-        task?.status_code
-      ) === 20000 &&
-      result
-    ) {
-      console.log(
-        "[DATAFORSEO] Search By Image complete:",
-        {
-          taskId,
-
-          itemsCount:
-            result?.items_count,
-
-          resultsCount:
-            result?.se_results_count
-        }
-      );
-
-
-      return {
-        taskId,
-
-        cost:
-          Number(
-            task?.cost ||
-            createdTask?.cost ||
-            0
-          ),
-
-        result
-      };
-    }
-
-
-    /*
-      Any non-pending non-success state.
-    */
-    if (
-      task?.status_code &&
-      Number(
-        task.status_code
-      ) !== 20000
+      !response.ok ||
+      data?.ok !== true
     ) {
       throw new Error(
-        task?.status_message ||
-        `DataForSEO task failed with status ${task.status_code}.`
+        data?.error ||
+        "Could not read remote Google Lens job."
       );
     }
-  }
 
+    if (
+      data.status ===
+      "completed"
+    ) {
+      const results =
+        Array.isArray(
+          data.results
+        )
+          ? data.results
+          : [];
+
+      console.log(
+        "[REMOTE GOOGLE LENS] Results received:",
+        {
+          jobId,
+
+          results:
+            results.length
+        }
+      );
+
+      return results;
+    }
+
+    if (
+      data.status ===
+      "failed"
+    ) {
+      throw new Error(
+        data.error ||
+        "Remote Google Lens worker reported failure."
+      );
+    }
+
+    await sleep(
+      REMOTE_GOOGLE_LENS_JOB_POLL_INTERVAL_MS
+    );
+  }
 
   throw new Error(
-    "DataForSEO Search By Image timed out."
+    "Remote Google Lens worker timed out."
   );
 }
 
-function extractDataForSeoEvidence(
-  dataForSeoResult
+
+async function runRemoteGoogleLensTargets(
+  targets
 ) {
-  const items =
+  console.log(
+    "[REMOTE GOOGLE LENS] Sending targets to worker:",
+    targets
+  );
+
+  const job =
+    await createRemoteGoogleLensJob({
+      targets
+    });
+
+  return await waitForRemoteGoogleLensJob(
+    job.jobId
+  );
+}
+
+async function prepareDataForSeoCrops(
+  targets,
+  initialIdentificationData,
+  productOcrResults
+) {
+  const primaryProducts =
     Array.isArray(
-      dataForSeoResult?.items
+      initialIdentificationData
+        ?.primaryProducts
     )
-      ? dataForSeoResult.items
+      ? initialIdentificationData
+          .primaryProducts
       : [];
 
 
-  const organicResults =
-    items
-      .filter(
-        item =>
-          item?.type ===
-          "organic"
-      )
-      .slice(
-        0,
-        25
-      )
-      .map(
-        item => ({
-          rank:
-            Number(
-              item?.rank_absolute ||
-              0
-            ),
-
-          domain:
-            String(
-              item?.domain ||
-              ""
-            ).trim(),
-
-          title:
-            String(
-              item?.title ||
-              ""
-            ).trim(),
-
-          description:
-            String(
-              item?.description ||
-              ""
-            ).trim(),
-
-          url:
-            String(
-              item?.url ||
-              ""
-            ).trim(),
-
-          highlighted:
-            Array.isArray(
-              item?.highlighted
-            )
-              ? item.highlighted
-              : []
-        })
-      );
-
-
-  /*
-    DataForSEO also gives us Google's
-    "Visual matches" image collection.
-
-    Keep only a limited number of URLs.
-  */
-  const visualMatchesItem =
-    items.find(
-      item =>
-        item?.type ===
-          "images" &&
-        Array.isArray(
-          item?.items
-        )
-    );
-
-
-  const visualMatchUrls =
-    Array.isArray(
-      visualMatchesItem?.items
-    )
-      ? visualMatchesItem.items
-          .map(
+  const enrichedTargets =
+    targets.map(
+      target => {
+        const product =
+          primaryProducts.find(
             item =>
               String(
-                item?.image_url ||
+                item?.productId ||
+                ""
+              ).trim() ===
+              String(
+                target?.productId ||
                 ""
               ).trim()
-          )
-          .filter(Boolean)
-          .slice(
-            0,
-            15
-          )
-      : [];
+          );
 
 
-  return {
-    googleAssociatedKeyword:
-      String(
-        dataForSeoResult?.keyword ||
-        ""
-      ).trim() ||
-      null,
-
-    organicResults,
-
-    visualMatchUrls
-  };
-}
-
-async function cleanDataForSeoIdentificationEvidence({
-  promptText,
-  evidence
-}) {
-  const prompt = `
-You are cleaning Google Lens / Search By Image evidence for a camera-equipment identification system.
-
-You are NOT allowed to blindly choose the most common search result.
-
-The original identification instruction was:
-
-${promptText}
-
-Below are raw Google Search By Image observations.
-
-${JSON.stringify(
-  evidence,
-  null,
-  2
-)}
-
-Your job has TWO purposes:
-
-1. Clean and organize the visual-search evidence.
-2. Decide whether the evidence is actually strong enough to support the identification requested by the original instruction.
-
-IMPORTANT:
-
-- Google visual-search results are noisy observations, not ground truth.
-- Completely unrelated results must be discarded.
-- Closely related but commercially different camera/lens models must remain separate.
-- Do NOT merge generations such as:
-  IS
-  IS II
-  STM
-  USM
-  II
-  III
-  G2
-
-- Repeated appearances of the same exact model across independent relevant results increase support.
-- A single high-ranked result does NOT establish identity.
-- Generic family agreement is weaker than exact-model agreement.
-- If results broadly agree on only a family, but disagree on exact revision, preserve that ambiguity.
-- Never pick the most popular/common model simply because it is common.
-- Never fill in a missing model suffix from general camera knowledge.
-- If the supplied evidence does not reliably distinguish one exact model, return UNKNOWN.
-- Respect exclusions or multi-product instructions contained in the original identification instruction.
-
-For a SINGLE-product or EXCLUSION request:
-recommendedIdentification must contain ONLY one full exact model name, or exactly UNKNOWN.
-
-For a GROUP request:
-recommendedIdentification must contain one model per line.
-If a requested product cannot be reliably identified, write UNKNOWN on that line.
-
-Return exactly this JSON:
-
-{
-  "recommendedIdentification": "string",
-  "confidence": "high" | "medium" | "low",
-  "consensus": "strong" | "mixed" | "weak" | "none",
-  "candidateModels": [
-    {
-      "model": "string",
-      "support": "strong" | "moderate" | "weak"
-    }
-  ],
-  "discardedAsIrrelevant": [
-    "string"
-  ],
-  "summary": "short explanation of what the Google evidence actually establishes"
-}
-
-Return valid JSON only.
-Do not use Markdown.
-`.trim();
+        const productOcr =
+          productOcrResults.find(
+            item =>
+              String(
+                item?.productId ||
+                ""
+              ).trim() ===
+              String(
+                target?.productId ||
+                ""
+              ).trim()
+          );
 
 
-  const response =
-    await createLoggedOpenAiResponse({
-      step:
-        "DataForSEO visual evidence cleaner",
+        return {
+          ...target,
 
-      request: {
-        model:
-          "gpt-4.1-mini",
+          /*
+            Partial existing identity is ONLY a localization hint.
 
-        input: [
-          {
-            role:
-              "user",
+            It is not a new identification step.
+          */
+          knownProduct:
+            product
+              ? {
+                  brand:
+                    product?.brand ||
+                    product
+                      ?.lensIdentity
+                      ?.brand ||
+                    null,
 
-            content: [
-              {
-                type:
-                  "input_text",
+                  model:
+                    product?.model ||
+                    null,
 
-                text:
-                  prompt
-              }
-            ]
-          }
-        ]
+                  productType:
+                    product?.productType ||
+                    target.productType,
+
+                  lensIdentity:
+                    product?.lensIdentity ||
+                    null
+                }
+              : null,
+
+          ocrText:
+            String(
+              productOcr?.ocrText ||
+              ""
+            ).trim()
+        };
       }
-    });
-
-
-  const rawText =
-    String(
-      response.output_text ||
-      ""
-    ).trim();
-
-
-  let parsed;
-
-
-  try {
-    parsed =
-      JSON.parse(
-        rawText
-      );
-
-  } catch (error) {
-    console.error(
-      "[DATAFORSEO CLEANER] Invalid JSON:",
-      rawText
     );
-
-    throw new Error(
-      "DataForSEO evidence cleaner returned invalid JSON."
-    );
-  }
-
-
-  const recommendedIdentification =
-    String(
-      parsed?.recommendedIdentification ||
-      "UNKNOWN"
-    ).trim() ||
-    "UNKNOWN";
-
-
-  const cleaned = {
-    recommendedIdentification,
-
-    confidence:
-      [
-        "high",
-        "medium",
-        "low"
-      ].includes(
-        String(
-          parsed?.confidence ||
-          ""
-        ).toLowerCase()
-      )
-        ? String(
-            parsed.confidence
-          ).toLowerCase()
-        : "low",
-
-    consensus:
-      [
-        "strong",
-        "mixed",
-        "weak",
-        "none"
-      ].includes(
-        String(
-          parsed?.consensus ||
-          ""
-        ).toLowerCase()
-      )
-        ? String(
-            parsed.consensus
-          ).toLowerCase()
-        : "none",
-
-    candidateModels:
-      Array.isArray(
-        parsed?.candidateModels
-      )
-        ? parsed.candidateModels
-        : [],
-
-    discardedAsIrrelevant:
-      Array.isArray(
-        parsed?.discardedAsIrrelevant
-      )
-        ? parsed.discardedAsIrrelevant
-        : [],
-
-    summary:
-      String(
-        parsed?.summary ||
-        ""
-      ).trim()
-  };
 
 
   console.log(
-    "[DATAFORSEO CLEANER] Cleaned evidence:",
-    cleaned
-  );
-
-
-  return cleaned;
-}
-
-/*
-  ============================================================
-  SERPAPI GOOGLE AI MODE — UNCROPPED LENS FALLBACK
-  ============================================================
-*/
-
-const SERPAPI_API_KEY =
-  String(
-    process.env.SERPAPI_API_KEY ||
-    ""
-  ).trim();
-
-
-async function identifyLensWithSerpApiAiMode({
-  imageUrl,
-  promptText,
-  lensfunCandidates = []
-}) {
-  if (!SERPAPI_API_KEY) {
-    throw new Error(
-      "Missing SERPAPI_API_KEY in .env"
-    );
-  }
-
-  const cleanImageUrl =
-    String(
-      imageUrl || ""
-    ).trim();
-
-  if (
-    !/^https?:\/\//i.test(
-      cleanImageUrl
-    )
-  ) {
-    throw new Error(
-      "SerpApi Google AI Mode requires a public image URL."
-    );
-  }
-
-  const cleanPrompt =
-    String(
-      promptText || ""
-    ).trim();
-
-  if (!cleanPrompt) {
-    throw new Error(
-      "SerpApi Google AI Mode requires a prompt."
-    );
-  }
-
-  /*
-    IMPORTANT:
-
-    Do NOT replace or wrap promptText.
-
-    background.js has already decided whether this is:
-
-      single
-      exclusion
-      group
-
-    and generated the correct old Google Lens prompt.
-  */
-  const params =
-    new URLSearchParams({
-      engine:
-        "google_ai_mode",
-
-      q:
-        cleanPrompt,
-
-      image_url:
-        cleanImageUrl,
-
-      gl:
-        "us",
-
-      hl:
-        "en",
-
-      no_cache:
-        "true",
-
-      api_key:
-        SERPAPI_API_KEY
-    });
-
-
-  console.log(
-    "[SERPAPI AI MODE] Request:",
-    {
-      imageUrl:
-        cleanImageUrl,
-
-      prompt:
-        cleanPrompt,
-
-      lensfunCandidateCount:
-        Array.isArray(
-          lensfunCandidates
-        )
-          ? lensfunCandidates.length
-          : 0
-    }
+    "[DATAFORSEO CROP] Requesting isolated product crops:",
+    enrichedTargets
   );
 
 
   const response =
-    await fetch(
-      `https://serpapi.com/search?${params.toString()}`
+    await fetchLocalServer(
+      "/prepare-dataforseo-crops",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            targets:
+              enrichedTargets
+          })
+      }
     );
 
 
   const data =
-    await response.json();
+    await readJsonSafely(
+      response
+    );
 
 
   if (
     !response.ok ||
-    data?.error
+    data?.ok !== true
   ) {
-    throw new Error(
-      data?.error ||
-      `SerpApi failed with HTTP ${response.status}.`
+    throw new LocalServerError(
+      data,
+      "Could not prepare isolated DataForSEO product crops."
     );
   }
 
 
-  /*
-    Mimic the OLD Google Lens behavior.
-
-    The old Chrome-based implementation extracted
-    the visible AI Overview text and returned it as
-    plain text.
-
-    reconstructed_markdown is the SerpApi equivalent.
-  */
-  const snippetAnswer =
-  Array.isArray(
-    data?.text_blocks
-  )
-    ? data.text_blocks
-        .map(
-          block =>
-            String(
-              block?.snippet ||
-              ""
-            ).trim()
-        )
-        .filter(Boolean)
-        .join("\n")
-    : "";
-
-
-const reconstructedAnswer =
-  String(
-    data?.reconstructed_markdown ||
-    ""
-  ).trim();
-
-
-let rawAnswer =
-  snippetAnswer ||
-  reconstructedAnswer;
-
-
-/*
-  reconstructed_markdown wraps the answer in a markdown
-  link, e.g.:
-
-    [Canon EF\-S 18\-55mm f/3.5\-5.6 IS II](https://www.google.com/search?ibp=oshop&prds=...)
-
-  If we don't unwrap this, the trailing Google Shopping
-  URL (often 150-300+ chars) gets left in rawAnswer and
-  trips the length-based "not a real model name" rejection
-  in background.js's cleanGoogleIdentificationResult(),
-  silently discarding a correct identification.
-
-  Collapse every markdown link down to just its display
-  text before any other cleanup runs.
-*/
-rawAnswer =
-  rawAnswer.replace(
-    /\[([^\]]*)\]\([^)]*\)/g,
-    "$1"
-  );
-
-
-/*
-  SerpApi / Google may append accessibility UI text
-  directly after the product name.
-*/
-rawAnswer =
-  rawAnswer.replace(
-    /Go to product viewer dialog for this item\.?/gi,
-    ""
-  );
-
-
-/*
-  reconstructed_markdown escapes hyphens:
-
-    EF\-S
-    18\-55mm
-    3.5\-5.6
-
-  Convert those back to normal hyphens.
-
-  This normally does nothing when text_blocks.snippet
-  was available, because snippet is already clean.
-*/
-rawAnswer =
-  rawAnswer.replace(
-    /\\-/g,
-    "-"
-  );
-
-
-rawAnswer =
-  rawAnswer
-    .replace(/\s+/g, " ")
-    .trim();
-
-
-  if (!rawAnswer) {
-    console.warn(
-      "[SERPAPI AI MODE] No AI Mode answer returned.",
-      {
-        searchId:
-          data?.search_metadata?.id
-      }
-    );
-
-    return {
-      searchId:
-        String(
-          data?.search_metadata?.id ||
-          ""
-        ),
-
-      found:
-        false,
-
-      text:
-        ""
-    };
-  }
-
-
-  console.log(
-    "[SERPAPI AI MODE] Raw identification answer:",
-    {
-      searchId:
-        data?.search_metadata?.id,
-
-      prompt:
-        cleanPrompt,
-
-      answer:
-        rawAnswer
-    }
-  );
-
-
-  return {
-    searchId:
-      String(
-        data?.search_metadata?.id ||
-        ""
-      ),
-
-    found:
-      true,
-
-    text:
-      rawAnswer
-  };
-}
-
-const __filename =
-  fileURLToPath(
-    import.meta.url
-  );
-
-const __dirname =
-  path.dirname(
-    __filename
-  );
-
-const LENSFUN_DB_DIRECTORY =
-  path.join(
-    __dirname,
-    "data",
-    "lensfun",
-    "db"
-  );
-
-let lensfunDatabase = {
-  lenses: [],
-  cameras: [],
-  mounts: []
-};
-
-function removeLeadingLensBrand(
-  model,
-  brand
-) {
-  const cleanModel =
-    String(model || "")
-      .trim();
-
-  const cleanBrand =
-    String(brand || "")
-      .trim();
-
-  if (
-    !cleanModel ||
-    !cleanBrand
-  ) {
-    return cleanModel;
-  }
-
-  const escapedBrand =
-    cleanBrand.replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&"
-    );
-
-  return cleanModel
-    .replace(
-      new RegExp(
-        `^${escapedBrand}\\s+`,
-        "i"
-      ),
-      ""
-    )
-    .trim();
-}
-
-function lensfunArrayify(value) {
-  if (value == null) {
-    return [];
-  }
-
-  return Array.isArray(value)
-    ? value
-    : [value];
-}
-
-
-/*
-  Returns the primary language subtag of a parsed XML node's
-  lang="..." attribute ("en-US" -> "en").
-
-  Plain strings, numbers, and objects with no lang attribute
-  are "untagged" and return "".
-*/
-function lensfunLang(value) {
-  if (
-    !value ||
-    typeof value !== "object" ||
-    Array.isArray(value)
-  ) {
-    return "";
-  }
-
-  return String(
-    value["@_lang"] ||
-    ""
-  )
-    .trim()
-    .toLowerCase()
-    .split(/[-_]/)[0];
-}
-
-
-function lensfunText(value) {
-  if (
-    typeof value === "string" ||
-    typeof value === "number"
-  ) {
-    return String(value).trim();
-  }
-
-  /*
-    fast-xml-parser turns REPEATED tags into an array, e.g.
-
-      <model>Nikon AF-P DX Nikkor 18-55mm f/3.5-5.6G VR</model>
-      <model lang="en">Nikkor AF-P 18-55mm f/3.5-5.6G DX VR</model>
-
-    parses as
-
-      [
-        "Nikon AF-P DX Nikkor 18-55mm f/3.5-5.6G VR",
-        { "#text": "Nikkor AF-P ...", "@_lang": "en" }
-      ]
-
-    Pick ONE canonical value so a record never loads blank.
-    Preference order:
-
-      1. untagged/default value
-      2. lang="en"
-      3. any other non-empty value
-
-    Ties inside a tier keep document order.
-
-    IMPORTANT: this function is passed straight to .map() for
-    repeated <mount>/<compat> tags, so it must keep a single
-    parameter (.map() would otherwise feed it the array index).
-  */
-  if (Array.isArray(value)) {
-    const entries =
-      value
-        .map(
-          item => ({
-            text:
-              lensfunText(item),
-
-            lang:
-              lensfunLang(item)
-          })
-        )
-        .filter(
-          entry =>
-            entry.text
-        );
-
-    const chosen =
-      entries.find(
-        entry =>
-          !entry.lang
-      ) ||
-      entries.find(
-        entry =>
-          entry.lang === "en"
-      ) ||
-      entries[0];
-
-    return chosen
-      ? chosen.text
-      : "";
-  }
-
-  if (
-    value &&
-    typeof value === "object"
-  ) {
-    return String(
-      value["#text"] ||
-      ""
-    ).trim();
-  }
-
-  return "";
-}
-
-
-/*
-  Post-load sanity check.
-
-  A blank maker/model/mount means a record was parsed
-  incorrectly (for example an XML shape the text helpers
-  don't understand). Those records fail matching silently,
-  so report them once at startup instead.
-*/
-function validateLensfunDatabase(
-  database
-) {
-  const isBlank =
-    value =>
-      !String(
-        value || ""
-      ).trim();
-
-  const lenses =
-    database?.lenses || [];
-
-  const cameras =
-    database?.cameras || [];
-
-  const mounts =
-    database?.mounts || [];
-
-  const summary = {
-    lensesMissingMaker:
-      lenses.filter(
-        lens =>
-          isBlank(lens.maker)
-      ).length,
-
-    lensesMissingModel:
-      lenses.filter(
-        lens =>
-          isBlank(lens.model)
-      ).length,
-
-    lensesMissingMount:
-      lenses.filter(
-        lens =>
-          !lens.mounts?.length
-      ).length,
-
-    camerasMissingMaker:
-      cameras.filter(
-        camera =>
-          isBlank(camera.maker)
-      ).length,
-
-    camerasMissingModel:
-      cameras.filter(
-        camera =>
-          isBlank(camera.model)
-      ).length,
-
-    camerasMissingMount:
-      cameras.filter(
-        camera =>
-          isBlank(camera.mount)
-      ).length,
-
-    mountsMissingName:
-      mounts.filter(
-        mount =>
-          isBlank(mount.name)
-      ).length
-  };
-
-  /*
-    Informational only: how many lens records carried repeated
-    <model> tags (localized names) and had to be reduced to one
-    canonical value.
-  */
-  const lensesWithRepeatedModelTags =
-    lenses.filter(
-      lens =>
-        Array.isArray(
-          lens.raw?.model
-        )
-    ).length;
-
-  const invalidCount =
-    Object.values(summary)
-      .reduce(
-        (sum, count) =>
-          sum + count,
-        0
-      );
-
-  if (invalidCount === 0) {
-    console.log(
-      "[LENSFUN] Validation passed: no blank maker/model/mount fields.",
-      {
-        lensesWithRepeatedModelTags
-      }
-    );
-
-    return summary;
-  }
-
-  console.warn(
-    "[LENSFUN] Validation found blank maker/model/mount fields:",
-    {
-      ...summary,
-      lensesWithRepeatedModelTags
-    }
-  );
-
-  const sampleInvalidLenses =
-    lenses
-      .filter(
-        lens =>
-          isBlank(lens.maker) ||
-          isBlank(lens.model) ||
-          !lens.mounts?.length
-      )
-      .slice(0, 5)
-      .map(
-        lens => ({
-          sourceFile:
-            lens.sourceFile,
-
-          maker:
-            lens.maker,
-
-          model:
-            lens.model,
-
-          mounts:
-            lens.mounts
-        })
-      );
-
-  if (sampleInvalidLenses.length) {
-    console.warn(
-      "[LENSFUN] First invalid lens record(s):",
-      sampleInvalidLenses
-    );
-  }
-
-  return summary;
-}
-
-
-function loadLensfunDatabase() {
-  const parser =
-    new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: "@_",
-      textNodeName: "#text"
-    });
-
-
-  const files =
-    fs.readdirSync(
-      LENSFUN_DB_DIRECTORY
-    )
-      .filter(
-        fileName =>
-          fileName
-            .toLowerCase()
-            .endsWith(".xml")
-      );
-
-
-  const lenses = [];
-  const cameras = [];
-  const mounts = [];
-
-
-  for (
-    const fileName of files
-  ) {
-    const fullPath =
-      path.join(
-        LENSFUN_DB_DIRECTORY,
-        fileName
-      );
-
-    try {
-      const xml =
-        fs.readFileSync(
-          fullPath,
-          "utf8"
-        );
-
-      const parsed =
-        parser.parse(xml);
-
-      const root =
-        parsed?.lensdatabase;
-
-      if (!root) {
-        continue;
-      }
-
-
-      for (
-        const lens of
-          lensfunArrayify(root.lens)
-      ) {
-        lenses.push({
-          maker:
-            lensfunText(
-              lens?.maker
-            ),
-
-          model:
-            lensfunText(
-              lens?.model
-            ),
-
-          mounts:
-            lensfunArrayify(
-              lens?.mount
-            )
-              .map(lensfunText)
-              .filter(Boolean),
-
-          cropfactor:
-            lens?.cropfactor ?? null,
-
-          focal:
-            lens?.focal ?? null,
-
-          aperture:
-            lens?.aperture ?? null,
-
-          sourceFile:
-            fileName,
-
-          raw:
-            lens
-        });
-      }
-
-
-      for (
-        const camera of
-          lensfunArrayify(root.camera)
-      ) {
-        cameras.push({
-          maker:
-            lensfunText(
-              camera?.maker
-            ),
-
-          model:
-            lensfunText(
-              camera?.model
-            ),
-
-          mount:
-            lensfunText(
-              camera?.mount
-            ),
-
-          cropfactor:
-            camera?.cropfactor ?? null,
-
-          sourceFile:
-            fileName
-        });
-      }
-
-
-      for (
-        const mount of
-          lensfunArrayify(root.mount)
-      ) {
-        mounts.push({
-          name:
-            lensfunText(
-              mount?.name
-            ),
-
-          compat:
-            lensfunArrayify(
-              mount?.compat
-            )
-              .map(lensfunText)
-              .filter(Boolean),
-
-          sourceFile:
-            fileName
-        });
-      }
-
-    } catch (error) {
-      console.error(
-        `[LENSFUN] Failed parsing ${fileName}:`,
-        error
-      );
-    }
-  }
-
-
-  lensfunDatabase = {
-    lenses,
-    cameras,
-    mounts
-  };
-
-
-  console.log(
-    "[LENSFUN] Loaded:",
-    {
-      files:
-        files.length,
-
-      lenses:
-        lenses.length,
-
-      cameras:
-        cameras.length,
-
-      mounts:
-        mounts.length
-    }
-  );
-
-
-  validateLensfunDatabase(
-    lensfunDatabase
-  );
-}
-
-function normalizeLensfunComparisonText(
-  value
-) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[–—]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-function extractFocalLengthFromText(
-  value
-) {
-  const text =
-    String(value || "")
-      .replace(/[–—]/g, "-");
-
-
-  const match =
-    text.match(
-      /\b(\d{1,3}(?:\.\d+)?)\s*(?:-\s*(\d{1,3}(?:\.\d+)?))?\s*mm\b/i
-    );
-
-
-  if (!match) {
-    return null;
-  }
-
-
-  if (match[2]) {
-    return (
-      `${match[1]}-${match[2]}mm`
-    );
-  }
-
-
-  return `${match[1]}mm`;
-}
-
-
-function extractMaxApertureFromText(
-  value
-) {
-  const text =
-    String(value || "")
-      .replace(/[–—]/g, "-");
-
-
-  /*
-    Supports:
-
-    1:3.5-6.3
-    1:3.5–6.3
-    f/3.5-6.3
-    F3.5-6.3
-    F2.8
-  */
-  const match =
-    text.match(
-      /(?:\b1\s*:\s*|\bf\s*\/?\s*)(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?/i
-    );
-
-
-  if (!match) {
-    return null;
-  }
-
-
-  if (match[2]) {
-    return (
-      `f/${match[1]}-${match[2]}`
-    );
-  }
-
-
-  return `f/${match[1]}`;
-}
-
-
-function normalizeApertureForComparison(
-  value
-) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/^f\s*\/?/i, "")
-    .replace(/^1\s*:/i, "")
-    .replace(/\s+/g, "")
-    .replace(/[–—]/g, "-")
-    .trim();
-}
-
-
-function normalizeFocalForComparison(
-  value
-) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[–—]/g, "-")
-    .trim();
-}
-
-function inferExplicitLensMountFromEvidence(
-  product
-) {
-  const evidenceText =
-    normalizeStringArray(
-      product?.extracted_evidence
-    )
-      .join(" ");
-
-  /*
-    Ordered most-specific first so:
-      RF-S does not become RF
-      EF-S does not become EF
-  */
-  const knownMountTokens = [
-    [ /\bRF-S\b/i, "RF-S" ],
-    [ /\bEF-S\b/i, "EF-S" ],
-    [ /\bEF-M\b/i, "EF-M" ],
-    [ /\bRF\b/i, "RF" ],
-    [ /\bEF\b/i, "EF" ]
-  ];
-
-  for (
-    const [pattern, mount] of
-      knownMountTokens
-  ) {
-    if (
-      pattern.test(
-        evidenceText
-      )
-    ) {
-      return mount;
-    }
-  }
-
-  return null;
-}
-
-function collectStructuredLensEvidence(
-  product
-) {
-  const productId =
-    String(
-      product?.productId || ""
-    ).trim();
-
-  const normalizedIdentity =
-    normalizeLensIdentity(
-      product?.lensIdentity ||
-      {}
-    );
-
-  return {
-    productId,
-
-    brand:
-      normalizedIdentity.brand,
-
-    focalLength:
-      normalizedIdentity.focalLength,
-
-    maxAperture:
-      normalizedIdentity.maxAperture,
-
-    modelCodes:
-      normalizedIdentity.modelCodes,
-
-    generation:
-      normalizedIdentity.generation,
-
-explicitMount:
-  normalizedIdentity.mountSeries ||
-  inferExplicitLensMountFromEvidence(
-    product
-  ),
-
-    featureTokens:
-      normalizedIdentity.featureTokens
-  };
-}
-
-function expandLensfunCandidateVariants(
-  lens
-) {
-  const mounts =
+  const prepared =
     Array.isArray(
-      lens?.mounts
+      data?.targets
     )
-      ? lens.mounts
-          .map(
-            value =>
-              String(
-                value || ""
-              ).trim()
-          )
-          .filter(Boolean)
+      ? data.targets
       : [];
 
 
-  /*
-    A record with no mount still gets represented,
-    but its mount remains unknown.
-  */
-  const variants =
-    mounts.length
-      ? mounts
-      : [null];
-
-
-  return variants.map(
-    (mount, index) => ({
-      candidateId:
-        [
-          String(
-            lens?.sourceFile || ""
-          ),
-
-          String(
-            lens?.maker || ""
-          ),
-
-          String(
-            lens?.model || ""
-          ),
-
-          String(
-            mount || "unknown"
-          ),
-
-          String(index)
-        ]
-          .join("|")
-          .toLowerCase(),
-
-      maker:
-        String(
-          lens?.maker || ""
-        ).trim(),
-
-      model:
-        String(
-          lens?.model || ""
-        ).trim(),
-
-      mount,
-
-      sourceFile:
-        String(
-          lens?.sourceFile || ""
-        ).trim()
-    })
-  );
-}
-
-/*
-  Legacy manual-focus mounts where a Lensfun entry for a DIFFERENT
-  mount family must never be accepted as a stand-in.
-*/
-function isLegacyManualMountWithoutLensfunMatch(
-  explicitMount
-) {
-  const key =
-    String(explicitMount || "")
-      .toLowerCase()
-      .replace(/\b(mount|bayonet)\b/g, " ")
-      .replace(
-        /\b(minolta|olympus|pentax|yashica|contax|exakta|konica|canon)\b/g,
-        " "
-      )
-      .replace(/[^a-z0-9/]+/g, "");
-
-  return new Set([
-    "md",
-    "mc",
-    "md/mc",
-    "mc/md",
-    "sr",
-    "m42",
-    "om",
-    "fd",
-    "fl",
-    "c/y",
-    "exakta",
-    "t",
-    "t2",
-    "c"
-  ]).has(key);
-}
-
-function findLensfunCandidates(
-  evidence
-) {
-  const brand =
-    normalizeLensfunComparisonText(
-      evidence?.brand
-    );
-
-  const focal =
-    normalizeFocalForComparison(
-      evidence?.focalLength
-    );
-
-  const aperture =
-    normalizeApertureForComparison(
-      evidence?.maxAperture
-    );
-
-  const explicitMount =
-    normalizeLensfunComparisonText(
-      evidence?.explicitMount
-    );
-
-    const featureTokens =
-  normalizeStringArray(
-    evidence?.featureTokens
-  )
-    .map(
-      token =>
-        normalizeLensfunComparisonText(
-          token
-        )
-    )
-    .filter(Boolean);
-
-  const generation =
-    normalizeLensfunComparisonText(
-      evidence?.generation
-    );
-
-  const modelCodes =
-    normalizeStringArray(
-      evidence?.modelCodes
-    )
-      .map(
-        code =>
-          normalizeLensfunComparisonText(
-            code
-          )
-      )
-      .filter(Boolean);
-
-
-  /*
-    We need at least something useful.
-
-    Searching all 1,564 lenses with no evidence
-    would accomplish nothing.
-  */
-  if (
-    !brand &&
-    !focal
-  ) {
-    return [];
-  }
-
-
-  const scoredRecords =
-    lensfunDatabase.lenses
-      .map(
-        lens => {
-          const makerText =
-            normalizeLensfunComparisonText(
-              lens?.maker
-            );
-
-          const modelText =
-            normalizeLensfunComparisonText(
-              lens?.model
-            );
-
-
-          let score = 0;
-
-
-          /*
-            Manufacturer is strong evidence.
-          */
-          if (brand) {
-            if (
-              makerText === brand ||
-              makerText.includes(
-                brand
-              ) ||
-              brand.includes(
-                makerText
-              )
-            ) {
-              score += 10;
-            } else {
-              /*
-                If we confidently know Sigma,
-                don't return Canon lenses.
-              */
-              return null;
-            }
-          }
-
-
-         /*
-  Focal length/range must match EXACTLY.
-
-  Do not allow:
-    -55mm -> 18-55mm
-    50mm  -> 16-50mm
-    55mm  -> 18-55mm
-*/
-if (focal) {
-  const candidateFocal =
-    normalizeFocalForComparison(
-      extractFocalLengthFromText(
-        lens?.model
-      )
-    );
-
-  if (
-    !candidateFocal ||
-    candidateFocal !== focal
-  ) {
-    return null;
-  }
-
-  score += 12;
-}
-
-
-          /*
-            Aperture further narrows revisions.
-
-            We don't require it because Lensfun naming
-            conventions are not perfectly uniform.
-          */
-          if (aperture) {
-  const candidateAperture =
-    normalizeApertureForComparison(
-      extractMaxApertureFromText(
-        lens?.model
-      )
-    );
-
-
-  /*
-    If both Marketplace evidence and Lensfun
-    explicitly state an aperture and they disagree,
-    this cannot be the same exact lens.
-  */
-  if (
-    candidateAperture &&
-    candidateAperture !==
-      aperture
-  ) {
-    return null;
-  }
-
-
-  if (
-    candidateAperture ===
-    aperture
-  ) {
-    score += 8;
-  }
-}
-
-if (featureTokens.length) {
-  const allFeatureTokensMatch =
-    featureTokens.every(
-      token => {
-        const escapedToken =
-          token.replace(
-            /[.*+?^${}()|[\]\\]/g,
-            "\\$&"
-          );
-
-        return new RegExp(
-          `(^|[^a-z0-9])${escapedToken}(?=$|[^a-z0-9])`,
-          "i"
-        ).test(
-          modelText
-        );
-      }
-    );
-
-  if (!allFeatureTokensMatch) {
-    return null;
-  }
-
-  score +=
-    featureTokens.length * 4;
-}
-
-/*
-  A revision/generation marker ("II", "III", "Mark II") printed
-  on the lens barrel or reported by visual identification is
-  just as strong a discriminator as a feature token, and rules
-  out any candidate whose name doesn't contain it - e.g.
-  generation "III" eliminates a plain "IS USM" candidate.
-*/
-if (generation) {
-  const escapedGeneration =
-    generation.replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&"
-    );
-
-  const generationMatches =
-    new RegExp(
-      `(^|[^a-z0-9])${escapedGeneration}(?=$|[^a-z0-9])`,
-      "i"
-    ).test(
-      modelText
-    );
-
-  if (!generationMatches) {
-    return null;
-  }
-
-  score += 6;
-}
-
-/*
-  Literal manufacturer SKUs are rare in Lensfun model names but
-  are unambiguous when they do appear - treat them as a soft
-  scoring boost rather than a hard filter, since most Lensfun
-  entries won't include the SKU at all.
-*/
-if (modelCodes.length) {
-  const matchedModelCodes =
-    modelCodes.filter(
-      code => {
-        const escapedCode =
-          code.replace(
-            /[.*+?^${}()|[\]\\]/g,
-            "\\$&"
-          );
-
-        return new RegExp(
-          `(^|[^a-z0-9])${escapedCode}(?=$|[^a-z0-9])`,
-          "i"
-        ).test(
-          modelText
-        );
-      }
-    );
-
-  score +=
-    matchedModelCodes.length * 4;
-}
-
-          return {
-            lens,
-            score
-          };
-        }
-      )
-      .filter(Boolean);
-
-
-  /*
-    Expand records by physical mount.
-  */
-  let candidates =
-    scoredRecords
-      .flatMap(
-        entry =>
-          expandLensfunCandidateVariants(
-            entry.lens
-          )
-            .map(
-              candidate => ({
-                ...candidate,
-                score:
-                  entry.score
-              })
-            )
-      );
-
-
-  /*
-    If OCR literally established a mount,
-    use it as a hard narrowing signal.
-  */
-  if (explicitMount) {
-   const mountFiltered =
-  candidates.filter(
-    candidate => {
-      const candidateMount =
-        normalizeLensfunComparisonText(
-          candidate?.mount
-        );
-
-      if (!candidateMount) {
-        return false;
-      }
-
-      return (
-        candidateMount ===
-          explicitMount ||
-
-        candidateMount.includes(
-          explicitMount
-        ) ||
-
-        explicitMount.includes(
-          candidateMount
-        )
-      );
-    }
-  );
-
-
-    if (mountFiltered.length) {
-      candidates =
-        mountFiltered;
-    } else if (
-      isLegacyManualMountWithoutLensfunMatch(
-        explicitMount
-      )
-    ) {
-      /*
-        The lens is explicitly a legacy manual-focus mount (e.g.
-        Minolta MD) and Lensfun has nothing for that mount. Do NOT
-        fall back to same-focal-length lenses from a different
-        mount family (e.g. "Minolta AF 70-210mm f/4 Macro") - that
-        is a different physical product with a different value.
-      */
-      console.log(
-        "[LENSFUN] Explicit legacy mount has no Lensfun entries; returning no candidates instead of cross-mount matches:",
-        explicitMount
-      );
-
-      candidates = [];
-    }
-  }
-
-
-  /*
-    De-duplicate identical Lensfun entries.
-  */
-  const unique =
-    new Map();
-
-
-  for (
-    const candidate of candidates
-  ) {
-    const key =
-      [
-        candidate.maker,
-        candidate.model,
-        candidate.mount
-      ]
-        .map(
-          value =>
-            normalizeLensfunComparisonText(
-              value
-            )
-        )
-        .join("|");
-
-
-    if (!unique.has(key)) {
-      unique.set(
-        key,
-        candidate
-      );
-    }
-  }
-
-
-  candidates =
-    Array.from(
-      unique.values()
-    );
-
-
-  candidates.sort(
-    (a, b) =>
-      Number(
-        b.score || 0
-      ) -
-      Number(
-        a.score || 0
-      )
-  );
-
-
-  /*
-    Only retain the strongest reasonable set.
-  */
-  if (candidates.length) {
-    const bestScore =
-      Number(
-        candidates[0].score ||
-        0
-      );
-
-
-    candidates =
-      candidates.filter(
-        candidate =>
-          Number(
-            candidate.score || 0
-          ) >=
-            bestScore - 2
-      );
-  }
-
-
-  return candidates;
-}
-
-
-/*
-  ============================================================
-  MULTIPLE-CANDIDATE DISAMBIGUATION STRATEGY
-
-  When Lensfun returns more than one candidate, they all
-  survived the SAME hard filters in findLensfunCandidates()
-  above (maker, exact focal length, exact aperture when known,
-  every feature token, and any reported generation marker -
-  any mismatch on those returns null and drops the candidate).
-  Multiple candidates can still survive together when they
-  differ only by something none of those fields captured, e.g.
-  a barrel-printed suffix like "USM" that OCR/seller text never
-  mentioned - "IS" vs "IS STM" vs "IS II" all differing only in
-  a token nobody supplied as structured evidence.
-
-  Before asking for a fresh visual identification, check whether
-  a visual identification we already have (this pass's SerpApi
-  answer, or an earlier one) exactly matches exactly one of the
-  remaining candidates via matchVisualAnswerToLensfunCandidate().
-  If so, that answer is treated as the final discriminator and
-  resolution stops there - it is NOT sent back through another
-  Lensfun/SerpApi cycle.
-
-  Empirically, a cropped reverse-image search (DataForSEO) has
-  never once resolved this specific ambiguity: a plain black
-  kit lens barrel looks visually identical across those three
-  variants at crop zoom level, so Google's image match just
-  returns generic "Canon EOS Rebel kit" results with no
-  consensus. SerpApi's Google AI Mode, run on the ORIGINAL
-  uncropped photo, can actually read the small print on the
-  barrel and has reliably resolved this exact case.
-
-  So: if no visual answer directly matches a candidate, prefer
-  requesting SerpApi AI Mode over cropped DataForSEO.
-  ============================================================
-*/
-
-/*
-  Normalize a lens model string for exact comparison by
-  stripping everything except letters/digits and lowercasing.
-  This makes formatting differences between the Lensfun database
-  and a visual-search answer (e.g. "f/4-5.6" vs "F4-5.6") collapse
-  to the same key without needing bespoke aperture-format logic.
-*/
-function normalizeLensAnswerForExactMatch(
-  value
-) {
-  /*
-    Canonicalize notation differences that made a correct visual
-    answer fail to match its own Lensfun candidate:
-      "1:1.4"  / "f/1.4" / "f 1.4" / "F1.4"   -> "f1.4"
-      "1:3.5-5.6"                              -> "f3.5-5.6"
-      a bare "Lens" word ("Nikon Lens Series E") is ignored.
-    Both sides go through this function, so matching is still an
-    exact, unique comparison - just notation-insensitive.
-  */
-  return String(
-    value || ""
-  )
-    .toLowerCase()
-    .replace(/[–—]/g, "-")
-    .replace(
-      /\b1\s*:\s*(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?/g,
-      (match, low, high) =>
-        `f${low}${high ? `-${high}` : ""}`
-    )
-    .replace(
-      /\bf\s*\/?\s*(\d+(?:\.\d+)?)/g,
-      "f$1"
-    )
-    .replace(/\blens\b/g, " ")
-    .replace(
-      /[^a-z0-9]+/g,
-      ""
-    );
-}
-
-/*
-  Deterministically match a visual-identification answer (from
-  SerpApi AI Mode, or any other source) against the Lensfun
-  candidates that survived findLensfunCandidates(). Only an
-  EXACT match (after normalization) that uniquely identifies one
-  candidate is accepted - this is intentionally conservative:
-  a partial/fuzzy match could easily pick the wrong variant among
-  near-identical kit lens candidates, which is worse than staying
-  unresolved.
-*/
-function matchVisualAnswerToLensfunCandidate(
-  answerText,
-  candidates
-) {
-  const cleanAnswer =
-    String(
-      answerText || ""
-    ).trim();
-
-  if (
-    !cleanAnswer ||
-    cleanAnswer.toLowerCase() ===
-      "unknown" ||
-    !Array.isArray(candidates) ||
-    !candidates.length
-  ) {
-    return null;
-  }
-
-  const normalizedAnswer =
-    normalizeLensAnswerForExactMatch(
-      cleanAnswer
-    );
-
-  if (!normalizedAnswer) {
-    return null;
-  }
-
-  const exactMatches =
-    candidates.filter(
-      candidate =>
-        normalizeLensAnswerForExactMatch(
-          candidate?.model
-        ) === normalizedAnswer
-    );
-
-  return exactMatches.length === 1
-    ? exactMatches[0]
-    : null;
-}
-
-function lensfunCandidateToIdentity(
-  candidate
-) {
-  if (!candidate) {
-    return null;
-  }
-
-
-  const focalLength =
-    extractFocalLengthFromText(
-      candidate.model
-    );
-
-
-  const maxAperture =
-    extractMaxApertureFromText(
-      candidate.model
-    );
-
-
-  return {
-    brand:
-      cleanNullableIdentityField(
-        candidate.maker
-      ),
-
-    canonicalModel:
-      cleanNullableIdentityField(
-        candidate.model
-      ),
-
-    mountSeries:
-      cleanNullableIdentityField(
-        candidate.mount
-      ),
-
-    focalLength,
-
-    maxAperture,
-
-featureTokens:
-  [],
-
-modelCodes:
-  [],
-
-generation:
-  null,
-
-    lensfunCandidateId:
-      candidate.candidateId,
-
-    lensfunSourceFile:
-      candidate.sourceFile,
-
-    resolutionMode:
-      "lensfun"
-  };
-}
-
-function isCompleteLensfunFocalEvidence(
-  value
-) {
-  const focal =
-    normalizeFocalForComparison(
-      value
-    );
-
-  /*
-    Only allow COMPLETE focal lengths/ranges.
-
-    Valid:
-      50mm
-      18-55mm
-      12.5mm
-
-    Invalid / truncated OCR:
-      -55mm
-      18-mm
-      18-
-  */
-  return /^(?:\d+(?:\.\d+)?)(?:-\d+(?:\.\d+)?)?mm$/i
-    .test(
-      focal
-    );
-}
-
-
-function hasEnoughEvidenceForLensfun(
-  evidence
-) {
-  const brand =
-    String(
-      evidence?.brand ||
-      ""
-    ).trim();
-
-  const focalLength =
-    String(
-      evidence?.focalLength ||
-      ""
-    ).trim();
-
-  return Boolean(
-    brand &&
-    isCompleteLensfunFocalEvidence(
-      focalLength
-    )
-  );
-}
-
-/*
-  ============================================================
-  LENSFUN MULTI-CANDIDATE RESALE CONSENSUS
-
-  When Lensfun narrows a lens down to exactly 2 or 3 surviving
-  candidates (after the structured OCR evidence has already
-  been organized/filtered by findLensfunCandidates()), it is
-  often cheaper and just as reliable to price ALL of the
-  remaining candidates instead of spending a SerpApi Google AI
-  Mode call trying to pin down exactly which one it is.
-
-  For each remaining candidate:
-    1. Look it up in the global Supabase "camera_products"
-       resale database (findProductInDatabase).
-    2. If it is not already in the database, run the normal
-       eBay active-listing comp analysis for it
-       (evaluateActiveCompsForTarget), which also appends the
-       newly learned price back into Supabase
-       (saveProductToDatabase) exactly like the standard
-       /evaluate-active-comps flow does.
-
-  If every candidate ends up with a valid resale price AND the
-  spread between the cheapest and priciest candidate is under
-  $20, we don't actually need to know which exact model it is:
-  averaging the 2-3 resale prices is an accurate-enough resale
-  estimate for the primary item, so we accept that average and
-  skip the SerpApi identification step entirely.
-
-  If any candidate can't be priced, or the prices disagree by
-  $20 or more, this returns null so resolveCanonicalLens() falls
-  through to its normal visual-match / SerpApi routing.
-  ============================================================
-*/
-const LENSFUN_CANDIDATE_RESALE_CONSENSUS_MAX_DEVIATION = 20;
-
-/*
-  Builds an eBay-search-ready "target" item for one Lensfun
-  candidate, reusing whatever listing-level context (condition,
-  facebookPrice, negativeSearchTerms, etc.) is already on the
-  ambiguous product, but overriding the identity fields
-  (brand/model/productType/ebaySearchQuery) with THIS candidate's
-  own values.
-*/
-function buildEbayTargetFromLensfunCandidate({
-  candidate,
-  product
-}) {
-  const brand =
-    String(
-      candidate?.maker || ""
-    ).trim();
-
-  const model =
-    String(
-      candidate?.model || ""
-    ).trim();
-
-  const productType =
-    String(
-      product?.productType ||
-      "Lens"
-    ).trim();
-
-  const ebaySearchQuery =
-    [
-      brand,
-      model
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  return {
-    ...product,
-
-    brand,
-
-    model,
-
-    productType,
-
-    ebaySearchQuery,
-
-    /*
-      This candidate IS a specific, named Lensfun model -
-      it is eligible for an eBay search even though the
-      PRIMARY item's exact identity is still ambiguous.
-    */
-    exactIdentityResolved:
-      true,
-
-    negativeSearchTerms:
-      Array.isArray(
-        product?.negativeSearchTerms
-      )
-        ? product.negativeSearchTerms
-        : []
-  };
-}
-
-async function priceLensfunCandidateForConsensus(
-  candidate,
-  product
-) {
-  const candidateItem =
-    buildEbayTargetFromLensfunCandidate({
-      candidate,
-      product
-    });
-
-  if (
-    !hasEnoughIdentityForEbaySearch(
-      candidateItem
-    )
-  ) {
-    return {
-      candidate,
-      candidateItem,
-      estimatedResalePrice:
-        null,
-      source:
-        "insufficient-identity"
-    };
-  }
-
-  const databaseProduct =
-    await findProductInDatabase(
-      candidateItem
-    );
-
-  if (databaseProduct) {
-    return {
-      candidate,
-      candidateItem,
-      estimatedResalePrice:
-        Number(
-          databaseProduct.estimated_resale_price
-        ),
-      source:
-        "supabase"
-    };
-  }
-
-  /*
-    Not in the global database yet - run the normal eBay
-    active-comp analysis for it. This also writes the newly
-    learned price back into Supabase via
-    saveProductToDatabase(), same as /evaluate-active-comps.
-  */
-  const compResult =
-    await evaluateActiveCompsForTarget(
-      candidateItem
-    );
-
-  const expectedSalePrice =
-    Number(
-      compResult?.expectedSalePrice
-    );
-
-  return {
-    candidate,
-    candidateItem,
-    estimatedResalePrice:
-      Number.isFinite(
-        expectedSalePrice
-      ) &&
-      expectedSalePrice > 0
-        ? expectedSalePrice
-        : null,
-    source:
-      "ebay-comp-analysis"
-  };
-}
-
-async function resolveLensfunCandidatesViaResaleConsensus({
-  evidence,
-  product,
-  candidates
-}) {
-  try {
-    const priced =
-      await Promise.all(
-        candidates.map(
-          candidate =>
-            priceLensfunCandidateForConsensus(
-              candidate,
-              product
-            )
-        )
-      );
-
-    const unpriced =
-      priced.filter(
-        entry =>
-          !Number.isFinite(
-            entry.estimatedResalePrice
-          ) ||
-          entry.estimatedResalePrice <= 0
-      );
-
-    if (unpriced.length > 0) {
-      console.log(
-        "[LENS RESOLVER] Candidate resale consensus skipped: could not price every remaining candidate.",
-        {
-          productId:
-            evidence?.productId,
-
-          unpricedModels:
-            unpriced.map(
-              entry =>
-                entry?.candidate?.model
-            )
-        }
-      );
-
-      return null;
-    }
-
-    const prices =
-      priced.map(
-        entry =>
-          entry.estimatedResalePrice
-      );
-
-    const deviation =
-      Math.max(...prices) -
-      Math.min(...prices);
-
-    if (
-      deviation >=
-      LENSFUN_CANDIDATE_RESALE_CONSENSUS_MAX_DEVIATION
-    ) {
-      console.log(
-        "[LENS RESOLVER] Candidate resale prices diverge too much for consensus:",
-        {
-          productId:
-            evidence?.productId,
-
-          prices,
-
-          deviation
-        }
-      );
-
-      return null;
-    }
-
-    const averagedResalePrice =
-      Number(
-        (
-          prices.reduce(
-            (sum, price) =>
-              sum + price,
-            0
-          ) / prices.length
-        ).toFixed(2)
-      );
-
-    /*
-      All remaining candidates priced within $20 of each other,
-      so which exact model it is barely matters for valuation.
-      Use the first candidate as the representative identity,
-      but carry the averaged resale price as an override so
-      downstream code uses the consensus price instead of a
-      single candidate's individually-estimated value.
-    */
-    const identity =
-      lensfunCandidateToIdentity(
-        priced[0].candidate
-      );
-
-    identity.resolutionMode =
-      "lensfun-candidate-resale-consensus";
-
-    identity.resaleValueOverride =
-      averagedResalePrice;
-
-    identity.resaleConsensusCandidateModels =
-      priced.map(
-        entry =>
-          entry?.candidate?.model
-      );
-
-    console.log(
-      "[LENS RESOLVER] Resolved via candidate resale consensus:",
-      {
-        productId:
-          evidence?.productId,
-
-        candidateModels:
-          identity.resaleConsensusCandidateModels,
-
-        prices,
-
-        averagedResalePrice
-      }
-    );
-
-    return {
-      evidence,
-
-      identity,
-
-      candidates,
-
-      mode:
-        "lensfun-candidate-resale-consensus",
-
-      resaleValueOverride:
-        averagedResalePrice,
-
-      reason:
-        `${candidates.length} Lensfun candidates priced within ` +
-        `$${LENSFUN_CANDIDATE_RESALE_CONSENSUS_MAX_DEVIATION} of each ` +
-        `other (spread $${deviation.toFixed(2)}); averaged their ` +
-        `estimated resale prices instead of routing to SerpApi.`
-    };
-
-  } catch (error) {
-    console.warn(
-      "[LENS RESOLVER] Candidate resale consensus failed; falling back to normal routing:",
-      error?.message ||
-      error
-    );
-
-    return null;
-  }
-}
-
-async function resolveCanonicalLens({
-  product,
-  cameraContext,
-  visualIdentificationAnswer
-}) {
-  const evidence =
-    collectStructuredLensEvidence(
-      product
-    );
-
-  console.log(
-    "[LENS RESOLVER] Structured evidence:",
-    evidence
-  );
-
-
-  /*
-    ============================================================
-    DETERMINISTIC LENSFUN ELIGIBILITY
-    ============================================================
-  */
-
-  if (
-    !hasEnoughEvidenceForLensfun(
-      evidence
-    )
-  ) {
-        /*
-      Lensfun cannot be queried (missing maker or a complete focal
-      length). That is NOT automatically an insufficient identity:
-      a brand plus a literal manufacturer model code is already a
-      commercially adequate identity. Assess it separately.
-    */
-    const sufficiencyWithoutLensfun =
-      assessLensIdentitySufficiency(
-        evidence
-      );
-
-    if (
-      sufficiencyWithoutLensfun.sufficient
-    ) {
-      const groundedIdentity =
-        buildGroundedLensIdentity(
-          product,
-          evidence,
-          sufficiencyWithoutLensfun
-        );
-
-      console.log(
-        "[LENS RESOLVER] Lensfun not queryable, but seller/OCR identity is already commercially sufficient. No visual fallback:",
-        {
-          productId:
-            evidence.productId,
-          sufficiency:
-            sufficiencyWithoutLensfun,
-          canonicalModel:
-            groundedIdentity.canonicalModel
-        }
-      );
-
-      return {
-        evidence,
-        identity:
-          groundedIdentity,
-        candidates:
-          [],
-        mode:
-          "seller-ocr-grounded",
-        reason:
-          `Seller/OCR identity is commercially sufficient (${sufficiencyWithoutLensfun.reason}); Lensfun lookup not required.`,
-        reasonCode:
-          "lens-identity-grounded",
-        notFoundInLensfun:
-          false,
-        identityInsufficient:
-          false
-      };
-    }
-
-    console.log(
-      "[LENS RESOLVER] Identity insufficient (Lensfun not queryable). Routing to visual fallback:",
-      {
-        productId:
-          evidence.productId,
-        brand:
-          evidence.brand,
-        focalLength:
-          evidence.focalLength,
-        sufficiency:
-          sufficiencyWithoutLensfun
-      }
-    );
-
-    return {
-      evidence,
-      identity:
-        null,
-      candidates:
-        [],
-      mode:
-        "serpapi-ai-mode-uncropped",
-      reason:
-        `Lens identity is insufficient for a commercially specific match (${sufficiencyWithoutLensfun.reason}); use uncropped SerpApi Google AI Mode.`,
-      reasonCode:
-        "distinct-product-identity-unresolved",
-      notFoundInLensfun:
-        false,
-      identityInsufficient:
-        true
-    };
-  }
-
-
-  /*
-    ============================================================
-    DETERMINISTIC LENSFUN LOOKUP
-    ============================================================
-  */
-
-  const candidates =
-    findLensfunCandidates(
-      evidence
-    );
-
-
-  console.log(
-    "[LENS RESOLVER] Lensfun candidates:",
-    {
-      productId:
-        evidence.productId,
-
-      count:
-        candidates.length,
-
-      candidates:
-        candidates.map(
-          candidate => ({
-            candidateId:
-              candidate.candidateId,
-
-            maker:
-              candidate.maker,
-
-            model:
-              candidate.model,
-
-            mount:
-              candidate.mount,
-
-            score:
-              candidate.score
-          })
-        )
-    }
-  );
-
-
-  /*
-    ZERO CANDIDATES
-
-    Lensfun cannot resolve it.
-    Go directly to cropped visual search.
-  */
-    if (
-    candidates.length === 0
-  ) {
-    /*
-      notFoundInLensfun != identityInsufficient.
-      Lensfun is a canonicalization source. If the seller/OCR
-      evidence is already commercially specific, keep that
-      grounded identity instead of paying to rediscover it.
-    */
-    const sufficiencyZeroCandidates =
-      assessLensIdentitySufficiency(
-        evidence
-      );
-
-    if (
-      sufficiencyZeroCandidates.sufficient
-    ) {
-      const groundedIdentity =
-        buildGroundedLensIdentity(
-          product,
-          evidence,
-          sufficiencyZeroCandidates
-        );
-
-      console.log(
-        "[LENS RESOLVER] notFoundInLensfun=true, identityInsufficient=false. Keeping grounded seller/OCR identity; no visual fallback:",
-        {
-          productId:
-            evidence.productId,
-          sufficiency:
-            sufficiencyZeroCandidates,
-          canonicalModel:
-            groundedIdentity.canonicalModel
-        }
-      );
-
-      return {
-        evidence,
-        identity:
-          groundedIdentity,
-        candidates:
-          [],
-        mode:
-          "seller-ocr-grounded",
-        reason:
-          `No Lensfun record, but seller/OCR identity is commercially sufficient (${sufficiencyZeroCandidates.reason}).`,
-        reasonCode:
-          "lens-identity-grounded",
-        notFoundInLensfun:
-          true,
-        identityInsufficient:
-          false
-      };
-    }
-
-    console.log(
-      "[LENS RESOLVER] notFoundInLensfun=true AND identityInsufficient=true. Routing to visual fallback:",
-      {
-        productId:
-          evidence.productId,
-        sufficiency:
-          sufficiencyZeroCandidates
-      }
-    );
-
-    return {
-      evidence,
-      identity:
-        null,
-      candidates:
-        [],
-      mode:
-        "serpapi-ai-mode-uncropped",
-      reason:
-        `Lensfun returned zero candidates and the seller/OCR identity is insufficient (${sufficiencyZeroCandidates.reason}).`,
-      reasonCode:
-        "distinct-product-identity-unresolved",
-      notFoundInLensfun:
-        true,
-      identityInsufficient:
-        true
-    };
-  }
-
-
-  /*
-  EXACTLY ONE CANDIDATE
-
-  Consider this resolved directly by Lensfun.
-*/
-if (
-  candidates.length === 1
-) {
-  const identity =
-    lensfunCandidateToIdentity(
-      candidates[0]
-    );
-
-  console.log(
-    "[LENS RESOLVER] Exactly one Lensfun candidate. Resolved directly:",
-    {
-      productId:
-        evidence.productId,
-
-      model:
-        candidates[0]?.model
-    }
-  );
-
-  return {
-    evidence,
-
-    identity,
-
-    candidates,
-
-    mode:
-      "lensfun",
-
-    reason:
-      "Exactly one Lensfun candidate remained; accepting it as the resolved lens identity."
-  };
-}
-
-
-  /*
-    ============================================================
-    EXACTLY 2 OR 3 CANDIDATES: TRY RESALE CONSENSUS FIRST
-
-    Instead of immediately routing to SerpApi, try pricing all
-    of the remaining candidates individually (Supabase first,
-    eBay comp analysis for any not yet in Supabase). If they all
-    price within $20 of each other, accept the average as the
-    resale value for the primary item and skip SerpApi entirely.
-    ============================================================
-  */
-  if (
-    candidates.length === 2 ||
-    candidates.length === 3
-  ) {
-    const consensusResolution =
-      await resolveLensfunCandidatesViaResaleConsensus({
-        evidence,
-        product,
-        candidates
-      });
-
-    if (consensusResolution) {
-      return consensusResolution;
-    }
-
-    /*
-      Consensus wasn't possible (a candidate couldn't be priced,
-      or the candidates' resale prices disagreed by $20+) - fall
-      through to the normal visual-match / SerpApi routing below.
-    */
-  }
-
-
-  /*
-    TWO OR MORE CANDIDATES
-
-    Lensfun did not uniquely resolve the lens on structured
-    evidence alone. Before asking for (another) visual
-    identification, check whether a visual identification we
-    already have exactly matches exactly one remaining
-    candidate - if so, that IS the resolution; stop here rather
-    than routing back into another Lensfun/SerpApi cycle.
-  */
-  const directMatch =
-    matchVisualAnswerToLensfunCandidate(
-      visualIdentificationAnswer,
-      candidates
-    );
-
-  if (directMatch) {
-    const identity =
-      lensfunCandidateToIdentity(
-        directMatch
-      );
-
-    identity.resolutionMode =
-      "lensfun-serpapi-matched";
-
-    console.log(
-      "[LENS RESOLVER] Visual identification exactly matched one remaining Lensfun candidate. Resolved directly:",
-      {
-        productId:
-          evidence.productId,
-
-        visualIdentificationAnswer,
-
-        matchedModel:
-          directMatch?.model
-      }
-    );
-
-    return {
-      evidence,
-
-      identity,
-
-      candidates,
-
-      mode:
-        "lensfun",
-
-      reason:
-        `Visual identification ("${visualIdentificationAnswer}") exactly matched one remaining Lensfun candidate; accepting it as resolved.`
-    };
-  }
-
-  /*
-    No visual answer (yet), or it didn't exactly match a
-    remaining candidate. Always use SerpApi AI Mode on the
-    original best image rather than asking a generic
-    reconciliation AI to just pick one.
-  */
-console.log(
-  "[LENS RESOLVER] Multiple Lensfun candidates remain. Routing to SerpApi AI Mode:",
-  {
-    productId:
-      evidence.productId,
-
-    count:
-      candidates.length
-  }
-);
-
-return {
-  evidence,
-
-  identity:
-    null,
-
-  candidates,
-
-  mode:
-    "serpapi-ai-mode-uncropped",
-
-    reason:
-    "Multiple Lensfun candidates remain; use SerpApi Google AI Mode on the original best image to identify the exact lens.",
-  reasonCode:
-    "lens-commercial-variant-ambiguous",
-  notFoundInLensfun:
-    false,
-  identityInsufficient:
-    true
-};
-}
-
-/*
-  ============================================================
-  SUPABASE PROCESSED MARKETPLACE LISTINGS
-  ============================================================
-*/
-
-/*
-  Check which of a group of listing IDs
-  have already been processed.
-*/
-
-/*
-  Atomically claim a Marketplace listing.
-
-  claimed: true
-      This listing was not in Supabase and this
-      scanner successfully claimed it.
-
-  claimed: false
-      Another scanner/device has already processed
-      or claimed this listing.
-*/
-
-function cleanupOldLocalAnalysisLogs() {
-  const MAX_AGE_MS =
-    24 * 60 * 60 * 1000;
-
-  try {
-    const files =
-      fs.readdirSync(
-        ANALYSIS_LOG_DIRECTORY
-      );
-
-    const now =
-      Date.now();
-
-    for (
-      const fileName of files
-    ) {
-      if (
-        !fileName.endsWith(
-          ".log"
-        )
-      ) {
-        continue;
-      }
-
-      const filePath =
-        path.join(
-          ANALYSIS_LOG_DIRECTORY,
-          fileName
-        );
-
-      try {
-        const stats =
-          fs.statSync(
-            filePath
-          );
-
-        if (
-          now -
-            stats.mtimeMs >
-          MAX_AGE_MS
-        ) {
-          fs.unlinkSync(
-            filePath
-          );
-        }
-      } catch (error) {
-        originalConsoleWarn(
-          "[ANALYSIS LOG] Could not clean temporary log:",
-          filePath,
-          error?.message ||
-            error
-        );
-      }
-    }
-  } catch (error) {
-    originalConsoleWarn(
-      "[ANALYSIS LOG] Cleanup failed:",
-      error?.message ||
-        error
-    );
-  }
-}
-
-
-const app = express();
-
-
-/*
-  ============================================================
-  GLOBAL EXPRESS MIDDLEWARE
-
-  IMPORTANT:
-  These MUST appear before every app.get/app.post/etc.
-  ============================================================
-*/
-
-app.use((req, res, next) => {
-  const startedAt = Date.now();
-
-  console.log(`[REQ START] ${req.method} ${req.url}`);
-
-  res.on("finish", () => {
-    console.log(
-      `[REQ END] ${req.method} ${req.url} ${res.statusCode} ${Date.now() - startedAt}ms`
-    );
-  });
-
-  res.on("close", () => {
-    console.log(
-      `[REQ CLOSED] ${req.method} ${req.url} ${Date.now() - startedAt}ms`
-    );
-  });
-
-  next();
-});
-
-app.use(cors({
-  origin: "*"
-}));
-
-app.use(express.json({
-  limit: "50mb"
-}));
-
-app.post(
-  "/prepare-dataforseo-crops",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const targets =
-        Array.isArray(
-          req.body?.targets
-        )
-          ? req.body.targets
-          : [];
-
-
-      if (!targets.length) {
-        return res
-          .status(400)
-          .json({
-            ok:
-              false,
-
-            error:
-              "No DataForSEO crop targets were supplied."
-          });
-      }
-
-
-      /*
-        Group by ORIGINAL Marketplace image.
-
-        If lens_1 and lens_2 both chose Image 3,
-        Image 3 is sent to the localizer once,
-        with both requested products.
-      */
-      const targetsByImage =
-        new Map();
-
-
-      for (
-        const target of targets
-      ) {
-        const imageUrl =
-          String(
-            target?.imageUrl ||
-            ""
-          ).trim();
-
-
-        if (
-          !imageUrl ||
-          !target?.productId
-        ) {
-          continue;
-        }
-
-
-        if (
-          !targetsByImage.has(
-            imageUrl
-          )
-        ) {
-          targetsByImage.set(
-            imageUrl,
-            []
-          );
-        }
-
-
-        targetsByImage
-          .get(
-            imageUrl
-          )
-          .push(
-            target
-          );
-      }
-
-
-      const preparedTargets =
-        [];
-
-
-      for (
-        const [
-          imageUrl,
-          imageTargets
-        ] of targetsByImage
-      ) {
-        try {
-          const prepared =
-            await prepareDataForSeoCropsForImage({
-              imageUrl,
-              targets:
-                imageTargets
-            });
-
-
-          preparedTargets.push(
-            ...prepared
-          );
-
-        } catch (error) {
-          console.error(
-            "[DATAFORSEO CROP] Image localization failed:",
-            {
-              imageUrl,
-
-              error:
-                error?.message ||
-                String(error)
-            }
-          );
-
-
-          /*
-            Do not destroy all other crop targets
-            because one source image failed.
-          */
-          preparedTargets.push(
-            ...imageTargets.map(
-              target => ({
-                ...target,
-
-                cropPrepared:
-                  false,
-
-                dataForSeoImageUrl:
-                  "",
-
-                dataForSeoCropObjectPath:
-                  "",
-
-                cropBoundingBox:
-                  null,
-
-                cropError:
-                  error?.message ||
-                  "Crop preparation failed."
-              })
-            )
-          );
-        }
-      }
-
-
-      return res.json({
-        ok:
-          true,
-
-        targets:
-          preparedTargets
-      });
-
-    } catch (error) {
-      console.error(
-        "[DATAFORSEO CROP] Endpoint failed:",
-        error
-      );
-
-
-      return res
-        .status(500)
-        .json({
-          ok:
-            false,
-
-          error:
-            error?.message ||
-            "Could not prepare DataForSEO crops."
-        });
-    }
-  }
-);
-
-app.post(
-  "/serpapi-ai-mode-identify-lens",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const imageUrl =
-        String(
-          req.body?.imageUrl ||
-          ""
-        ).trim();
-
-      const promptText =
-        String(
-          req.body?.promptText ||
-          ""
-        ).trim();
-
-      const lensfunCandidates =
-        Array.isArray(
-          req.body?.lensfunCandidates
-        )
-          ? req.body.lensfunCandidates
-          : [];
-
-      if (!imageUrl) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing imageUrl."
-          });
-      }
-
-      if (!promptText) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing promptText."
-          });
-      }
-
-  const result =
-  await identifyLensWithSerpApiAiMode({
-    imageUrl,
-    promptText,
-    lensfunCandidates
-  });
-
-
-return res.json({
-  ok:
-    true,
-
-  found:
-    result.found === true,
-
-  /*
-    IMPORTANT:
-
-    This is intentionally RAW AI identification text.
-
-    For a single/exclusion request this will normally
-    be one model.
-
-    For a group request it may contain multiple lines.
-  */
-  identification:
-    result.text || "",
-
-  evidenceSource:
-    "serpapi-google-ai-mode",
-
-  serpApiSearchId:
-    result.searchId
-});
-
-    } catch (error) {
-      console.error(
-        "[SERPAPI AI MODE] Identification failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "SerpApi Google AI Mode lens identification failed."
-        });
-    }
-  }
-);
-
-app.post(
-  "/dataforseo-identify-image",
-  async (
-    req,
-    res
-  ) => {
-      const cropObjectPath =
-      String(
-        req.body
-          ?.cropObjectPath ||
-        ""
-      ).trim();
-    try {
-      const imageUrl =
-        String(
-          req.body?.imageUrl ||
-          ""
-        ).trim();
-
-      const promptText =
-        String(
-          req.body?.promptText ||
-          ""
-        ).trim();
-
-
-      if (!imageUrl) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing imageUrl."
-          });
-      }
-
-
-      if (!promptText) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing promptText."
-          });
-      }
-
-
-      /*
-        ============================================================
-        A — GOOGLE SEARCH BY IMAGE
-        ============================================================
-      */
-
-      const search =
-        await searchDataForSeoByImage(
-          imageUrl
-        );
-
-
-      /*
-        ============================================================
-        B — DETERMINISTIC REDUCTION
-        ============================================================
-      */
-
-      const evidence =
-        extractDataForSeoEvidence(
-          search.result
-        );
-
-
-      console.log(
-        "[DATAFORSEO] Reduced evidence:",
-        evidence
-      );
-
-
-      /*
-        ============================================================
-        C — AI EVIDENCE CLEANER
-        ============================================================
-      */
-
-      const cleaned =
-        await cleanDataForSeoIdentificationEvidence({
-          promptText,
-          evidence
-        });
-
-
-      const found =
-        Boolean(
-          cleaned
-            .recommendedIdentification &&
-          cleaned
-            .recommendedIdentification
-            .trim()
-            .toLowerCase() !==
-              "unknown"
-        );
-
-
-      return res.json({
-        ok:
-          true,
-
-        found,
-
-        identification:
-          cleaned
-            .recommendedIdentification,
-
-        cleanedEvidence:
-          cleaned,
-
-        dataForSeoTaskId:
-          search.taskId,
-
-        dataForSeoCost:
-          search.cost
-      });
-
-    } catch (error) {
-      console.error(
-        "[DATAFORSEO] Identification failed:",
-        error
-      );
-
-
-      return res
-        .status(500)
-        .json({
-          ok:
-            false,
-
-          error:
-            error?.message ||
-            "DataForSEO identification failed."
-        });
-    }
-    finally {
-  if (cropObjectPath) {
-    await deleteDataForSeoCrop(
-      cropObjectPath
-    );
-  }
-}
-  }
-);
-
-const EBAY_DELETION_VERIFICATION_TOKEN =
-  String(
-    process.env.EBAY_DELETION_VERIFICATION_TOKEN ||
-    ""
-  ).trim();
-
-const EBAY_DELETION_ENDPOINT =
-  String(
-    process.env.EBAY_DELETION_ENDPOINT ||
-    ""
-  ).trim();
-
-if (
-  !EBAY_DELETION_VERIFICATION_TOKEN
-) {
-  console.warn(
-    "[EBAY DELETION] Verification token is not configured."
-  );
-}
-
-if (
-  !EBAY_DELETION_ENDPOINT
-) {
-  console.warn(
-    "[EBAY DELETION] Public endpoint URL is not configured."
-  );
-}
-
-app.get(
-  "/ebay/account-deletion",
-  (req, res) => {
-    try {
-      const challengeCode =
-        String(
-          req.query?.challenge_code ||
-          ""
-        ).trim();
-
-      if (!challengeCode) {
-        return res
-          .status(400)
-          .json({
-            error:
-              "Missing challenge_code."
-          });
-      }
-
-      if (
-        !EBAY_DELETION_VERIFICATION_TOKEN ||
-        !EBAY_DELETION_ENDPOINT
-      ) {
-        return res
-          .status(500)
-          .json({
-            error:
-              "eBay account deletion verification is not configured."
-          });
-      }
-
-      const challengeResponse =
-        createHash("sha256")
-          .update(
-            challengeCode +
-            EBAY_DELETION_VERIFICATION_TOKEN +
-            EBAY_DELETION_ENDPOINT
-          )
-          .digest("hex");
-
-      console.log(
-        "[EBAY DELETION] Verification challenge received."
-      );
-
-      return res
-        .status(200)
-        .json({
-          challengeResponse
-        });
-
-    } catch (error) {
-      console.error(
-        "[EBAY DELETION] Verification failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          error:
-            "Verification failed."
-        });
-    }
-  }
-);
-
-app.post(
-  "/ebay/account-deletion",
-  async (req, res) => {
-    try {
-      const payload =
-        req.body || {};
-
-      console.log(
-        "[EBAY DELETION] Notification received:",
-        {
-          topic:
-            payload?.metadata?.topic ||
-            "",
-
-          notificationId:
-            payload
-              ?.notification
-              ?.notificationId ||
-            "",
-
-          userId:
-            payload
-              ?.notification
-              ?.data
-              ?.userId ||
-            "",
-
-          username:
-            payload
-              ?.notification
-              ?.data
-              ?.username ||
-            ""
-        }
-      );
-
-      /*
-        IMPORTANT:
-
-        If your application stores records tied to
-        this eBay user, delete/anonymize those records here.
-      */
-
-      return res
-        .status(204)
-        .send();
-
-    } catch (error) {
-      console.error(
-        "[EBAY DELETION] Notification processing failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          error:
-            "Could not process deletion notification."
-        });
-    }
-  }
-);
-
-const SUPABASE_URL =
-  String(
-    process.env.SUPABASE_URL ||
-    ""
-  ).trim();
-
-const SUPABASE_SECRET_KEY =
-  String(
-    process.env.SUPABASE_SECRET_KEY ||
-    ""
-  ).trim();
-
-const SUPABASE_DATAFORSEO_CROP_BUCKET =
-  String(
-    process.env
-      .SUPABASE_DATAFORSEO_CROP_BUCKET ||
-    "marketplace-dataforseo-crops"
-  ).trim();
-
-const SUPABASE_HIT_LOG_BUCKET =
-  String(
-    process.env.SUPABASE_HIT_LOG_BUCKET ||
-    "marketplace-hit-logs"
-  ).trim();
-
-if (!SUPABASE_URL) {
-  throw new Error(
-    "Missing SUPABASE_URL in .env"
-  );
-}
-
-if (!SUPABASE_SECRET_KEY) {
-  throw new Error(
-    "Missing SUPABASE_SECRET_KEY in .env"
-  );
-}
-
-/*
-  ============================================================
-  DATAFORSEO TARGET CROPPING
-  ============================================================
-*/
-
-const DATAFORSEO_CROP_PADDING_RATIO =
-  0.12;
-
-
-function clampNumber(
-  value,
-  min,
-  max
-) {
-  return Math.min(
-    max,
-    Math.max(
-      min,
-      Number(value)
-    )
-  );
-}
-
-function normalizeStringArray(
-  value
-) {
-  const values =
-    Array.isArray(value)
-      ? value
-      : value == null
-        ? []
-        : [value];
-
-  return [
-    ...new Set(
-      values
-        .map(
-          item =>
-            String(
-              item || ""
-            ).trim()
-        )
-        .filter(Boolean)
-    )
-  ];
-}
-
-function normalizeLocalizerBoundingBox(
-  boundingBox
-) {
-  if (!boundingBox) {
-    return null;
-  }
-
-
-  let xMin =
-    Number(
-      boundingBox.xMin
-    );
-
-  let yMin =
-    Number(
-      boundingBox.yMin
-    );
-
-  let xMax =
-    Number(
-      boundingBox.xMax
-    );
-
-  let yMax =
-    Number(
-      boundingBox.yMax
-    );
-
-
-  if (
-    !Number.isFinite(xMin) ||
-    !Number.isFinite(yMin) ||
-    !Number.isFinite(xMax) ||
-    !Number.isFinite(yMax)
-  ) {
-    return null;
-  }
-
-
-  xMin =
-    clampNumber(
-      xMin,
-      0,
-      1000
-    );
-
-  yMin =
-    clampNumber(
-      yMin,
-      0,
-      1000
-    );
-
-  xMax =
-    clampNumber(
-      xMax,
-      0,
-      1000
-    );
-
-  yMax =
-    clampNumber(
-      yMax,
-      0,
-      1000
-    );
-
-
-  if (
-    xMax <= xMin ||
-    yMax <= yMin
-  ) {
-    return null;
-  }
-
-
-  /*
-    Reject obviously broken microscopic boxes.
-  */
-  if (
-    xMax - xMin < 20 ||
-    yMax - yMin < 20
-  ) {
-    return null;
-  }
-
-
-  return {
-    xMin,
-    yMin,
-    xMax,
-    yMax
-  };
-}
-
-
-function addPaddingToBoundingBox(
-  boundingBox,
-  paddingRatio =
-    DATAFORSEO_CROP_PADDING_RATIO
-) {
-  const width =
-    boundingBox.xMax -
-    boundingBox.xMin;
-
-  const height =
-    boundingBox.yMax -
-    boundingBox.yMin;
-
-
-  const padX =
-    width *
-    paddingRatio;
-
-  const padY =
-    height *
-    paddingRatio;
-
-
-  return {
-    xMin:
-      clampNumber(
-        boundingBox.xMin -
-          padX,
-        0,
-        1000
-      ),
-
-    yMin:
-      clampNumber(
-        boundingBox.yMin -
-          padY,
-        0,
-        1000
-      ),
-
-    xMax:
-      clampNumber(
-        boundingBox.xMax +
-          padX,
-        0,
-        1000
-      ),
-
-    yMax:
-      clampNumber(
-        boundingBox.yMax +
-          padY,
-        0,
-        1000
-      )
-  };
-}
-
-async function localizeDataForSeoTargets({
-  normalizedImageBuffer,
-  imageIndex,
-  targets
-}) {
- const localizationTargets =
-  targets.map(
-    target => ({
-      productId:
-        String(
-          target?.productId ||
-          ""
-        ).trim(),
-
-      productType:
-        String(
-          target?.productType ||
-          ""
-        ).trim(),
-
-      knownProduct:
-        target?.knownProduct ||
-        null
-    })
-  );
-
-
-  const prompt = `
-You are a PRODUCT LOCALIZATION system.
-
-You are looking at ONE ORIGINAL Facebook Marketplace photograph.
-
-THIS IS NOT A COLLAGE.
-
-All coordinates you return must be relative ONLY to the single supplied image.
-
-Your only job is to locate the requested PHYSICAL PRIMARY PRODUCTS.
-
-Do NOT attempt to determine their exact model.
-Do NOT add products that were not requested.
-Do NOT return bounding boxes for accessories.
-
-REQUESTED TARGETS:
-
-${JSON.stringify(
-  localizationTargets,
-  null,
-  2
-)}
-
-The partial identity information above is provided only so that you can
-distinguish the requested physical products from other objects in the image.
-
-BOUNDING BOX RULES:
-
-- Return coordinates from 0 to 1000.
-- xMin = left edge.
-- yMin = top edge.
-- xMax = right edge.
-- yMax = bottom edge.
-- The coordinates refer to THIS ORIGINAL IMAGE only.
-- Make the box reasonably tight around the entire physical product.
-- Include the complete product whenever possible.
-- Exclude other primary products as much as possible.
-- For a camera lens attached to a body, box the lens itself rather than
-  the entire camera-and-lens combination.
-- For a camera body, avoid including attached lenses when possible.
-- If two lenses are present, use the supplied evidence to associate the
-  correct physical lens with the requested productId.
-- If you cannot confidently locate a requested product, set found=false
-  and boundingBox=null.
-- Return exactly one result for every requested productId.
-
-Return exactly:
-
-{
-  "targets": [
-    {
-      "productId": "lens_1",
-      "found": true,
-      "boundingBox": {
-        "xMin": 100,
-        "yMin": 200,
-        "xMax": 700,
-        "yMax": 800
-      }
-    }
-  ]
-}
-
-Return valid JSON only.
-Do not use Markdown.
-`.trim();
-
-
-  const imageDataUrl =
-    `data:image/jpeg;base64,${normalizedImageBuffer.toString(
-      "base64"
-    )}`;
-
-
-  const parsed =
-    await runAiJsonStep({
-      step:
-        `DataForSEO crop localizer image ${imageIndex}`,
-
-      maxAttempts:
-        2,
-
-      runRequest:
-        async () =>
-          await createLoggedOpenAiResponse({
-            step:
-              `DataForSEO crop localizer image ${imageIndex}`,
-
-            request: {
-              model:
-                "gpt-5.6-luna",
-
-              input: [
-                {
-                  role:
-                    "user",
-
-                  content: [
-                    {
-                      type:
-                        "input_text",
-
-                      text:
-                        prompt
-                    },
-
-                    {
-                      type:
-                        "input_image",
-
-                      image_url:
-                        imageDataUrl,
-
-                      detail:
-                        "high"
-                    }
-                  ]
-                }
-              ]
-            }
-          })
-    });
-
-
-  return Array.isArray(
-    parsed?.targets
-  )
-    ? parsed.targets
-    : [];
-}
-
-async function uploadDataForSeoCrop({
-  productId,
-  cropBuffer
-}) {
-  const safeProductId =
-    String(
-      productId ||
-      "product"
-    )
-      .trim()
-      .replace(
-        /[^a-zA-Z0-9_-]/g,
-        "_"
-      );
-
-
-  const objectPath =
-    (
-      "dataforseo-crops/" +
-      `${Date.now()}-` +
-      `${randomUUID()}-` +
-      `${safeProductId}.jpg`
-    );
-
-
-  const {
-    error:
-      uploadError
-  } =
-    await supabaseAdmin
-      .storage
-      .from(
-        SUPABASE_DATAFORSEO_CROP_BUCKET
-      )
-      .upload(
-        objectPath,
-        cropBuffer,
-        {
-          contentType:
-            "image/jpeg",
-
-          cacheControl:
-            "300",
-
-          upsert:
-            false
-        }
-      );
-
-
-  if (uploadError) {
-    throw new Error(
-      `Could not upload DataForSEO crop: ${
-        uploadError.message ||
-        String(uploadError)
-      }`
-    );
-  }
-
-
-  const {
-    data:
-      publicUrlData
-  } =
-    supabaseAdmin
-      .storage
-      .from(
-        SUPABASE_DATAFORSEO_CROP_BUCKET
-      )
-      .getPublicUrl(
-        objectPath
-      );
-
-
-  const publicUrl =
-    String(
-      publicUrlData
-        ?.publicUrl ||
-      ""
-    ).trim();
-
-
-  if (!publicUrl) {
-    throw new Error(
-      "Supabase did not return a public crop URL."
-    );
-  }
-
-
-  return {
-    objectPath,
-    publicUrl
-  };
-}
-
-
-async function deleteDataForSeoCrop(
-  objectPath
-) {
-  const cleanPath =
-    String(
-      objectPath || ""
-    ).trim();
-
-
-  /*
-    Never permit arbitrary Supabase deletion
-    from this endpoint.
-  */
-  if (
-    !cleanPath.startsWith(
-      "dataforseo-crops/"
-    )
-  ) {
-    return;
-  }
-
-
-  try {
-    const {
-      error
-    } =
-      await supabaseAdmin
-        .storage
-        .from(
-          SUPABASE_DATAFORSEO_CROP_BUCKET
-        )
-        .remove([
-          cleanPath
-        ]);
-
-
-    if (error) {
-      console.warn(
-        "[DATAFORSEO CROP] Cleanup failed:",
-        {
-          objectPath:
-            cleanPath,
-
-          error:
-            error.message
-        }
-      );
-    }
-
-  } catch (error) {
-    console.warn(
-      "[DATAFORSEO CROP] Cleanup threw:",
-      error?.message ||
-      String(error)
-    );
-  }
-}
-
-async function prepareDataForSeoCropsForImage({
-  imageUrl,
-  targets
-}) {
-  /*
-    Download the ORIGINAL Marketplace image.
-  */
-  const originalBuffer =
-    await downloadImageBuffer(
-      imageUrl
-    );
-
-
-  /*
-    IMPORTANT:
-
-    Normalize orientation FIRST.
-
-    The AI localizer sees this exact buffer,
-    and Sharp also crops this exact buffer.
-
-    Therefore their coordinate systems are
-    guaranteed to match.
-  */
-  const normalizedImageBuffer =
-    await sharp(
-      originalBuffer
-    )
-      .rotate()
-      .jpeg({
-        quality:
-          95
-      })
-      .toBuffer();
-
-
-  const metadata =
-    await sharp(
-      normalizedImageBuffer
-    )
-      .metadata();
-
-
-  const imageWidth =
-    Number(
-      metadata.width
-    );
-
-  const imageHeight =
-    Number(
-      metadata.height
-    );
-
-
-  if (
-    !imageWidth ||
-    !imageHeight
-  ) {
-    throw new Error(
-      "Could not determine normalized image dimensions."
-    );
-  }
-
-
-  const imageIndex =
-    Number(
-      targets?.[0]
-        ?.bestImageIndex
-    ) || 0;
-
-
-  const localizedTargets =
-    await localizeDataForSeoTargets({
-      normalizedImageBuffer,
-      imageIndex,
-      targets
-    });
-
-
-  const localizedByProductId =
+  const byProductId =
     new Map(
-      localizedTargets.map(
-        item => [
+      prepared.map(
+        target => [
           String(
-            item?.productId ||
+            target?.productId ||
             ""
           ).trim(),
 
-          item
+          target
         ]
       )
     );
 
 
-  const results =
-    [];
+  return targets.map(
+    target => {
+      const preparedTarget =
+        byProductId.get(
+          String(
+            target?.productId ||
+            ""
+          ).trim()
+        );
 
 
-  for (
-    const target of targets
+      return {
+        ...target,
+
+        cropPrepared:
+          preparedTarget
+            ?.cropPrepared ===
+          true,
+
+        dataForSeoImageUrl:
+          String(
+            preparedTarget
+              ?.dataForSeoImageUrl ||
+            ""
+          ).trim(),
+
+        dataForSeoCropObjectPath:
+          String(
+            preparedTarget
+              ?.dataForSeoCropObjectPath ||
+            ""
+          ).trim(),
+
+        cropBoundingBox:
+          preparedTarget
+            ?.cropBoundingBox ||
+          null,
+
+        cropError:
+          String(
+            preparedTarget
+              ?.cropError ||
+            ""
+          ).trim(),
+
+        /*
+          CRITICAL:
+
+          DataForSEO now receives an ISOLATED PRODUCT crop.
+
+          Do NOT retain the old whole-image ambiguity state,
+          otherwise background.js may ask DataForSEO to identify
+          multiple lenses inside a crop containing only one lens.
+        */
+        sameTypeProductIds: [
+          String(
+            target.productId
+          ).trim()
+        ]
+      };
+    }
+  );
+}
+
+async function runLocalGoogleLensTargets(
+  targets
+) {
+  console.log(
+    "[LOCAL GOOGLE LENS] Sending targets to main extension background:",
+    targets
+  );
+
+  const response =
+  await chrome.runtime.sendMessage({
+    type:
+      "PROCESS_SELECTED_GOOGLE_LENS_TARGETS",
+
+    targets
+  });
+
+  if (
+    !response ||
+    response.ok !== true
   ) {
-    const productId =
-      String(
-        target?.productId ||
-        ""
-      ).trim();
-
-
-    const localization =
-      localizedByProductId.get(
-        productId
-      );
-
-
-    if (
-      !localization ||
-      localization.found !== true
-    ) {
-      results.push({
-        ...target,
-
-        cropPrepared:
-          false,
-
-        dataForSeoImageUrl:
-          "",
-
-        dataForSeoCropObjectPath:
-          "",
-
-        cropBoundingBox:
-          null,
-
-        cropError:
-          "Product localizer could not confidently locate this physical product."
-      });
-
-      continue;
-    }
-
-
-    const rawBoundingBox =
-      normalizeLocalizerBoundingBox(
-        localization
-          .boundingBox
-      );
-
-
-    if (!rawBoundingBox) {
-      results.push({
-        ...target,
-
-        cropPrepared:
-          false,
-
-        dataForSeoImageUrl:
-          "",
-
-        dataForSeoCropObjectPath:
-          "",
-
-        cropBoundingBox:
-          null,
-
-        cropError:
-          "Product localizer returned an invalid bounding box."
-      });
-
-      continue;
-    }
-
-
-    const paddedBoundingBox =
-      addPaddingToBoundingBox(
-        rawBoundingBox
-      );
-
-
-    const left =
-      Math.max(
-        0,
-        Math.floor(
-          (
-            paddedBoundingBox
-              .xMin /
-            1000
-          ) *
-          imageWidth
-        )
-      );
-
-
-    const top =
-      Math.max(
-        0,
-        Math.floor(
-          (
-            paddedBoundingBox
-              .yMin /
-            1000
-          ) *
-          imageHeight
-        )
-      );
-
-
-    const right =
-      Math.min(
-        imageWidth,
-        Math.ceil(
-          (
-            paddedBoundingBox
-              .xMax /
-            1000
-          ) *
-          imageWidth
-        )
-      );
-
-
-    const bottom =
-      Math.min(
-        imageHeight,
-        Math.ceil(
-          (
-            paddedBoundingBox
-              .yMax /
-            1000
-          ) *
-          imageHeight
-        )
-      );
-
-
-    const cropWidth =
-      right -
-      left;
-
-    const cropHeight =
-      bottom -
-      top;
-
-
-    if (
-      cropWidth < 40 ||
-      cropHeight < 40
-    ) {
-      results.push({
-        ...target,
-
-        cropPrepared:
-          false,
-
-        dataForSeoImageUrl:
-          "",
-
-        dataForSeoCropObjectPath:
-          "",
-
-        cropBoundingBox:
-          null,
-
-        cropError:
-          "Calculated product crop was too small."
-      });
-
-      continue;
-    }
-
-
-    const cropBuffer =
-      await sharp(
-        normalizedImageBuffer
-      )
-        .extract({
-          left,
-          top,
-          width:
-            cropWidth,
-          height:
-            cropHeight
-        })
-        .jpeg({
-          quality:
-            95
-        })
-        .toBuffer();
-
-
-    const uploaded =
-      await uploadDataForSeoCrop({
-        productId,
-        cropBuffer
-      });
-
-
-    console.log(
-      "[DATAFORSEO CROP] Prepared:",
-      {
-        productId,
-        imageIndex,
-
-        sourceDimensions:
-          `${imageWidth}x${imageHeight}`,
-
-        cropPixels: {
-          left,
-          top,
-          width:
-            cropWidth,
-          height:
-            cropHeight
-        },
-
-        rawBoundingBox,
-
-        paddedBoundingBox,
-
-        publicUrl:
-          uploaded.publicUrl
-      }
+    throw new Error(
+      response?.error ||
+      "Local Google Lens processing failed."
     );
-
-
-    results.push({
-      ...target,
-
-      cropPrepared:
-        true,
-
-      dataForSeoImageUrl:
-        uploaded.publicUrl,
-
-      dataForSeoCropObjectPath:
-        uploaded.objectPath,
-
-      cropBoundingBox: {
-        raw:
-          rawBoundingBox,
-
-        padded:
-          paddedBoundingBox,
-
-        pixels: {
-          left,
-          top,
-          width:
-            cropWidth,
-          height:
-            cropHeight
-        }
-      },
-
-      cropError:
-        ""
-    });
   }
 
+  const results =
+    Array.isArray(
+      response.results
+    )
+      ? response.results
+      : [];
+
+  console.log(
+    "[LOCAL GOOGLE LENS] Results received:",
+    results
+  );
 
   return results;
 }
 
-const supabaseAdmin =
-  createClient(
-    SUPABASE_URL,
-    SUPABASE_SECRET_KEY,
-    {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-        detectSessionInUrl: false
-      }
-    }
-  );
-
-  /*
-  ============================================================
-  PURCHASE CHECKLIST
-  ============================================================
-
-  EDIT YOUR CHECKLIST ITEMS HERE.
-
-  key:
-    Permanent internal ID.
-    Do NOT change it after you've started using the item.
-
-  label:
-    Text displayed to you.
-    This CAN be changed whenever you want.
-
-  enabled:
-    true  = show item
-    false = hide item
-*/
-
-const DEAL_CHECKLIST_ITEMS = [
-  {
-    key: "everything_functional",
-    label: "Sent message confirming everything works and there is no significant damage",
-    enabled: true
-  },
-
-  {
-    key: "seller_profile_ok",
-    label: "Seller does not have more than 1 one-star review",
-    enabled: true
-  },
-
-  {
-    key: "analysis_verified",
-    label: "Product analysis is correct",
-    enabled: true
-  },
-
-  {
-    key: "tradeshield_confirmation_sent",
-    label: "TradeShield confirmation sent",
-    enabled: true
-  },
-
-  {
-    key: "manual_estimate_complete",
-    label: "Listing manually estimated",
-    enabled: true
-  }
-];
-
-
-const DEAL_CHECKLIST_PUBLIC_BASE_URL =
-  String(
-    process.env.DEAL_CHECKLIST_PUBLIC_BASE_URL ||
-    "http://localhost:3000"
-  )
-    .trim()
-    .replace(/\/+$/, "");
-
-
-function getEnabledDealChecklistItems() {
-  return DEAL_CHECKLIST_ITEMS.filter(
-    item =>
-      item.enabled !== false
-  );
-}
-
-
-function getMarketplaceListingIdFromUrl(
-  value
-) {
-  const match =
-    String(
-      value || ""
-    ).match(
-      /\/marketplace\/item\/(\d+)/
-    );
-
-  return match?.[1] || "";
-}
-
-
-function getDealChecklistPublicUrl(
-  token
-) {
-  return (
-    `${DEAL_CHECKLIST_PUBLIC_BASE_URL}/` +
-    encodeURIComponent(
-      token
-    )
-  );
-}
-
-
-async function findDealChecklistBySourceKey(
-  sourceKey
-) {
-  const {
-    data,
-    error
-  } =
-    await supabaseAdmin
-      .from(
-        "deal_checklists"
-      )
-      .select("*")
-      .eq(
-        "source_key",
-        sourceKey
-      )
-      .maybeSingle();
-
-
-  if (error) {
-    throw error;
-  }
-
-
-  return data || null;
-}
-
-
-async function createOrGetDealChecklist({
-  deal,
-  analysisRunId
-}) {
-  const listingUrl =
-    String(
-      deal?.facebookUrl ||
-      ""
-    ).trim();
-
-
-  const listingId =
-    getMarketplaceListingIdFromUrl(
-      listingUrl
-    );
-
-
-  /*
-    Prefer Facebook listing ID.
-
-    That makes retries of the same listing
-    reuse the SAME checklist.
-  */
-  const sourceKey =
-    listingId
-      ? `facebook:${listingId}`
-      : `analysis:${analysisRunId}`;
-
-
-  let checklist =
-    await findDealChecklistBySourceKey(
-      sourceKey
-    );
-
-
-  if (!checklist) {
-    const newChecklist = {
-      id:
-        randomUUID(),
-
-      token:
-        randomUUID(),
-
-      source_key:
-        sourceKey,
-
-      analysis_run_id:
-        analysisRunId,
-
-      listing_id:
-        listingId ||
-        null,
-
-      listing_url:
-        listingUrl ||
-        null,
-
-      title:
-        String(
-          deal?.title ||
-          ""
-        ).trim() ||
-        null,
-
-      updated_at:
-        new Date()
-          .toISOString()
-    };
-
-
-    const {
-      data,
-      error
-    } =
-      await supabaseAdmin
-        .from(
-          "deal_checklists"
-        )
-        .insert(
-          newChecklist
-        )
-        .select("*")
-        .single();
-
-
-    /*
-      23505 = duplicate unique key.
-
-      This can happen if the same listing
-      gets saved twice at almost exactly
-      the same time.
-    */
-    if (error) {
-      if (
-        String(
-          error.code ||
-          ""
-        ) === "23505"
-      ) {
-        checklist =
-          await findDealChecklistBySourceKey(
-            sourceKey
-          );
-
-      } else {
-        throw error;
-      }
-
-    } else {
-      checklist =
-        data;
-    }
-  }
-
-
-  if (!checklist) {
-    throw new Error(
-      "Could not create purchase checklist."
-    );
-  }
-
-
-  return {
-    ...checklist,
-
-    url:
-      getDealChecklistPublicUrl(
-        checklist.token
-      )
-  };
-}
-
-
-async function loadDealChecklistByToken(
-  rawToken
-) {
-  const token =
-    String(
-      rawToken ||
-      ""
-    ).trim();
-
-
-  const {
-    data:
-      checklist,
-
-    error:
-      checklistError
-  } =
-    await supabaseAdmin
-      .from(
-        "deal_checklists"
-      )
-      .select("*")
-      .eq(
-        "token",
-        token
-      )
-      .maybeSingle();
-
-
-  if (checklistError) {
-    throw checklistError;
-  }
-
-
-  if (!checklist) {
-    return null;
-  }
-
-
-  const {
-    data:
-      savedStates,
-
-    error:
-      statesError
-  } =
-    await supabaseAdmin
-      .from(
-        "deal_checklist_states"
-      )
-      .select(
-        "item_key, checked"
-      )
-      .eq(
-        "checklist_id",
-        checklist.id
-      );
-
-
-  if (statesError) {
-    throw statesError;
-  }
-
-
-  const stateMap =
-    new Map(
-      (
-        savedStates ||
-        []
-      ).map(
-        row => [
-          row.item_key,
-          row.checked === true
-        ]
-      )
-    );
-
-
-  return {
-    ...checklist,
-
-    items:
-      getEnabledDealChecklistItems()
-        .map(
-          item => ({
-            key:
-              item.key,
-
-            label:
-              item.label,
-
-            checked:
-              stateMap.get(
-                item.key
-              ) === true
-          })
-        )
-  };
-}
-
-
-function escapeChecklistHtml(
-  value
-) {
-  return String(
-    value ?? ""
-  )
-    .replace(
-      /&/g,
-      "&amp;"
-    )
-    .replace(
-      /</g,
-      "&lt;"
-    )
-    .replace(
-      />/g,
-      "&gt;"
-    )
-    .replace(
-      /"/g,
-      "&quot;"
-    )
-    .replace(
-      /'/g,
-      "&#039;"
-    );
-}
-
-
-function renderDealChecklistPage(
-  checklist
-) {
-  const title =
-    escapeChecklistHtml(
-      checklist.title ||
-      "Marketplace Purchase"
-    );
-
-
-  const listingUrl =
-    escapeChecklistHtml(
-      checklist.listing_url ||
-      ""
-    );
-
-
-  const checklistHtml =
-    checklist.items
-      .map(
-        item => `
-          <label class="check-row">
-
-            <input
-              type="checkbox"
-              data-item-key="${escapeChecklistHtml(
-                item.key
-              )}"
-              ${item.checked ? "checked" : ""}
-            >
-
-            <span>
-              ${escapeChecklistHtml(
-                item.label
-              )}
-            </span>
-
-          </label>
-        `
-      )
-      .join("");
-
-
-  return `
-<!doctype html>
-
-<html>
-
-<head>
-
-<meta charset="utf-8">
-
-<meta
-  name="viewport"
-  content="width=device-width, initial-scale=1"
->
-
-<title>${title}</title>
-
-<style>
-
-body {
-  margin: 0;
-  background: #f5f5f5;
-  font-family: Arial, sans-serif;
-  color: #222;
-}
-
-.container {
-  max-width: 650px;
-  margin: 40px auto;
-  padding: 20px;
-}
-
-.card {
-  background: white;
-  border-radius: 14px;
-  padding: 26px;
-  box-shadow:
-    0 4px 20px
-    rgba(0, 0, 0, 0.08);
-}
-
-h1 {
-  margin-top: 0;
-  margin-bottom: 5px;
-}
-
-.subtitle {
-  color: #777;
-  margin-bottom: 22px;
-}
-
-.listing-link {
-  display: inline-block;
-  margin-bottom: 22px;
-}
-
-.check-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-
-  padding: 15px;
-  margin-bottom: 10px;
-
-  border:
-    1px solid
-    #ddd;
-
-  border-radius: 9px;
-
-  cursor: pointer;
-}
-
-.check-row:hover {
-  background: #fafafa;
-}
-
-.check-row input {
-  width: 21px;
-  height: 21px;
-}
-
-.status {
-  margin-top: 18px;
-  font-size: 13px;
-  color: #666;
-}
-
-.progress {
-  font-weight: bold;
-  margin-bottom: 15px;
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-<div class="container">
-
-<div class="card">
-
-<h1>
-  ${title}
-</h1>
-
-<div class="subtitle">
-  Pre-purchase checklist
-</div>
-
-${
-  listingUrl
-    ? `
-      <a
-        class="listing-link"
-        href="${listingUrl}"
-        target="_blank"
-      >
-        Open Marketplace Listing
-      </a>
-    `
-    : ""
-}
-
-<div
-  class="progress"
-  id="progress"
-></div>
-
-
-<div>
-  ${checklistHtml}
-</div>
-
-
-<div
-  class="status"
-  id="status"
->
-  Saved
-</div>
-
-</div>
-
-</div>
-
-
-<script>
-
-const checklistToken =
-  ${JSON.stringify(
-    checklist.token
-  )};
-
-
-const boxes =
-  Array.from(
-    document.querySelectorAll(
-      "input[data-item-key]"
-    )
-  );
-
-
-const statusElement =
-  document.getElementById(
-    "status"
-  );
-
-
-const progressElement =
-  document.getElementById(
-    "progress"
-  );
-
-
-function updateProgress() {
-  const completed =
-    boxes.filter(
-      box =>
-        box.checked
-    ).length;
-
-
-  progressElement.textContent =
-    completed +
-    " / " +
-    boxes.length +
-    " complete";
-}
-
-
-for (
-  const box of boxes
-) {
-  box.addEventListener(
-    "change",
-
-    async () => {
-      const intendedState =
-        box.checked;
-
-
-      updateProgress();
-
-
-      statusElement.textContent =
-        "Saving...";
-
-
-      box.disabled =
-        true;
-
-
-      try {
-        const response =
-          await fetch(
-            "/api/deal-checklists/" +
-            encodeURIComponent(
-              checklistToken
-            ) +
-            "/item",
-            {
-              method:
-                "PATCH",
-
-              headers: {
-                "Content-Type":
-                  "application/json"
-              },
-
-              body:
-                JSON.stringify({
-                  itemKey:
-                    box.dataset.itemKey,
-
-                  checked:
-                    intendedState
-                })
-            }
-          );
-
-
-        const data =
-          await response.json();
-
-
-        if (
-          !response.ok ||
-          data.ok !== true
-        ) {
-          throw new Error(
-            data.error ||
-            "Could not save."
-          );
-        }
-
-
-        statusElement.textContent =
-          "Saved";
-
-
-      } catch (error) {
-        /*
-          Put the checkbox back if saving fails.
-        */
-        box.checked =
-          !intendedState;
-
-
-        updateProgress();
-
-
-        statusElement.textContent =
-          "Save failed: " +
-          (
-            error.message ||
-            "Unknown error"
-          );
-
-
-      } finally {
-        box.disabled =
-          false;
-      }
-    }
-  );
-}
-
-
-updateProgress();
-
-</script>
-
-</body>
-
-</html>
-  `;
-}
-
-
 /*
   ============================================================
-  PURCHASE CHECKLIST PAGE
+  FINAL DETERMINISTIC SERPAPI PAID-CALL GATE
   ============================================================
+
+  needsGoogleLens is a REQUEST, not a permission. The server
+  already prunes/derives entries deterministically, but this is
+  the last checkpoint before money is spent, so it re-verifies
+  each target and requires an affirmative reason code:
+
+    camera-model-genuinely-vague
+    lens-commercial-variant-ambiguous
+    distinct-product-identity-unresolved
+    (lens-resolver-error: resolver crashed; legacy behaviour kept)
+
+  It also:
+    - refuses products the server rejected as likely duplicates;
+    - refuses an evidence-free extra detection that cannot be
+      isolated from already-resolved same-type products in every
+      image it appears in (a broad group search could only
+      rediscover the known product or mis-map a group answer);
+    - builds the exclusion context (ALL already-resolved
+      same-type products visible in the target image, from any
+      source - not only earlier visual results) that the visual
+      prompt must use.
 */
-
-app.get(
-  "/deal-checklist/:token",
-
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const checklist =
-        await loadDealChecklistByToken(
-          req.params.token
-        );
-
-
-      if (!checklist) {
-        return res
-          .status(404)
-          .send(
-            "Checklist not found."
-          );
-      }
-
-
-      return res
-        .type("html")
-        .send(
-          renderDealChecklistPage(
-            checklist
-          )
-        );
-
-
-    } catch (error) {
-      console.error(
-        "[DEAL CHECKLIST] Load failed:",
-        error
-      );
-
-
-      return res
-        .status(500)
-        .send(
-          "Could not load checklist."
-        );
-    }
-  }
-);
-
-
-/*
-  ============================================================
-  PURCHASE CHECKLIST STATE UPDATE
-  ============================================================
-*/
-
-app.patch(
-  "/api/deal-checklists/:token/item",
-
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const itemKey =
-        String(
-          req.body?.itemKey ||
-          ""
-        ).trim();
-
-
-      const itemExists =
-        DEAL_CHECKLIST_ITEMS.some(
-          item =>
-            item.key ===
-            itemKey
-        );
-
-
-      if (!itemExists) {
-        return res
-          .status(400)
-          .json({
-            ok:
-              false,
-
-            error:
-              "Unknown checklist item."
-          });
-      }
-
-
-      const checklist =
-        await loadDealChecklistByToken(
-          req.params.token
-        );
-
-
-      if (!checklist) {
-        return res
-          .status(404)
-          .json({
-            ok:
-              false,
-
-            error:
-              "Checklist not found."
-          });
-      }
-
-
-      const checked =
-        req.body?.checked ===
-        true;
-
-
-      const {
-        error
-      } =
-        await supabaseAdmin
-          .from(
-            "deal_checklist_states"
-          )
-          .upsert(
-            {
-              checklist_id:
-                checklist.id,
-
-              item_key:
-                itemKey,
-
-              checked,
-
-              updated_at:
-                new Date()
-                  .toISOString()
-            },
-            {
-              onConflict:
-                "checklist_id,item_key"
-            }
-          );
-
-
-      if (error) {
-        throw error;
-      }
-
-
-      return res.json({
-        ok:
-          true,
-
-        itemKey,
-
-        checked
-      });
-
-
-    } catch (error) {
-      console.error(
-        "[DEAL CHECKLIST] Save failed:",
-        error
-      );
-
-
-      return res
-        .status(500)
-        .json({
-          ok:
-            false,
-
-          error:
-            error?.message ||
-            "Could not save checklist."
-        });
-    }
-  }
-);
-
-  const ANALYSIS_LOG_DIRECTORY =
-  path.resolve(
-    "marketplace-analysis-logs"
-  );
-
-fs.mkdirSync(
-  ANALYSIS_LOG_DIRECTORY,
-  {
-    recursive: true
-  }
-);
-
-function sanitizeAnalysisRunId(
-  value
-) {
-  return String(value || "")
-    .trim()
-    .replace(
-      /[^a-zA-Z0-9_-]/g,
-      "_"
-    )
-    .slice(
-      0,
-      240
-    );
-}
-
-
-function getAnalysisLogFilePath(
-  analysisRunId
-) {
-  const safeId =
-    sanitizeAnalysisRunId(
-      analysisRunId
-    );
-
-  if (!safeId) {
-    return null;
-  }
-
-  return path.join(
-    ANALYSIS_LOG_DIRECTORY,
-    `${safeId}.log`
-  );
-}
-
-
-function appendAnalysisLogText(
-  text
-) {
-  const context =
-    analysisLogStorage.getStore();
-
-  const analysisRunId =
-    context?.analysisRunId;
-
-  if (!analysisRunId) {
-    return;
-  }
-
-  const filePath =
-    getAnalysisLogFilePath(
-      analysisRunId
-    );
-
-  if (!filePath) {
-    return;
-  }
-
-  try {
-    fs.appendFileSync(
-      filePath,
-      `${text}\n`,
-      "utf8"
-    );
-  } catch (error) {
-    /*
-      Do NOT use console.error here.
-
-      console.error itself will be intercepted
-      by our logger below, which could cause
-      recursion.
-    */
-    process.stderr.write(
-      `[ANALYSIS LOG ERROR] ${
-        error?.message ||
-        String(error)
-      }\n`
-    );
-  }
-}
-
-const analysisLogStorage =
-  new AsyncLocalStorage();
-
-const visionClient =
-  new vision.ImageAnnotatorClient();
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH QUEUE DATABASE
-  ============================================================
-
-  This database is separate from camera-products.db.
-
-  Scanner extension:
-      analyzes listing
-      -> generates message
-      -> stores outreach job here
-
-  Outreach extension:
-      requests next pending job
-      -> sends Facebook message
-      -> marks job sent
-*/
-
-const MARKETPLACE_OUTREACH_DATABASE_PATH =
-  path.resolve(
-    "marketplace-outreach.db"
-  );
-
-  /*
-  ============================================================
-  REMOTE EBAY WORKER DATABASE
-  ============================================================
-
-  Main scanner:
-      queues exact eBay sold-search URL
-
-  Worker extension:
-      claims pending job
-      opens URL
-      scrapes listings
-      returns raw listings
-
-  Main scanner:
-      receives listings
-      continues normal /evaluate-comps flow
-*/
-
-const EBAY_WORKER_DATABASE_PATH =
-  path.resolve(
-    "ebay-worker.db"
-  );
-
-const ebayWorkerDb =
-  new Database(
-    EBAY_WORKER_DATABASE_PATH
-  );
-
-ebayWorkerDb.pragma(
-  "journal_mode = WAL"
-);
-
-ebayWorkerDb.exec(`
-  CREATE TABLE IF NOT EXISTS ebay_worker_jobs (
-    id TEXT PRIMARY KEY,
-
-    marketplace_listing_id TEXT,
-    marketplace_url TEXT,
-
-    ebay_url TEXT NOT NULL,
-
-    status TEXT NOT NULL DEFAULT 'pending',
-
-    created_at INTEGER NOT NULL,
-    claimed_at INTEGER,
-    completed_at INTEGER,
-    failed_at INTEGER,
-
-    listings_json TEXT,
-    error TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_ebay_worker_jobs_status
-    ON ebay_worker_jobs (
-      status,
-      created_at
-    );
-`);
-
-console.log(
-  "[EBAY WORKER DATABASE] Ready:",
-  EBAY_WORKER_DATABASE_PATH
-);
-
-const outreachDb =
-  new Database(
-    MARKETPLACE_OUTREACH_DATABASE_PATH
-  );
-
-outreachDb.pragma(
-  "journal_mode = WAL"
-);
-
-outreachDb.pragma(
-  "foreign_keys = ON"
-);
-
-outreachDb.exec(`
-  CREATE TABLE IF NOT EXISTS marketplace_outreach_sessions (
-    session_id TEXT PRIMARY KEY,
-
-    started_at INTEGER NOT NULL,
-    ended_at INTEGER,
-
-    list_url TEXT,
-    scan_mode TEXT,
-
-    stop_reason TEXT,
-
-    clicked_listings INTEGER NOT NULL DEFAULT 0,
-    hits_found INTEGER NOT NULL DEFAULT 0,
-    outreach_queued INTEGER NOT NULL DEFAULT 0,
-
-    status TEXT NOT NULL DEFAULT 'open'
-  );
-
-  CREATE TABLE IF NOT EXISTS marketplace_outreach_items (
-    id TEXT PRIMARY KEY,
-
-    session_id TEXT NOT NULL,
-    listing_id TEXT NOT NULL UNIQUE,
-    listing_url TEXT NOT NULL,
-
-    message TEXT NOT NULL,
-
-    recommendation TEXT,
-
-    status TEXT NOT NULL DEFAULT 'pending',
-
-    created_at INTEGER NOT NULL,
-    claimed_at INTEGER,
-    sent_at INTEGER,
-    failed_at INTEGER,
-
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-
-    FOREIGN KEY (
-      session_id
-    )
-    REFERENCES marketplace_outreach_sessions(
-      session_id
-    )
-    ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_marketplace_outreach_items_status
-    ON marketplace_outreach_items(
-      status,
-      created_at
-    );
-
-  CREATE INDEX IF NOT EXISTS idx_marketplace_outreach_items_session
-    ON marketplace_outreach_items(
-      session_id,
-      status,
-      created_at
-    );
-`);
-
-console.log(
-  "[OUTREACH DATABASE] Ready:",
-  MARKETPLACE_OUTREACH_DATABASE_PATH
-);
-
-function validateRemoteEbayUrl(
-  value
-) {
-  try {
-    const url =
-      new URL(
-        String(value || "")
-      );
-
-    const hostname =
-      url.hostname
-        .toLowerCase();
-
-    const validHost =
-      hostname === "ebay.com" ||
-      hostname === "www.ebay.com" ||
-      hostname.endsWith(
-        ".ebay.com"
-      );
-
-    const validPath =
-      url.pathname.startsWith(
-        "/sch/"
-      );
-
-    if (
-      !validHost ||
-      !validPath
-    ) {
-      return null;
-    }
-
-    return url.toString();
-
-  } catch (error) {
-    return null;
-  }
-}
-
-/*
-  ============================================================
-  REMOTE EBAY — QUEUE SEARCH
-  ============================================================
-*/
-
-app.post(
-  "/ebay-worker/jobs",
-  (req, res) => {
-    try {
-      const ebayUrl =
-        validateRemoteEbayUrl(
-          req.body?.ebayUrl
-        );
-
-      if (!ebayUrl) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Invalid eBay sold-search URL."
-          });
-      }
-
-      const marketplaceListingId =
-        String(
-          req.body
-            ?.marketplaceListingId ||
-          ""
-        ).trim();
-
-      const marketplaceUrl =
-        String(
-          req.body
-            ?.marketplaceUrl ||
-          ""
-        ).trim();
-
-      const jobId =
-        randomUUID();
-
-      const createdAt =
-        Date.now();
-
-      ebayWorkerDb
-        .prepare(`
-          INSERT INTO ebay_worker_jobs (
-            id,
-            marketplace_listing_id,
-            marketplace_url,
-            ebay_url,
-            status,
-            created_at
-          )
-          VALUES (
-            ?,
-            ?,
-            ?,
-            ?,
-            'pending',
-            ?
-          )
-        `)
-        .run(
-          jobId,
-          marketplaceListingId,
-          marketplaceUrl,
-          ebayUrl,
-          createdAt
-        );
-
-      console.log(
-        "[EBAY WORKER] Search queued:",
-        {
-          jobId,
-          marketplaceListingId,
-          ebayUrl
-        }
-      );
-
-      return res.json({
-        ok: true,
-        jobId,
-        status:
-          "pending",
-        ebayUrl,
-        createdAt
-      });
-
-    } catch (error) {
-      console.error(
-        "[EBAY WORKER] Queue failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not queue remote eBay search."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  REMOTE EBAY — GET JOB STATUS
-  ============================================================
-*/
-
-app.get(
-  "/ebay-worker/jobs/:jobId",
-  (req, res) => {
-    try {
-      const jobId =
-        String(
-          req.params.jobId ||
-          ""
-        ).trim();
-
-      const row =
-        ebayWorkerDb
-          .prepare(`
-            SELECT *
-            FROM ebay_worker_jobs
-            WHERE id = ?
-          `)
-          .get(
-            jobId
-          );
-
-      if (!row) {
-        return res
-          .status(404)
-          .json({
-            ok: false,
-            error:
-              "Remote eBay job not found."
-          });
-      }
-
-      let listings =
-        null;
-
-      if (
-        row.listings_json
-      ) {
-        try {
-          listings =
-            JSON.parse(
-              row.listings_json
-            );
-        } catch (error) {
-          listings =
-            [];
-        }
-      }
-
-      return res.json({
-        ok: true,
-
-        jobId:
-          row.id,
-
-        status:
-          row.status,
-
-        ebayUrl:
-          row.ebay_url,
-
-        listings,
-
-        error:
-          row.error || "",
-
-        createdAt:
-          row.created_at,
-
-        claimedAt:
-          row.claimed_at,
-
-        completedAt:
-          row.completed_at
-      });
-
-    } catch (error) {
-      console.error(
-        "[EBAY WORKER] Status lookup failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not read remote eBay job."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  REMOTE EBAY — CLAIM NEXT SEARCH
-  ============================================================
-*/
-
-const claimNextRemoteEbayJob =
-  ebayWorkerDb.transaction(
-    () => {
-      const row =
-        ebayWorkerDb
-          .prepare(`
-            SELECT *
-            FROM ebay_worker_jobs
-            WHERE status = 'pending'
-            ORDER BY created_at ASC
-            LIMIT 1
-          `)
-          .get();
-
-      if (!row) {
-        return null;
-      }
-
-      const claimedAt =
-        Date.now();
-
-      const result =
-        ebayWorkerDb
-          .prepare(`
-            UPDATE ebay_worker_jobs
-            SET
-              status = 'claimed',
-              claimed_at = ?
-            WHERE
-              id = ?
-              AND status = 'pending'
-          `)
-          .run(
-            claimedAt,
-            row.id
-          );
-
-      if (
-        result.changes !== 1
-      ) {
-        return null;
-      }
-
-      return ebayWorkerDb
-        .prepare(`
-          SELECT *
-          FROM ebay_worker_jobs
-          WHERE id = ?
-        `)
-        .get(
-          row.id
-        );
-    }
-  );
-
-app.post(
-  "/ebay-worker/jobs/claim",
-  (req, res) => {
-    try {
-      const row =
-        claimNextRemoteEbayJob();
-
-      if (!row) {
-        return res.json({
-          ok: true,
-          job: null
-        });
-      }
-
-      console.log(
-        "[EBAY WORKER] Claimed:",
-        {
-          jobId:
-            row.id,
-          ebayUrl:
-            row.ebay_url
-        }
-      );
-
-      return res.json({
-        ok: true,
-
-        job: {
-          jobId:
-            row.id,
-
-          ebayUrl:
-            row.ebay_url,
-
-          marketplaceListingId:
-            row.marketplace_listing_id,
-
-          createdAt:
-            row.created_at,
-
-          claimedAt:
-            row.claimed_at
-        }
-      });
-
-    } catch (error) {
-      console.error(
-        "[EBAY WORKER] Claim failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not claim remote eBay job."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  REMOTE EBAY — COMPLETE SEARCH
-  ============================================================
-*/
-
-app.post(
-  "/ebay-worker/jobs/:jobId/complete",
-  (req, res) => {
-    try {
-      const jobId =
-        String(
-          req.params.jobId ||
-          ""
-        ).trim();
-
-      const listings =
-        Array.isArray(
-          req.body?.listings
-        )
-          ? req.body.listings
-          : [];
-
-      const result =
-        ebayWorkerDb
-          .prepare(`
-            UPDATE ebay_worker_jobs
-            SET
-              status = 'completed',
-              completed_at = ?,
-              listings_json = ?,
-              error = NULL
-            WHERE id = ?
-          `)
-          .run(
-            Date.now(),
-            JSON.stringify(
-              listings
-            ),
-            jobId
-          );
-
-      if (
-        result.changes !== 1
-      ) {
-        return res
-          .status(404)
-          .json({
-            ok: false,
-            error:
-              "Remote eBay job not found."
-          });
-      }
-
-      console.log(
-        "[EBAY WORKER] Completed:",
-        {
-          jobId,
-          listings:
-            listings.length
-        }
-      );
-
-      return res.json({
-        ok: true,
-        jobId,
-        listingsCount:
-          listings.length
-      });
-
-    } catch (error) {
-      console.error(
-        "[EBAY WORKER] Completion failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not complete remote eBay job."
-        });
-    }
-  }
-);
-
-app.post(
-  "/ebay-worker/jobs/:jobId/fail",
-  (req, res) => {
-    try {
-      const jobId =
-        String(
-          req.params.jobId ||
-          ""
-        ).trim();
-
-      const errorMessage =
-        String(
-          req.body?.error ||
-          "Remote eBay worker failed."
-        ).trim();
-
-      ebayWorkerDb
-        .prepare(`
-          UPDATE ebay_worker_jobs
-          SET
-            status = 'failed',
-            failed_at = ?,
-            error = ?
-          WHERE id = ?
-        `)
-        .run(
-          Date.now(),
-          errorMessage,
-          jobId
-        );
-
-      return res.json({
-        ok: true,
-        jobId
-      });
-
-    } catch (error) {
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not fail remote eBay job."
-        });
-    }
-  }
-);
-
-function normalizeMarketplaceOutreachItem(
-  row
-) {
-  if (!row) {
-    return null;
-  }
-
-  return {
-    id:
-      row.id,
-
-    sessionId:
-      row.session_id,
-
-    listingId:
-      row.listing_id,
-
-    listingUrl:
-      row.listing_url,
-
-    message:
-      row.message,
-
-    recommendation:
-      row.recommendation || "",
-
-    status:
-      row.status,
-
-    createdAt:
-      row.created_at,
-
-    claimedAt:
-      row.claimed_at,
-
-    sentAt:
-      row.sent_at,
-
-    failedAt:
-      row.failed_at,
-
-    attempts:
-      Number(
-        row.attempts || 0
-      ),
-
-    lastError:
-      row.last_error || ""
-  };
-}
-
-const originalConsoleLog =
-  console.log.bind(
-    console
-  );
-
-const originalConsoleWarn =
-  console.warn.bind(
-    console
-  );
-
-const originalConsoleError =
-  console.error.bind(
-    console
-  );
-
-
-console.log = (...args) => {
-  originalConsoleLog(
-    ...args
-  );
-
-  appendAnalysisLogText(
-    util.format(
-      ...args
-    )
-  );
-};
-
-
-console.warn = (...args) => {
-  originalConsoleWarn(
-    ...args
-  );
-
-  appendAnalysisLogText(
-    util.format(
-      ...args
-    )
-  );
-};
-
-app.use(
-  (req, res, next) => {
-    const analysisRunId =
-      sanitizeAnalysisRunId(
-        req.get(
-          "X-Analysis-Run-Id"
-        )
-      );
-
-    if (!analysisRunId) {
-      next();
-      return;
-    }
-
-    analysisLogStorage.run(
-      {
-        analysisRunId
-      },
-      next
-    );
-  }
-);
-
-function getSupabaseHitLogObjectPath(
-  analysisRunId
-) {
-  const safeId =
-    sanitizeAnalysisRunId(
-      analysisRunId
-    );
-
-  if (!safeId) {
-    throw new Error(
-      "Missing analysis run ID."
-    );
-  }
-
-  /*
-    The Facebook Marketplace listing ID
-    is the portion before the first "_".
-  */
-  const listingId =
-    safeId.split("_")[0] ||
-    "unknown";
-
-  return (
-    `${listingId}/` +
-    `${safeId}.log`
-  );
-}
-
-
-async function uploadAnalysisLogToSupabase(
-  analysisRunId
-) {
-  const safeId =
-    sanitizeAnalysisRunId(
-      analysisRunId
-    );
-
-  if (!safeId) {
-    throw new Error(
-      "Cannot upload hit log without analysisRunId."
-    );
-  }
-
-  const localFilePath =
-    getAnalysisLogFilePath(
-      safeId
-    );
-
-  if (
-    !localFilePath ||
-    !fs.existsSync(
-      localFilePath
-    )
-  ) {
-    throw new Error(
-      `Analysis log file does not exist for ${safeId}.`
-    );
-  }
-
-  const objectPath =
-    getSupabaseHitLogObjectPath(
-      safeId
-    );
-
-  const logBuffer =
-    fs.readFileSync(
-      localFilePath
-    );
-
-  const {
-    error: uploadError
-  } =
-    await supabaseAdmin
-      .storage
-      .from(
-        SUPABASE_HIT_LOG_BUCKET
-      )
-      .upload(
-        objectPath,
-        logBuffer,
-        {
-          contentType:
-            "text/plain; charset=utf-8",
-
-          cacheControl:
-            "60",
-
-          upsert:
-            true
-        }
-      );
-
-  if (uploadError) {
-    throw new Error(
-      `Supabase hit-log upload failed: ${
-        uploadError.message ||
-        String(uploadError)
-      }`
-    );
-  }
-
-  const {
-    data: publicUrlData
-  } =
-    supabaseAdmin
-      .storage
-      .from(
-        SUPABASE_HIT_LOG_BUCKET
-      )
-      .getPublicUrl(
-        objectPath
-      );
-
-  const publicUrl =
-    String(
-      publicUrlData
-        ?.publicUrl ||
-      ""
-    ).trim();
-
-  if (!publicUrl) {
-    throw new Error(
-      "Supabase did not return a public hit-log URL."
-    );
-  }
-
-  return {
-    publicUrl,
-    objectPath,
-    localFilePath
-  };
-}
-
-
-console.error = (...args) => {
-  originalConsoleError(
-    ...args
-  );
-
-  appendAnalysisLogText(
-    util.format(
-      ...args
-    )
-  );
-};
-
-cleanupOldLocalAnalysisLogs();
-
-console.log(
-  "[PRODUCT DATABASE] Using global Supabase camera_products table."
-);
-
-/*
-  ============================================================
-  KNOWN CANONICAL NAME ALIASES
-  ============================================================
-
-  Some products have genuinely different names that still refer
-  to the exact same physical item - most commonly Canon's
-  regional DSLR naming (same camera, different badge in the US
-  vs. Europe vs. Asia). No generic formatting rule can safely
-  catch these since the names don't share a common pattern; they
-  have to be listed explicitly.
-
-  HOW TO ADD A NEW ONE: add a { pattern, replacement } entry
-  below. `pattern` matches the case where the ALTERNATE name
-  appears (word-boundary, case-insensitive since the input is
-  already lowercased); `replacement` is whichever form should
-  win going forward. It does not matter which side "wins" as
-  long as it's applied consistently - pick whichever spelling is
-  already more common in camera_products if unsure. Verify a new
-  pair actually refers to the same camera (not just a similar
-  one) before adding it - an incorrect merge would silently
-  combine pricing data for two different products.
-
-  Confirmed as of this writing:
-    Rebel T6   = EOS 1300D
-    Rebel T7   = EOS 2000D
-    Rebel T100 = EOS 4000D
-    Rebel XTi  = EOS 400D
-  ============================================================
-*/
-const CANONICAL_NAME_KNOWN_ALIASES = [
-  {
-    pattern: /\brebel t6\b/g,
-    replacement: "1300d"
-  },
-  {
-    pattern: /\beos t6\b/g,
-    replacement: "eos 1300d"
-  },
-  {
-    pattern: /\brebel t7\b/g,
-    replacement: "2000d"
-  },
-  {
-    pattern: /\bt7 rebel\b/g,
-    replacement: "2000d"
-  },
-  {
-    pattern: /\beos t7\b/g,
-    replacement: "eos 2000d"
-  },
-  {
-    pattern: /\brebel t100\b/g,
-    replacement: "4000d"
-  },
-  {
-    pattern: /\beos t100\b/g,
-    replacement: "eos 4000d"
-  },
-  {
-    pattern: /\brebel xti\b/g,
-    replacement: "400d"
-  }
-];
-
-/*
-  Lens mount prefixes that are sometimes glued directly to the
-  focal length with no space (e.g. OCR/reconstruction producing
-  "ef-s55-250mm" instead of "ef-s 55-250mm"). Longer/more
-  specific prefixes are listed before their shorter substrings
-  ("ef-s" before "ef") so the more specific one always matches
-  first.
-*/
-const LENS_MOUNT_PREFIXES_NEEDING_SPACE =
-  [
-    "ef-s",
-    "ef-m",
-    "rf-s",
-    "ef",
-    "rf",
-    "fd",
-    "fl",
-    "dx",
-    "fx"
-  ];
-
-function normalizeCanonicalName(value) {
-  let name =
-    String(value || "")
-      .trim()
-      .toLowerCase()
-
-      // Normalize trivial product-type wording.
-      .replace(/\bcamera lens\b/g, "lens")
-
-      /*
-        Parenthetical asides and slash-separated alternates are
-        almost always just an alternate/regional name annotation
-        ("EOS 1300D (Rebel T6)", "EOS Rebel XTi / 400D") - strip
-        them to plain whitespace so both spellings of a listing
-        converge to the same string once the alias table and the
-        duplicate-token collapse below run.
-      */
-      .replace(/\([^)]*\)/g, " ")
-      .replace(/\//g, " ")
-
-      .replace(/\s+/g, " ")
-      .trim();
-
-  /*
-    Known same-product-different-name aliases (see table above).
-  */
-  for (
-    const alias of CANONICAL_NAME_KNOWN_ALIASES
-  ) {
-    name =
-      name.replace(
-        alias.pattern,
-        alias.replacement
-      );
-  }
-
-  /*
-    Insert a missing space between a lens mount prefix and an
-    immediately-following focal length digit, e.g.
-    "ef-s55-250mm" -> "ef-s 55-250mm".
-  */
-  for (
-    const prefix of LENS_MOUNT_PREFIXES_NEEDING_SPACE
-  ) {
-    const escapedPrefix =
-      prefix.replace(
-        /[.*+?^${}()|[\]\\]/g,
-        "\\$&"
-      );
-
-    name =
-      name.replace(
-        new RegExp(
-          `\\b${escapedPrefix}(?=\\d)`,
-          "g"
-        ),
-        `${prefix} `
-      );
-  }
-
-  name = name
-
-    /*
-      Aperture notation formatting varies ("f/4-5.6" vs.
-      "f4-5.6") without changing what the aperture actually is -
-      collapse both to the same form so they compare equal.
-    */
-    .replace(/\bf\s*\/?\s*/g, "f")
-
-    /*
-      A revision marker occasionally gets extracted in the wrong
-      order relative to "IS" (e.g. "II IS" instead of Canon's
-      actual "IS II" naming) - normalize to the correct order.
-    */
-    .replace(
-      /\b(ii|iii|iv)\s+is\b/g,
-      "is $1"
-    )
-
-    /*
-      Marketing/descriptive filler that doesn't add any
-      identifying information beyond what's already in the
-      focal length + productType. Strip the descriptive words
-      but leave a trailing bare "lens" (from productType) intact.
-    */
-    .replace(
-      /\b(manual focus )?telephoto zoom\b/g,
-      " "
-    )
-
-    .replace(/\s+/g, " ")
-    .trim();
-
-  /*
-    Collapse any word/token that's immediately repeated
-    (e.g. "ef-s ef-s", "1300d 1300d") - this can happen either
-    from upstream string-building bugs or as a side effect of
-    the alias substitution above. Run twice to also catch a
-    repeat created by the first pass (e.g. three in a row).
-  */
-  for (let pass = 0; pass < 2; pass++) {
-    name =
-      name.replace(
-        /\b([a-z0-9][a-z0-9-]*)\s+\1\b/g,
-        "$1"
-      );
-  }
-
-  return name
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function cleanNullableIdentityField(value) {
-  if (value == null) {
-    return null;
-  }
-
-  const cleaned =
-    String(value)
-      .replace(/\s+/g, " ")
-      .trim();
-
-  return cleaned || null;
-}
-
-/*
-  ============================================================
-  DETERMINISTIC CAMERA MODEL SPECIFICITY CHECK
-  ============================================================
-
-  Camera lenses get a deterministic backstop via
-  resolveCanonicalLens() regardless of what Step 5's LLM call
-  decided. Camera bodies/cameras have no such resolver, so this
-  gives non-lens products the same kind of deterministic check.
-
-  IMPORTANT (why this is NOT a "must contain a digit" test):
-  a model does not need a numeral to be an exact model.
-  "Nikkormat EL", "Nikon F", "Canon Canonet" style names are
-  exact; the previous digit heuristic sent them to paid visual
-  identification, which just echoed the same name back.
-
-  The rule is now: a seller-supported model is specific unless it
-  is (a) empty/placeholder text, (b) only a brand/filler word, or
-  (c) a KNOWN generic family/series label ("EOS", "Rebel",
-  "Alpha", "D", "PowerShot"...). Detection of the generic forms
-  is explicit and conservative rather than trying to prove
-  specificity from the presence of a number.
-*/
-const CAMERA_BRAND_TOKENS =
+const SERPAPI_ALLOWED_REASON_CODES =
   new Set([
-    "canon", "nikon", "sony", "fujifilm", "fuji", "olympus",
-    "pentax", "asahi", "panasonic", "leica", "minolta",
-    "konica", "kodak", "samsung", "ricoh", "casio",
-    "hasselblad", "mamiya", "yashica", "contax", "polaroid",
-    "sigma", "sanyo", "vivitar"
+    "camera-model-genuinely-vague",
+    "lens-commercial-variant-ambiguous",
+    "distinct-product-identity-unresolved",
+    "lens-resolver-error"
   ]);
 
-const CAMERA_MODEL_FILLER_TOKENS =
-  new Set([
-    "camera", "cameras", "body", "bodies", "only", "slr",
-    "dslr", "mirrorless", "compact", "kit", "series"
-  ]);
-
-const CAMERA_MODEL_PLACEHOLDER_LABELS =
-  new Set([
-    "unknown", "none", "n a", "na", "unspecified", "model",
-    "tbd", "not sure", "unsure"
-  ]);
-
-/*
-  Known GENERIC family/series labels (normalized: lowercase,
-  punctuation collapsed to single spaces, brand/filler words
-  removed). A label listed here maps to many commercially
-  distinct cameras. Real single models that merely look short
-  ("Nikon F", "Nikkormat EL", "EOS R", "EOS M", "Pen F",
-  "Df") are intentionally NOT listed.
-*/
-const GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND = {
-  any: [],
-  canon: [
-    "eos", "eos rebel", "rebel", "rebel t", "eos rebel t",
-    "eos digital", "eos kiss", "kiss", "powershot",
-    "powershot g", "powershot s", "powershot a",
-    "powershot sx", "powershot elph", "elph", "ixus", "ixy",
-    "canonet"
-  ],
-  nikon: [
-    "d", "d series", "z", "z series", "coolpix", "coolpix p",
-    "coolpix s", "coolpix l", "nikon 1", "1", "j", "v",
-    "nikkormat"
-  ],
-  sony: [
-    "alpha", "α", "alpha a", "a", "cyber shot", "cybershot",
-    "dsc", "nex"
-  ],
-  fujifilm: [
-    "x", "finepix", "fine pix", "gfx", "x pro", "x t", "x e",
-    "x h", "x s", "x a", "x m"
-  ],
-  fuji: [
-    "x", "finepix", "fine pix", "gfx", "x pro", "x t", "x e",
-    "x h", "x s", "x a", "x m"
-  ],
-  olympus: [
-    "om", "om d", "pen", "pen e", "e system", "stylus",
-    "stylus tough", "tough", "mju"
-  ],
-  pentax: [
-    "k", "optio"
-  ],
-  panasonic: [
-    "lumix", "lumix g", "lumix gh", "g", "gh", "gx", "fz",
-    "lx", "dmc"
-  ],
-  minolta: [
-    "maxxum", "dynax", "srt"
-  ]
-};
-
-const ALL_GENERIC_CAMERA_FAMILY_LABELS =
-  new Set(
-    Object.values(
-      GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND
-    ).flat()
-  );
-
-function tokenizeCameraText(
+function normalizeGateType(
   value
 ) {
   return String(
     value || ""
   )
-    .toLowerCase()
-    .normalize("NFKC")
-    .replace(
-      /[^\p{L}\p{N}]+/gu,
-      " "
-    )
     .trim()
-    .split(" ")
-    .filter(Boolean);
+    .toLowerCase();
 }
 
-/*
-  Returns a structured assessment so callers can log WHY an
-  identity was considered vague or sufficiently specific.
-*/
-function classifyCameraModelSpecificity(
-  brand,
-  modelName
+function collectSameTypeImageOccupancy(
+  galleries,
+  productId
 ) {
-  const brandTokens =
-    tokenizeCameraText(brand);
-
-  const brandResolved =
-    brandTokens.length > 0;
-
-  const brandKey =
-    brandTokens[0] || "";
-
-  let tokens =
-    tokenizeCameraText(modelName);
-
-  /*
-    Model strings frequently repeat the brand
-    ("Nikon Nikkormat EL"). Strip leading brand words only.
-  */
-  while (
-    tokens.length &&
-    CAMERA_BRAND_TOKENS.has(
-      tokens[0]
-    )
-  ) {
-    tokens.shift();
-  }
-
-  tokens =
-    tokens.filter(
-      token =>
-        !CAMERA_MODEL_FILLER_TOKENS.has(
-          token
-        )
-    );
-
-  const normalizedModel =
-    tokens.join(" ");
-
-  if (!normalizedModel) {
-    return {
-      vague: true,
-      code: "camera-model-missing",
-      reason:
-        "no model text remains after removing brand/filler words",
-      normalizedModel,
-      brandResolved
-    };
-  }
-
-  if (
-    CAMERA_MODEL_PLACEHOLDER_LABELS.has(
-      normalizedModel
-    )
-  ) {
-    return {
-      vague: true,
-      code: "camera-model-placeholder",
-      reason:
-        `"${normalizedModel}" is placeholder text, not a model`,
-      normalizedModel,
-      brandResolved
-    };
-  }
-
-  const familyLabels =
-    new Set(
-      GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND[
-        brandKey
-      ]
-        ? [
-            ...GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND.any,
-            ...GENERIC_CAMERA_FAMILY_LABELS_BY_BRAND[
-              brandKey
-            ]
-          ]
-        : [
-            ...ALL_GENERIC_CAMERA_FAMILY_LABELS
-          ]
-    );
-
-  if (
-    familyLabels.has(
-      normalizedModel
-    )
-  ) {
-    return {
-      vague: true,
-      code:
-        "camera-model-known-generic-family",
-      reason:
-        `"${normalizedModel}" is a known generic ${
-          brandKey || "camera"
-        } family/series label that maps to many distinct models`,
-      normalizedModel,
-      brandResolved
-    };
-  }
-
-  const hasDigit =
-    /\d/.test(normalizedModel);
-
-  /*
-    Without a digit, the model text alone cannot show WHICH
-    manufacturer's "EL"/"F"/"OM" it is, so a resolved brand is
-    required for alphabetic-only designations.
-  */
-  if (
-    !hasDigit &&
-    !brandResolved
-  ) {
-    return {
-      vague: true,
-      code:
-        "camera-model-brand-unresolved",
-      reason:
-        `alphabetic model "${normalizedModel}" cannot be trusted without a resolved brand`,
-      normalizedModel,
-      brandResolved
-    };
-  }
-
-  return {
-    vague: false,
-    code:
-      hasDigit
-        ? "camera-model-specific-designator"
-        : "camera-model-specific-named-model",
-    reason:
-      hasDigit
-        ? `"${normalizedModel}" carries an explicit model designator and is not a known generic family label`
-        : `"${normalizedModel}" is a plausible distinct model name (brand resolved) and is not a known generic family label`,
-    normalizedModel,
-    brandResolved
-  };
-}
-
-/*
-  Backward-compatible boolean wrapper. Pass the brand whenever
-  it is known: alphabetic-only models require a resolved brand.
-*/
-function isVagueCameraModelName(
-  modelName,
-  brand = null
-) {
-  return classifyCameraModelSpecificity(
-    brand,
-    modelName
-  ).vague;
-}
-
-/*
-  ============================================================
-  GALLERY PHANTOM / DUPLICATE PRODUCT VALIDATION
-  ============================================================
-
-  Step 2 (gallery analysis) can occasionally emit an extra
-  physical-product ID (e.g. lens_3) for an object that is really
-  just another detection of a product that already has its own ID.
-  Every gallery ID is otherwise treated as authoritative physical
-  existence, which then (a) gets restored by Step 5 structural
-  recovery and (b) sends an evidence-free product to paid visual
-  identification.
-
-  This stage is deliberately CONSERVATIVE. A gallery product is
-  flagged as a likely duplicate/phantom only when ALL of these hold:
-
-    1. it is a camera lens with no identity evidence of its own
-       (no brand/mount/focal/aperture/codes/tokens/generation);
-    2. its product-specific OCR contributes nothing that is not
-       already explained by other lenses (no unique focal length);
-    3. the seller reliably enumerates lenses (a structured item
-       list or an explicit quantity) and states no more lenses
-       than the OTHER, well-supported lens IDs already account for;
-    4. each seller-described lens can be traced to one of those
-       well-supported gallery IDs (when the seller listed items);
-    5. every image containing it also contains one of those
-       already-supported lenses (it never stands alone).
-
-  A seller simply omitting a product never suppresses anything:
-  with no reliable seller enumeration, or with a lens that shows
-  up in its own image, or with unique OCR, the product is kept.
-*/
-const SELLER_LENS_ACCESSORY_PATTERN =
-  /\b(hood|hoods|cap|caps|cover|covers|filter|filters|adapter|adaptor|converter|teleconverter|case|bag|pouch|strap|cleaning|cloth|shade|tube|extension)\b/i;
-
-const SELLER_NON_LENS_GEAR_PATTERN =
-  /\b(flash|speedlite|speedlight|tripod|monopod)\b/i;
-
-const SELLER_QUANTITY_WORDS = {
-  one: 1,
-  two: 2,
-  three: 3,
-  four: 4,
-  five: 5
-};
-
-function extractFocalInfoFromText(
-  text
-) {
-  const keys = new Set();
-  const endpoints = new Set();
-
-  let remaining =
-    String(text || "");
-
-  const rangePattern =
-    /(\d{1,3}(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d{1,3}(?:\.\d+)?)\s*mm/gi;
-
-  remaining =
-    remaining.replace(
-      rangePattern,
-      (
-        match,
-        low,
-        high
-      ) => {
-        keys.add(
-          `${Number(low)}-${Number(high)}mm`
-        );
-        endpoints.add(Number(low));
-        endpoints.add(Number(high));
-        return " ";
-      }
-    );
-
-  const singlePattern =
-    /(\d{1,3}(?:\.\d+)?)\s*mm/gi;
-
-  let match;
-
-  while (
-    (match =
-      singlePattern.exec(
-        remaining
-      )) !== null
-  ) {
-    keys.add(
-      `${Number(match[1])}mm`
-    );
-    endpoints.add(
-      Number(match[1])
-    );
-  }
-
-  return {
-    keys,
-    endpoints
-  };
-}
-
-function parseSellerLensEnumeration({
-  listingTitle,
-  listingDescription,
-  explicitFacts
-}) {
-  const description =
-    String(
-      listingDescription || ""
-    ).replace(
-      /[•●▪◦]/g,
-      "\n• "
-    );
-
-  const rawLines = [];
-
-  for (
-    const line of
-      description.split(/\r?\n/)
-  ) {
-    const trimmed =
-      line.trim();
-
-    if (!trimmed) {
-      continue;
-    }
-
-    const isBullet =
-      /^(?:[•\-\*–—·]|\d+[.)])\s+/.test(
-        trimmed
-      );
-
-    rawLines.push({
-      text:
-        trimmed.replace(
-          /^(?:[•\-\*–—·]|\d+[.)])\s+/,
-          ""
-        ),
-      isBullet,
-      source: "description"
-    });
-  }
-
-  const titleText =
-    String(
-      listingTitle || ""
-    ).trim();
-
-  if (titleText) {
-    rawLines.push({
-      text: titleText,
-      isBullet: false,
-      source: "title"
-    });
-  }
-
-  const explicitlyIncluded =
-    Array.isArray(
-      explicitFacts?.explicitlyIncluded
-    )
-      ? explicitFacts.explicitlyIncluded
-      : [];
-
-  for (
-    const entry of explicitlyIncluded
-  ) {
-    const text =
-      typeof entry === "string"
-        ? entry
-        : String(
-            entry?.text ||
-            entry?.item ||
-            entry?.name ||
-            ""
-          );
-
-    if (text.trim()) {
-      rawLines.push({
-        text: text.trim(),
-        isBullet: false,
-        source: "explicitFacts"
-      });
-    }
-  }
-
-  const items = [];
-  const itemKeys = new Set();
-  const signaturesSeenInDescription =
-    new Set();
-
-  for (const line of rawLines) {
-    const focal =
-      extractFocalInfoFromText(
-        line.text
-      );
-
-    const looksLikeLens =
-      focal.keys.size > 0 ||
-      /\blens\b/i.test(line.text);
-
-    if (
-      !looksLikeLens ||
-      SELLER_LENS_ACCESSORY_PATTERN.test(
-        line.text
-      ) ||
-      SELLER_NON_LENS_GEAR_PATTERN.test(
-        line.text
-      )
-    ) {
-      continue;
-    }
-
-    const signature =
-      focal.keys.size
-        ? Array.from(focal.keys)
-            .sort()
-            .join("|")
-        : line.text
-            .toLowerCase()
-            .replace(/\s+/g, " ");
-
-    /*
-      explicitFacts restates the description; don't
-      double count the same lens across those sources.
-    */
-    if (
-      line.source ===
-        "explicitFacts" &&
-      signaturesSeenInDescription.has(
-        signature
-      )
-    ) {
-      continue;
-    }
-
-    if (
-      line.source !==
-      "explicitFacts"
-    ) {
-      signaturesSeenInDescription.add(
-        signature
-      );
-    }
-
-    focal.keys.forEach(
-      key => itemKeys.add(key)
-    );
-
-    items.push({
-      text: line.text,
-      focalKeys:
-        Array.from(focal.keys),
-      lensCount:
-        Math.max(
-          1,
-          focal.keys.size
-        )
-    });
-  }
-
-  const enumeratedCount =
-    items.reduce(
-      (sum, item) =>
-        sum + item.lensCount,
-      0
-    );
-
-  const combinedText =
-    `${titleText}\n${String(listingDescription || "")}`;
-
-  let explicitCount = null;
-
-  const quantityPattern =
-    /\b(one|two|three|four|five|[1-5])\s+(?:[\w-]+\s+){0,2}lenses\b/gi;
-
-  let quantityMatch;
-
-  while (
-    (quantityMatch =
-      quantityPattern.exec(
-        combinedText
-      )) !== null
-  ) {
-    const token =
-      quantityMatch[1]
-        .toLowerCase();
-
-    const value =
-      SELLER_QUANTITY_WORDS[token] ||
-      Number(token);
-
-    if (
-      Number.isFinite(value) &&
-      (
-        explicitCount === null ||
-        value > explicitCount
-      )
-    ) {
-      explicitCount = value;
-    }
-  }
-
-  const bulletLineCount =
-    rawLines.filter(
-      line =>
-        line.isBullet &&
-        line.source ===
-          "description"
-    ).length;
-
-  const reliable =
-    explicitCount !== null ||
-    bulletLineCount >= 3;
-
-  return {
-    items,
-    itemFocalKeys:
-      Array.from(itemKeys),
-    enumeratedCount,
-    explicitCount,
-    bulletLineCount,
-    reliable,
-    sellerLensCount:
-      reliable
-        ? Math.max(
-            enumeratedCount,
-            explicitCount || 0
-          )
-        : 0
-  };
-}
-
-function buildGalleryProductRegistry(
-  galleryResults
-) {
-  const registry = new Map();
-  const imageProducts = new Map();
+  const occupancy = [];
 
   for (
     const gallery of
-      Array.isArray(galleryResults)
-        ? galleryResults
+      Array.isArray(galleries)
+        ? galleries
         : []
   ) {
     const analysis =
       gallery?.galleryAnalysis || {};
-
-    for (
-      const product of
-        Array.isArray(analysis.products)
-          ? analysis.products
-          : []
-    ) {
-      const productId =
-        String(
-          product?.productId || ""
-        ).trim();
-
-      const productType =
-        String(
-          product?.productType || ""
-        ).trim();
-
-      if (!productId || !productType) {
-        continue;
-      }
-
-      const entry =
-        registry.get(productId) || {
-          productId,
-          productType,
-          visibleInImages: new Set(),
-          maxReadability: 0
-        };
-
-      for (
-        const index of
-          Array.isArray(
-            product?.visibleInImages
-          )
-            ? product.visibleInImages
-            : []
-      ) {
-        if (Number.isFinite(Number(index))) {
-          entry.visibleInImages.add(
-            Number(index)
-          );
-        }
-      }
-
-      registry.set(productId, entry);
-    }
 
     for (
       const image of
@@ -7607,11966 +2044,2394 @@ function buildGalleryProductRegistry(
           ? analysis.images
           : []
     ) {
-      const imageIndex =
-        Number(image?.imageIndex);
+      const visible =
+        Array.isArray(
+          image?.visibleProducts
+        )
+          ? image.visibleProducts
+          : [];
 
-      if (!Number.isFinite(imageIndex)) {
+      const self =
+        visible.find(
+          item =>
+            String(
+              item?.productId || ""
+            ).trim() === productId
+        );
+
+      if (!self) {
         continue;
       }
 
-      for (
-        const visible of
-          Array.isArray(
-            image?.visibleProducts
-          )
-            ? image.visibleProducts
-            : []
-      ) {
-        const productId =
-          String(
-            visible?.productId || ""
-          ).trim();
-
-        const entry =
-          registry.get(productId);
-
-        if (!entry) {
-          continue;
-        }
-
-        entry.visibleInImages.add(
-          imageIndex
-        );
-
-        entry.maxReadability =
-          Math.max(
-            entry.maxReadability,
-            Number(
-              visible?.modelReadabilityScore
-            ) || 0
-          );
-
-        const set =
-          imageProducts.get(
-            imageIndex
-          ) || new Set();
-
-        set.add(productId);
-
-        imageProducts.set(
-          imageIndex,
-          set
-        );
-      }
+      occupancy.push({
+        imageIndex:
+          Number(image?.imageIndex),
+        sameTypeIds:
+          visible
+            .filter(
+              item =>
+                normalizeGateType(
+                  item?.productType
+                ) ===
+                normalizeGateType(
+                  self?.productType
+                )
+            )
+            .map(
+              item =>
+                String(
+                  item?.productId || ""
+                ).trim()
+            )
+            .filter(Boolean)
+      });
     }
   }
 
+  return occupancy;
+}
+
+function describeResolvedPrimaryProduct(
+  product
+) {
+  const brand =
+    String(
+      product?.brand || ""
+    ).trim();
+
+  const model =
+    String(
+      product?.model || ""
+    ).trim();
+
+  const identity =
+    [brand, model]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+
   return {
-    registry,
-    imageProducts
+    productId:
+      String(
+        product?.productId || ""
+      ).trim(),
+    productType:
+      String(
+        product?.productType || ""
+      ).trim(),
+    identity,
+    identitySource:
+      product?.lensIdentity
+        ?.resolutionMode ||
+      "seller-ocr"
   };
 }
 
-function isLensProductType(
-  productType
-) {
-  return /lens/i.test(
-    String(productType || "")
-  );
-}
-
-function getStructuredLensIdentityForProduct(
+function evaluateSerpApiPaidCallGate({
+  target,
+  unresolvedEntry,
   primaryProducts,
-  productId
-) {
+  needsGoogleLens,
+  suppressedGalleryProducts,
+  galleries,
+  lensfunCandidates
+}) {
+  const productId =
+    String(
+      target?.productId || ""
+    ).trim();
+
   const product =
-    (Array.isArray(primaryProducts)
-      ? primaryProducts
-      : []
-    ).find(
+    primaryProducts.find(
       item =>
         String(
           item?.productId || ""
         ).trim() === productId
+    ) || null;
+
+  const needsIds =
+    new Set(
+      needsGoogleLens.map(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim()
+      )
     );
 
-  return normalizeLensIdentity(
-    product?.lensIdentity || {}
-  );
-}
+  const isLens =
+    normalizeGateType(
+      product?.productType ||
+      target?.productType
+    ).includes("lens");
 
-function lensIdentityHasAnyEvidence(
-  identity
-) {
-  return Boolean(
-    identity?.brand ||
-    identity?.canonicalModel ||
-    identity?.mountSeries ||
-    identity?.focalLength ||
-    identity?.maxAperture ||
-    identity?.generation ||
-    (identity?.modelCodes || []).length ||
-    (identity?.featureTokens || []).length
-  );
-}
+  const isSufficientlyResolved =
+    id => {
+      const candidate =
+        primaryProducts.find(
+          item =>
+            String(
+              item?.productId || ""
+            ).trim() === id
+        );
 
-function lensIdentityIsWellSupported(
-  identity
-) {
-  return Boolean(
-    identity?.canonicalModel ||
+      return Boolean(
+        candidate &&
+        !needsIds.has(id) &&
+        String(
+          candidate?.model || ""
+        ).trim()
+      );
+    };
+
+  const sameTypeProductIds =
     (
-      identity?.brand &&
-      (
-        isCompleteLensfunFocalEvidence(
-          identity?.focalLength
-        ) ||
-        (identity?.modelCodes || []).length
+      Array.isArray(
+        target?.sameTypeProductIds
       )
+        ? target.sameTypeProductIds
+        : [productId]
     )
+      .map(
+        id =>
+          String(id || "").trim()
+      )
+      .filter(Boolean);
+
+  const resolvedProductsInSameImage =
+    sameTypeProductIds
+      .filter(
+        id =>
+          id !== productId &&
+          isSufficientlyResolved(id)
+      )
+      .map(
+        id =>
+          describeResolvedPrimaryProduct(
+            primaryProducts.find(
+              item =>
+                String(
+                  item?.productId || ""
+                ).trim() === id
+            )
+          )
+      );
+
+  const resolvedIds =
+    new Set(
+      resolvedProductsInSameImage.map(
+        item => item.productId
+      )
+    );
+
+  const suppressedIds =
+    new Set(
+      (Array.isArray(
+        suppressedGalleryProducts
+      )
+        ? suppressedGalleryProducts
+        : []
+      ).map(
+        item =>
+          String(
+            item?.productId || ""
+          ).trim()
+      )
+    );
+
+  const unresolvedSameTypeProductIds =
+    sameTypeProductIds.filter(
+      id =>
+        !resolvedIds.has(id) &&
+        !suppressedIds.has(id)
+    );
+
+  const reasonCode =
+    String(
+      unresolvedEntry
+        ?.serpApiReasonCode ||
+      ""
+    ).trim();
+
+  const occupancy =
+    collectSameTypeImageOccupancy(
+      galleries,
+      productId
+    );
+
+  const isolatedInSomeImage =
+    occupancy.some(
+      entry =>
+        entry.sameTypeIds.filter(
+          id => id !== productId
+        ).length === 0
+    );
+
+  const everyImageHasResolvedSibling =
+    occupancy.length > 0 &&
+    occupancy.every(
+      entry =>
+        entry.sameTypeIds.some(
+          id =>
+            id !== productId &&
+            isSufficientlyResolved(id)
+        )
+    );
+
+  const noIndependentEvidence =
+    unresolvedEntry
+      ?.hasOwnIdentityEvidence ===
+      false &&
+    unresolvedEntry
+      ?.hasUniqueOcrEvidence ===
+      false;
+
+  const totalResolvedSameType =
+    primaryProducts.filter(
+      item =>
+        normalizeGateType(
+          item?.productType
+        ) ===
+          normalizeGateType(
+            product?.productType
+          ) &&
+        isSufficientlyResolved(
+          String(
+            item?.productId || ""
+          ).trim()
+        )
+    ).length;
+
+  const sellerExpectsMore =
+    Number(
+      unresolvedEntry
+        ?.sellerLensCount || 0
+    ) > totalResolvedSameType;
+
+  let allowed = true;
+  let reason = reasonCode;
+  let suppressAsPhantom = false;
+
+  if (!product) {
+    allowed = false;
+    reason =
+      "product-not-in-final-primary-products";
+  } else if (
+    suppressedIds.has(productId)
+  ) {
+    allowed = false;
+    reason =
+      "likely-duplicate-suppressed-by-server";
+  } else if (
+    !SERPAPI_ALLOWED_REASON_CODES.has(
+      reasonCode
+    )
+  ) {
+    allowed = false;
+    reason =
+      "no-affirmative-reason";
+  } else if (
+    reasonCode ===
+      "lens-commercial-variant-ambiguous" &&
+    (
+      !Array.isArray(
+        lensfunCandidates
+      ) ||
+      lensfunCandidates.length < 2
+    )
+  ) {
+    allowed = false;
+    reason =
+      "variant-ambiguity-claimed-without-multiple-lensfun-candidates";
+  } else if (
+    isLens &&
+    reasonCode ===
+      "distinct-product-identity-unresolved" &&
+    unresolvedEntry
+      ?.identityInsufficient !==
+      true
+  ) {
+    allowed = false;
+    reason =
+      "identity-not-actually-insufficient";
+  } else if (
+    isLens &&
+    noIndependentEvidence &&
+    !isolatedInSomeImage &&
+    everyImageHasResolvedSibling &&
+    !sellerExpectsMore
+  ) {
+    allowed = false;
+    suppressAsPhantom = true;
+    reason =
+      "likely-phantom-no-independent-evidence-and-not-isolatable";
+  }
+
+  const gateLog = {
+    productId,
+    allowed,
+    reason,
+    currentIdentity:
+      unresolvedEntry
+        ?.currentIdentity ||
+      null,
+    identitySource:
+      unresolvedEntry
+        ?.identitySource ||
+      null,
+    lensfunCandidateCount:
+      Array.isArray(
+        lensfunCandidates
+      )
+        ? lensfunCandidates.length
+        : (
+            unresolvedEntry
+              ?.lensfunCandidateCount ??
+            null
+          ),
+    sellerEvidence:
+      unresolvedEntry
+        ?.sellerEvidence ??
+      null,
+    ocrEvidence:
+      unresolvedEntry
+        ?.ocrEvidence ??
+      null,
+    likelyDuplicate:
+      suppressedIds.has(
+        productId
+      ) ||
+      suppressAsPhantom,
+    resolvedProductsInSameImage
+  };
+
+  console.log(
+    "[SERPAPI GATE]",
+    gateLog
   );
+
+  return {
+    allowed,
+    reason,
+    suppressAsPhantom,
+    resolvedProductsInSameImage,
+    unresolvedSameTypeProductIds,
+    occupancy,
+    isolatedInSomeImage
+  };
 }
 
 /*
-  True when the product's own OCR text contributes a focal
-  length number that is NOT already explained by another lens's
-  identity. OCR can leak text from a neighbouring lens in the
-  same photo, so text that merely repeats another lens's numbers
-  is NOT unique evidence.
+  Exclusion context handed to the visual-search layer so that
+  paid output is never spent rediscovering products that are
+  already resolved (seller text/OCR, Lensfun exact or resale
+  consensus, earlier visual result, accepted DataForSEO...).
 */
-function productHasUniqueLensOcr({
-  productId,
-  productOcrResults,
-  otherLensIdentities
+function buildVisualExclusionContext({
+  target,
+  gateResult
 }) {
-  const ocrText =
-    (Array.isArray(productOcrResults)
-      ? productOcrResults
+  const resolved =
+    gateResult
+      .resolvedProductsInSameImage;
+
+  const unresolvedIds =
+    gateResult
+      .unresolvedSameTypeProductIds;
+
+  const noun =
+    normalizeGateType(
+      target?.productType
+    ).includes("lens")
+      ? "lens"
+      : (
+          normalizeGateType(
+            target?.productType
+          ) || "product"
+        );
+
+  const scope =
+    resolved.length
+      ? (
+          unresolvedIds.length > 1
+            ? "group-with-exclusions"
+            : "single-with-exclusions"
+        )
+      : (
+          unresolvedIds.length > 1
+            ? "group"
+            : "single"
+        );
+
+  const exclusionText =
+    resolved.length
+      ? `Other ${noun}s visible in this photo are ALREADY IDENTIFIED and must be ignored and NOT reported: ${
+          resolved
+            .map(
+              item =>
+                item.identity ||
+                item.productId
+            )
+            .join("; ")
+        }. Identify ONLY the remaining unidentified ${noun}${
+          unresolvedIds.length > 1
+            ? "s"
+            : ""
+        }. Reply with its full exact model name, or exactly UNKNOWN if it cannot be reliably identified.`
+      : "";
+
+  return {
+    alreadyResolvedSameImageProducts:
+      resolved,
+    unresolvedSameTypeProductIds:
+      unresolvedIds,
+    visualIdentificationScope:
+      scope,
+    visualPromptExclusionText:
+      exclusionText
+  };
+}
+
+const LISTING_JSON_RETRY_KEY =
+  "marketplaceMalformedJsonRetryByListingId";
+
+const MAX_FULL_LISTING_JSON_RESTARTS = 2;
+
+const MARKETPLACE_RANDOM_KEYWORD_MODE = "randomKeyword";
+
+const MARKETPLACE_SEARCH_EXHAUSTION_DELAY_MS =
+  30 * 1000;
+
+const MARKETPLACE_SEARCH_TERMS = [
+  "digital camera",
+  "DSLR",
+  "mirrorless camera",
+  "camera bundle",
+  "camera with lens",
+
+  "camera",
+  "Canon",
+  "Nikon",
+
+
+  "Canon EOS",
+  "Nikon DSLR",
+
+
+  "camera lens",
+  "Canon lens",
+  "Nikon lens",
+
+
+  "camara",
+  "cannon camera",
+  "cannon lens",
+  "nikon camara",
+  "camera lense",
+  "rebel camera"
+];
+
+function normalizeMarketplaceSearchTerm(term) {
+  return String(term || "")
+    .trim()
+    .toLowerCase();
+}
+
+function getMarketplaceSearchTermFromUrl(
+  url = window.location.href
+) {
+  try {
+    const parsed = new URL(
+      url,
+      window.location.origin
+    );
+
+    return (
+      parsed.searchParams.get("query") || ""
+    ).trim();
+  } catch (error) {
+    console.warn(
+      "Could not read Marketplace search term:",
+      error
+    );
+
+    return "";
+  }
+}
+
+function buildMarketplaceSearchUrl(
+  sourceUrl,
+  searchTerm
+) {
+  const parsed = new URL(
+    sourceUrl,
+    window.location.origin
+  );
+
+  parsed.searchParams.set(
+    "query",
+    String(searchTerm || "").trim()
+  );
+
+  parsed.searchParams.set(
+    "exact",
+    "false"
+  );
+
+  return parsed.toString();
+}
+
+function pickRandomMarketplaceSearchTerm({
+  currentTerm = "",
+  usedTerms = []
+} = {}) {
+  const normalizedCurrent =
+    normalizeMarketplaceSearchTerm(
+      currentTerm
+    );
+
+  const normalizedUsed = new Set(
+    Array.isArray(usedTerms)
+      ? usedTerms.map(
+          normalizeMarketplaceSearchTerm
+        )
       : []
+  );
+
+  /*
+    First try terms that have not been used during
+    this keyword cycle and are not the current term.
+  */
+  let available =
+    MARKETPLACE_SEARCH_TERMS.filter(term => {
+      const normalized =
+        normalizeMarketplaceSearchTerm(term);
+
+      return (
+        normalized !== normalizedCurrent &&
+        !normalizedUsed.has(normalized)
+      );
+    });
+
+  /*
+    Once every term has been used, start a new cycle.
+  */
+  if (!available.length) {
+    available =
+      MARKETPLACE_SEARCH_TERMS.filter(term => {
+        return (
+          normalizeMarketplaceSearchTerm(term) !==
+          normalizedCurrent
+        );
+      });
+  }
+
+  if (!available.length) {
+    return currentTerm || "camera";
+  }
+
+  return available[
+    Math.floor(
+      Math.random() * available.length
     )
-      .filter(
-        entry =>
-          String(
-            entry?.productId || ""
-          ).trim() === productId
-      )
-      .map(
-        entry =>
-          String(entry?.ocrText || "")
-      )
-      .join("\n");
+  ];
+}
 
-  const ownEndpoints =
-    extractFocalInfoFromText(
-      ocrText
-    ).endpoints;
+async function switchToRandomMarketplaceSearchTerm(
+  reason = "Current search exhausted"
+) {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
+    );
 
-  if (!ownEndpoints.size) {
+  const state =
+    stored[MARKETPLACE_AUTO_STATE_KEY];
+
+  if (
+    !state?.running ||
+    state.scanMode !==
+      MARKETPLACE_RANDOM_KEYWORD_MODE
+  ) {
     return false;
   }
 
-  const claimedEndpoints =
-    new Set();
-
-  for (
-    const identity of
-      otherLensIdentities
-  ) {
-    extractFocalInfoFromText(
-      identity?.focalLength || ""
-    ).endpoints.forEach(
-      value =>
-        claimedEndpoints.add(value)
-    );
-  }
-
-  return Array.from(
-    ownEndpoints
-  ).some(
-    value =>
-      !claimedEndpoints.has(value)
-  );
-}
-
-function evaluateLikelyPhantomGalleryProducts({
-  galleryResults,
-  primaryProducts,
-  productOcrResults,
-  listingTitle,
-  listingDescription,
-  explicitFacts,
-  priorSuppressed = []
-}) {
-  const {
-    registry,
-    imageProducts
-  } =
-    buildGalleryProductRegistry(
-      galleryResults
+  const currentTerm =
+    state.currentSearchTerm ||
+    getMarketplaceSearchTermFromUrl(
+      state.listUrl ||
+      window.location.href
     );
 
-  const seller =
-    parseSellerLensEnumeration({
-      listingTitle,
-      listingDescription,
-      explicitFacts
+  const usedTerms =
+    Array.isArray(state.usedSearchTerms)
+      ? state.usedSearchTerms
+      : [];
+
+  const nextTerm =
+    pickRandomMarketplaceSearchTerm({
+      currentTerm,
+      usedTerms
     });
 
-  const suppressed = [];
-  const diagnostics = [];
-  const suppressedIds = new Set();
+  const allTermsUsed =
+    new Set(
+      usedTerms.map(
+        normalizeMarketplaceSearchTerm
+      )
+    ).size >=
+    MARKETPLACE_SEARCH_TERMS.length - 1;
+
+  const nextUsedTerms =
+    allTermsUsed
+      ? [nextTerm]
+      : [...usedTerms, nextTerm];
+
+  const baseUrl =
+    state.listUrl ||
+    window.location.href;
+
+  const nextUrl =
+    buildMarketplaceSearchUrl(
+      baseUrl,
+      nextTerm
+    );
+
+  const now = Date.now();
+
+  const nextState = {
+    ...state,
+
+    listUrl: nextUrl,
+
+    currentSearchTerm: nextTerm,
+    previousSearchTerm: currentTerm,
+
+    usedSearchTerms: nextUsedTerms,
+
+    currentListingUrl: "",
+    waitingForAnalysis: false,
+    analysisDone: false,
+
+    noFreshListingSince: null,
+    lastFreshListingOpenedAt: now,
+
+    searchStartedAt: now,
+
+    searchSwitchCount:
+      Number(
+        state.searchSwitchCount || 0
+      ) + 1,
+
+    lastSearchSwitchReason: reason,
+    lastSearchSwitchAt: now
+  };
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_AUTO_STATE_KEY]:
+      nextState
+  });
+
+  console.log(
+    "[KEYWORD SWITCH]",
+    {
+      from: currentTerm,
+      to: nextTerm,
+      reason,
+      nextUrl
+    }
+  );
 
   /*
-    A product rejected on an earlier pass stays rejected: Step 5
-    recovery on the post-visual pass must not resurrect it.
+    Changing location loads the new query and acts
+    as the required page refresh.
   */
-  for (
-    const prior of
-      Array.isArray(priorSuppressed)
-        ? priorSuppressed
-        : []
-  ) {
-    const productId =
-      String(
-        prior?.productId || ""
-      ).trim();
+  window.location.href = nextUrl;
 
-    if (
-      productId &&
-      registry.has(productId) &&
-      !suppressedIds.has(productId)
-    ) {
-      suppressedIds.add(productId);
+  return true;
+}
 
-      suppressed.push({
-        ...prior,
-        productId,
-        suppressedAsLikelyDuplicate: true,
-        carriedOverFromEarlierPass: true
-      });
-    }
-  }
+async function getListingAnalysisRetryCount(listingId) {
+  if (!listingId) return 0;
 
-  const lensEntries =
-    Array.from(registry.values())
-      .filter(
-        entry =>
-          isLensProductType(
-            entry.productType
-          ) &&
-          !suppressedIds.has(
-            entry.productId
-          )
-      );
+  const stored = await chrome.storage.local.get(
+    LISTING_ANALYSIS_RETRY_KEY
+  );
 
-  const identityById =
-    new Map(
-      lensEntries.map(
-        entry => [
-          entry.productId,
-          getStructuredLensIdentityForProduct(
-            primaryProducts,
-            entry.productId
-          )
-        ]
-      )
-    );
+  const retryMap =
+    stored[LISTING_ANALYSIS_RETRY_KEY] || {};
 
-  const supported =
-    lensEntries.filter(
-      entry =>
-        lensIdentityIsWellSupported(
-          identityById.get(
-            entry.productId
-          )
-        )
-    );
+  return Number(retryMap[listingId] || 0);
+}
 
-  const candidates =
-    lensEntries.filter(
-      entry =>
-        !lensIdentityIsWellSupported(
-          identityById.get(
-            entry.productId
-          )
-        ) &&
-        !lensIdentityHasAnyEvidence(
-          identityById.get(
-            entry.productId
-          )
-        )
-    );
+async function incrementListingAnalysisRetryCount(listingId) {
+  if (!listingId) return 0;
 
-  for (const candidate of candidates) {
-    const images =
-      Array.from(
-        candidate.visibleInImages
-      ).sort(
-        (a, b) => a - b
-      );
+  const stored = await chrome.storage.local.get(
+    LISTING_ANALYSIS_RETRY_KEY
+  );
 
-    const otherIdentities =
-      lensEntries
-        .filter(
-          entry =>
-            entry.productId !==
-            candidate.productId
-        )
-        .map(
-          entry =>
-            identityById.get(
-              entry.productId
-            )
-        );
-
-    const uniqueOcr =
-      productHasUniqueLensOcr({
-        productId:
-          candidate.productId,
-        productOcrResults,
-        otherLensIdentities:
-          otherIdentities
-      });
-
-    const sellerCount =
-      seller.sellerLensCount;
-
-    const sellerCountAccounted =
-      sellerCount > 0 &&
-      supported.length >=
-        sellerCount;
-
-    const sellerKeys =
-      new Set(
-        seller.itemFocalKeys
-      );
-
-    const tracedSupported =
-      supported.filter(
-        entry => {
-          const identityKeys =
-            extractFocalInfoFromText(
-              identityById.get(
-                entry.productId
-              )?.focalLength || ""
-            ).keys;
-
-          return Array.from(
-            identityKeys
-          ).some(
-            key =>
-              sellerKeys.has(key)
-          );
-        }
-      );
-
-    const sellerItemsTraceable =
-      seller.items.length === 0
-        ? true
-        : tracedSupported.length >=
-          sellerCount;
-
-    const coVisibleSupported =
-      new Set();
-
-    let everyImageHasSupportedLens =
-      images.length > 0;
-
-    for (const imageIndex of images) {
-      const present =
-        imageProducts.get(
-          imageIndex
-        ) || new Set();
-
-      const supportedHere =
-        supported.filter(
-          entry =>
-            present.has(
-              entry.productId
-            ) ||
-            entry.visibleInImages.has(
-              imageIndex
-            )
-        );
-
-      if (!supportedHere.length) {
-        everyImageHasSupportedLens =
-          false;
-      }
-
-      supportedHere.forEach(
-        entry =>
-          coVisibleSupported.add(
-            entry.productId
-          )
-      );
-    }
-
-    const checks = {
-      noOwnIdentityEvidence: true,
-      noUniqueOcr: !uniqueOcr,
-      sellerReliablyEnumeratesLenses:
-        seller.reliable &&
-        sellerCount > 0,
-      sellerCountAlreadyAccountedFor:
-        sellerCountAccounted,
-      sellerItemsTraceableToGalleryIds:
-        sellerItemsTraceable,
-      onlyAppearsWithSupportedLenses:
-        everyImageHasSupportedLens
-    };
-
-    const shouldSuppress =
-      Object.values(checks).every(
-        Boolean
-      );
-
-    const diagnostic = {
-      productId:
-        candidate.productId,
-      images,
-      maxModelReadability:
-        candidate.maxReadability,
-      sellerLensCount:
-        sellerCount || null,
-      supportedLensIds:
-        supported.map(
-          entry => entry.productId
-        ),
-      checks,
-      decision:
-        shouldSuppress
-          ? "suppress-as-likely-duplicate"
-          : "keep"
-    };
-
-    diagnostics.push(diagnostic);
-
-    if (!shouldSuppress) {
-      continue;
-    }
-
-    suppressedIds.add(
-      candidate.productId
-    );
-
-    suppressed.push({
-      productId:
-        candidate.productId,
-      productType:
-        candidate.productType,
-      suppressedAsLikelyDuplicate:
-        true,
-      reason:
-        `Seller enumerates ${sellerCount} lens(es) and ${supported.length} other lens ID(s) already account for them; this ID has no brand/model/focal/OCR identity of its own and only appears in images that also show those lenses.`,
-      possibleDuplicateOf:
-        Array.from(
-          coVisibleSupported
-        ),
-      evidence: {
-        images,
-        maxModelReadability:
-          candidate.maxReadability,
-        sellerLensCount:
-          sellerCount,
-        supportedLensIds:
-          supported.map(
-            entry => entry.productId
-          )
-      }
-    });
-  }
-
-  return {
-    suppressed,
-    diagnostics,
-    seller
+  const retryMap = {
+    ...(stored[LISTING_ANALYSIS_RETRY_KEY] || {})
   };
+
+  retryMap[listingId] =
+    Number(retryMap[listingId] || 0) + 1;
+
+  await chrome.storage.local.set({
+    [LISTING_ANALYSIS_RETRY_KEY]: retryMap
+  });
+
+  return retryMap[listingId];
+}
+
+async function clearListingAnalysisRetryCount(listingId) {
+  if (!listingId) return;
+
+  const stored = await chrome.storage.local.get(
+    LISTING_ANALYSIS_RETRY_KEY
+  );
+
+  const retryMap = {
+    ...(stored[LISTING_ANALYSIS_RETRY_KEY] || {})
+  };
+
+  delete retryMap[listingId];
+
+  await chrome.storage.local.set({
+    [LISTING_ANALYSIS_RETRY_KEY]: retryMap
+  });
+}
+
+async function getMalformedJsonRetryCount(listingId) {
+  const stored = await chrome.storage.local.get(
+    LISTING_JSON_RETRY_KEY
+  );
+
+  const retryMap =
+    stored[LISTING_JSON_RETRY_KEY] || {};
+
+  return Number(retryMap[listingId] || 0);
+}
+
+async function incrementMalformedJsonRetryCount(listingId) {
+  const stored = await chrome.storage.local.get(
+    LISTING_JSON_RETRY_KEY
+  );
+
+  const retryMap = {
+    ...(stored[LISTING_JSON_RETRY_KEY] || {})
+  };
+
+  retryMap[listingId] =
+    Number(retryMap[listingId] || 0) + 1;
+
+  await chrome.storage.local.set({
+    [LISTING_JSON_RETRY_KEY]: retryMap
+  });
+
+  return retryMap[listingId];
+}
+
+async function clearMalformedJsonRetryCount(listingId) {
+  const stored = await chrome.storage.local.get(
+    LISTING_JSON_RETRY_KEY
+  );
+
+  const retryMap = {
+    ...(stored[LISTING_JSON_RETRY_KEY] || {})
+  };
+
+  delete retryMap[listingId];
+
+  await chrome.storage.local.set({
+    [LISTING_JSON_RETRY_KEY]: retryMap
+  });
+}
+
+function isExtensionContextInvalidated(error) {
+  return String(error?.message || error || "")
+    .toLowerCase()
+    .includes("extension context invalidated");
+}
+
+function handleExtensionContextError(error) {
+  if (!isExtensionContextInvalidated(error)) {
+    return false;
+  }
+
+  console.warn(
+    "Extension context was invalidated. Refresh this tab before continuing."
+  );
+
+  return true;
+}
+
+async function restartEntireFacebookListingScanBecauseMalformedJson({
+  step = "unknown",
+  errorMessage = ""
+} = {}) {
+  const stored = await chrome.storage.local.get([
+    "ebayCompContext",
+    MARKETPLACE_AUTO_STATE_KEY
+  ]);
+
+  const context = stored.ebayCompContext || {};
+  const autoState =
+    stored[MARKETPLACE_AUTO_STATE_KEY] || {};
+
+  const facebookUrl = String(
+    context.facebookUrl ||
+    autoState.currentListingUrl ||
+    ""
+  ).split("?")[0];
+
+  const listingId =
+    getFacebookMarketplaceItemId(facebookUrl);
+
+  if (!facebookUrl || !listingId) {
+    throw new Error(
+      "Could not determine the Facebook listing URL for JSON restart."
+    );
+  }
+
+  const previousCount =
+    await getMalformedJsonRetryCount(listingId);
+
+  if (
+    previousCount >= MAX_FULL_LISTING_JSON_RESTARTS
+  ) {
+    const finalError = {
+      recommendation: "Error",
+      reason:
+        `The listing produced malformed AI JSON repeatedly during ` +
+        `${step}. Full scan restart limit reached. ` +
+        `${errorMessage}`.trim()
+    };
+
+await markMarketplaceAutoAnalysisComplete(
+  finalError,
+  {
+    preserveMalformedJsonRetryCount: true
+  }
+);
+    showEbayCompPanel(finalError);
+
+    return false;
+  }
+
+  const nextCount =
+    await incrementMalformedJsonRetryCount(listingId);
+
+  console.warn(
+    `Restarting full listing scan after malformed JSON. ` +
+    `Attempt ${nextCount}/${MAX_FULL_LISTING_JSON_RESTARTS}.`,
+    {
+      listingId,
+      facebookUrl,
+      step,
+      errorMessage
+    }
+  );
+
+  await chrome.storage.local.remove(
+    "ebayCompContext"
+  );
+
+  await chrome.storage.local.set({
+    marketplacePendingMalformedJsonRestart: {
+      listingId,
+      facebookUrl,
+      step,
+      retryNumber: nextCount,
+      requestedAt: Date.now()
+    },
+
+    [MARKETPLACE_AUTO_STATE_KEY]: {
+      ...autoState,
+      currentListingUrl: facebookUrl,
+      waitingForAnalysis: false,
+      analysisDone: false,
+      lastResult: {
+        recommendation: "Restarting",
+        reason:
+          `Malformed AI JSON during ${step}. ` +
+          `Restarting the entire listing scan.`
+      }
+    }
+  });
+
+  await closeMarketplaceAutoEbayTabs();
+
+  window.location.href = facebookUrl;
+  return true;
+}
+
+async function resumeMalformedJsonListingRestartIfNeeded() {
+  if (!isFacebookMarketplaceListingPage()) {
+    return false;
+  }
+
+  const stored = await chrome.storage.local.get(
+    "marketplacePendingMalformedJsonRestart"
+  );
+
+  const pending =
+    stored.marketplacePendingMalformedJsonRestart;
+
+  if (!pending) {
+    return false;
+  }
+
+  const currentUrl =
+    window.location.href.split("?")[0];
+
+  const currentListingId =
+    getFacebookMarketplaceItemId(currentUrl);
+
+  if (currentListingId !== pending.listingId) {
+    return false;
+  }
+
+  if (
+    Date.now() - Number(pending.requestedAt || 0) >
+    10 * 60 * 1000
+  ) {
+    console.warn(
+      "Discarding expired malformed-JSON restart request:",
+      pending
+    );
+
+    await chrome.storage.local.remove(
+      "marketplacePendingMalformedJsonRestart"
+    );
+
+    return false;
+  }
+
+  // Remove it before starting the scan so a page refresh does not
+  // trigger the same pending restart repeatedly.
+  await chrome.storage.local.remove(
+    "marketplacePendingMalformedJsonRestart"
+  );
+
+  await sleep(1500);
+
+  console.log(
+    "Restarting complete listing analysis after malformed JSON:",
+    pending
+  );
+
+  await aiCheckListing();
+
+  return true;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /*
   ============================================================
-  LENS IDENTITY SUFFICIENCY
+  BUY NOW BUTTON CHECK (shipping mode)
+
+  When AUTO_MESSAGE_ENABLED is false the scanner is in
+  shipping-only mode: a listing is only actionable if it has a
+  "Buy now" checkout button. Listings that only offer Message /
+  Make an offer are skipped before any analysis spend.
+
+  The Marketplace buttons are generated, obfuscated-class
+  elements, so detection is by visible label, not by class:
+  a visible <button>, [role="button"], link or <span> whose text
+  (or aria-label) is exactly "Buy now" - the button label itself
+  is a bare <span class="x1lliihq ...">Buy now</span>.
   ============================================================
-
-  "notFoundInLensfun" and "identityInsufficient" are DIFFERENT
-  things. Lensfun is a canonicalization/validation source, not
-  the sole authority on whether a seller/OCR-supplied lens model
-  is usable. Only insufficient identity justifies paid visual
-  identification.
-
-  Structured evidence only (Step 5 remains the one boundary that
-  reads raw text): a lens identity is commercially adequate when
-  the brand is known AND either
-    - a literal manufacturer model code is present, or
-    - a complete focal length + maximum aperture are present
-      together with at least one discriminator (mount, feature
-      token, or generation marker).
 */
-function assessLensIdentitySufficiency(
-  evidence
-) {
-  const brand =
-    String(
-      evidence?.brand || ""
-    ).trim();
-
-  const focalComplete =
-    isCompleteLensfunFocalEvidence(
-      evidence?.focalLength
+function hasMarketplaceBuyNowButton() {
+  const candidates =
+    document.querySelectorAll(
+      'button, [role="button"], a[role="button"], a, [aria-label], span'
     );
 
-  const aperture =
-    String(
-      evidence?.maxAperture || ""
-    ).trim();
+  for (const element of candidates) {
+    const label =
+      String(
+        element.getAttribute("aria-label") ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
 
-  const modelCodes =
-    Array.isArray(
-      evidence?.modelCodes
-    )
-      ? evidence.modelCodes
-      : [];
+    const text =
+      String(
+        element.innerText ||
+        element.textContent ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
 
-  const featureTokens =
-    Array.isArray(
-      evidence?.featureTokens
-    )
-      ? evidence.featureTokens
-      : [];
+    if (
+      label !== "buy now" &&
+      text !== "buy now"
+    ) {
+      continue;
+    }
 
-  const discriminators = [
-    evidence?.explicitMount
-      ? "mount"
-      : null,
-    featureTokens.length
-      ? "featureTokens"
-      : null,
-    evidence?.generation
-      ? "generation"
-      : null
-  ].filter(Boolean);
-
-  if (!brand) {
-    return {
-      sufficient: false,
-      code: "brand-missing",
-      reason:
-        "no resolved lens brand"
-    };
+    if (isVisibleMarketplaceElement(element)) {
+      return true;
+    }
   }
 
-  if (modelCodes.length) {
-    return {
-      sufficient: true,
-      code:
-        "manufacturer-model-code",
-      reason:
-        `brand plus literal model code(s) ${modelCodes.join(", ")}`
-    };
-  }
-
-  if (!focalComplete) {
-    return {
-      sufficient: false,
-      code:
-        "focal-length-missing-or-incomplete",
-      reason:
-        "no complete focal length"
-    };
-  }
-
-  if (!aperture) {
-    return {
-      sufficient: false,
-      code: "aperture-missing",
-      reason:
-        "complete focal length but no maximum aperture"
-    };
-  }
-
-  if (!discriminators.length) {
-    return {
-      sufficient: false,
-      code: "no-discriminator",
-      reason:
-        "brand/focal/aperture only; no mount, feature token, or generation to separate commercial variants"
-    };
-  }
-
-  return {
-    sufficient: true,
-    code:
-      "brand-focal-aperture-plus-discriminator",
-    reason:
-      `brand, focal length, aperture and ${discriminators.join("+")}`
-  };
+  return false;
 }
 
-function buildGroundedLensIdentity(
-  product,
-  evidence,
-  sufficiency
-) {
-  const base =
-    normalizeLensIdentity(
-      product?.lensIdentity || {}
-    );
+/*
+  The listing panel renders progressively, so wait for either the
+  Buy now button or evidence that the listing has loaded without
+  one. Returns:
+    true  -> Buy now button found
+    false -> listing loaded and there is no Buy now button
+    null  -> could not tell (listing never finished rendering)
+*/
+async function waitForMarketplaceBuyNowDecision({
+  minWaitMs = 2500,
+  maxWaitMs = 7000
+} = {}) {
+  const startedAt = Date.now();
 
-  const canonicalModel =
-    [
-      evidence?.focalLength,
-      evidence?.maxAperture,
-      ...(evidence?.featureTokens || []),
-      ...(evidence?.modelCodes || []),
-      evidence?.generation
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+  while (Date.now() - startedAt < maxWaitMs) {
+    if (hasMarketplaceBuyNowButton()) {
+      return true;
+    }
 
-  return {
-    ...base,
-    mountSeries:
-      base.mountSeries ||
-      evidence?.explicitMount ||
-      null,
-    canonicalModel:
-      canonicalModel || null,
-    resolutionMode:
-      "seller-ocr-grounded",
-    groundedBy:
-      sufficiency?.code || null
-  };
+    const elapsed =
+      Date.now() - startedAt;
+
+    if (
+      elapsed >= minWaitMs &&
+      String(
+        getListingTitle() || ""
+      ).trim()
+    ) {
+      return false;
+    }
+
+    await sleep(300);
+  }
+
+  return null;
 }
 
-function normalizeLensModelCodes(
-  value
-) {
-  return normalizeStringArray(
-    value
+function isVisibleMarketplaceElement(element) {
+  if (!element) return false;
+
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+
+  return (
+    rect.width > 0 &&
+    rect.height > 0 &&
+    style.display !== "none" &&
+    style.visibility !== "hidden"
   );
 }
 
-function normalizeLensIdentity(
-  lensIdentity = {}
+async function waitForMarketplaceElement(
+  getElement,
+  timeoutMs = 12000
 ) {
-  return {
-    brand:
-      cleanNullableIdentityField(
-        lensIdentity?.brand
-      ),
+  const startedAt = Date.now();
 
-    canonicalModel:
-      cleanNullableIdentityField(
-        lensIdentity?.canonicalModel
-      ),
+  while (Date.now() - startedAt < timeoutMs) {
+    const element = getElement();
 
-    mountSeries:
-      cleanNullableIdentityField(
-        lensIdentity?.mountSeries
-      ),
+    if (isVisibleMarketplaceElement(element)) {
+      return element;
+    }
 
-    focalLength:
-      cleanNullableIdentityField(
-        lensIdentity?.focalLength
-      ),
+    await sleep(250);
+  }
 
-    maxAperture:
-  cleanNullableIdentityField(
-    lensIdentity?.maxAperture
-  ),
-
-featureTokens:
-  normalizeStringArray(
-    lensIdentity?.featureTokens
-  ),
-
-modelCodes:
-  normalizeLensModelCodes(
-    lensIdentity?.modelCodes
-  ),
-    generation:
-      cleanNullableIdentityField(
-        lensIdentity?.generation
-      ),
-
-    resolutionMode:
-      cleanNullableIdentityField(
-        lensIdentity?.resolutionMode
-      )
-  };
+  return null;
 }
 
-function normalizeCanonicalLensModelForComparison(
-  value
-) {
-  return String(
-    value || ""
-  )
-    .toLowerCase()
-    .replace(
-      /\bf\s*\/?\s*/g,
-      "f"
+function findMarketplaceSellerMessageInput() {
+  const selectors = [
+    'textarea[data-interactable*="keyup"]',
+    'textarea',
+    'input[placeholder*="available" i]',
+    'textarea[placeholder*="available" i]',
+    'input[aria-label*="message" i]',
+    'textarea[aria-label*="message" i]',
+    '[contenteditable="true"][role="textbox"]'
+  ];
+
+  const candidates = [
+    ...new Set(
+      selectors.flatMap(selector =>
+        Array.from(
+          document.querySelectorAll(selector)
+        )
+      )
     )
+  ];
+
+  const validCandidates =
+    candidates.filter(element => {
+      if (!isVisibleMarketplaceElement(element)) {
+        return false;
+      }
+
+      if (
+        element instanceof HTMLTextAreaElement
+      ) {
+        const value =
+          String(element.value || "")
+            .trim()
+            .toLowerCase();
+
+        const interactable =
+          String(
+            element.getAttribute(
+              "data-interactable"
+            ) || ""
+          ).toLowerCase();
+
+       const normalizedValue =
+  value
     .replace(
-      /[^a-z0-9.]+/g,
-      " "
+      /\bstill\b/g,
+      ""
     )
     .replace(
       /\s+/g,
       " "
     )
     .trim();
-}
 
+return (
+  normalizedValue.includes(
+    "is this available"
+  ) ||
+  interactable.includes(
+    "keyup"
+  )
+);
+      }
 
-function findMatchingLensfunCandidate(
-  model,
-  candidates
-) {
-  const normalizedModel =
-    normalizeCanonicalLensModelForComparison(
-      model
-    );
+      return true;
+    });
 
+  /*
+    Prefer the seller field in the listing details
+    panel on the right half of the page.
+  */
+  const rightSideInput =
+    validCandidates.find(element => {
+      const rect =
+        element.getBoundingClientRect();
 
-  if (
-    !normalizedModel ||
-    !Array.isArray(
-      candidates
-    )
-  ) {
-    return null;
-  }
-
+      return (
+        rect.left >
+        window.innerWidth * 0.5
+      );
+    });
 
   return (
-    candidates.find(
-      candidate =>
-        normalizeCanonicalLensModelForComparison(
-          candidate?.model
-        ) ===
-        normalizedModel
-    ) ||
+    rightSideInput ||
+    validCandidates[0] ||
     null
   );
 }
 
-function buildNormalizedLensModel(
-  lensIdentity = {}
+function setMarketplaceMessageInputValue(
+  input,
+  message
 ) {
-  const normalized =
-    normalizeLensIdentity(
-      lensIdentity
-    );
+  input.scrollIntoView({
+    block: "center",
+    inline: "nearest"
+  });
 
-
-  /*
-    Once Lensfun/Serper has given us a canonical model,
-    preserve that model instead of reconstructing it.
-  */
-if (
-  normalized.canonicalModel
-) {
-  const modelWithoutBrand =
-    removeLeadingLensBrand(
-      normalized.canonicalModel,
-      normalized.brand
-    );
-
-
-  const cleanMount =
-    String(
-      normalized.mountSeries || ""
-    ).trim();
-
-
-  const brandKey =
-    normalizeLensfunComparisonText(
-      normalized.brand
-    );
-
-  const mountKey =
-    normalizeLensfunComparisonText(
-      cleanMount
-    );
-
+  input.focus();
 
   /*
-    Canon lens:
-      Canon + Canon EF + EF 50mm...
-    should not become:
-      Canon Canon EF Canon EF...
-
-    Third-party lens:
-      Sigma + Canon EF + 18-250mm...
-    DOES need Canon EF preserved.
+    Select and remove Facebook's default message first.
+    Facebook often ignores a direct value replacement
+    unless keyboard-like events also occur.
   */
-  const mountIsSameManufacturer =
-    brandKey &&
-    mountKey &&
-    (
-      mountKey ===
-        brandKey ||
-
-      mountKey.startsWith(
-        `${brandKey} `
-      )
-    );
-
-
-  const mountForModel =
-    mountIsSameManufacturer
-      ? null
-      : cleanMount;
-
-
-  return [
-    mountForModel,
-    modelWithoutBrand
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-  /*
-    Legacy/objective-evidence fallback.
-  */
-return [
-  normalized.mountSeries,
-  normalized.focalLength,
-  normalized.maxAperture,
-  ...normalized.modelCodes,
-  normalized.generation
-]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function getCanonicalNameForItem(item) {
-  return normalizeCanonicalName(
-    item?.ebaySearchQuery ||
-    `${item?.brand || ""} ${item?.model || ""} ${item?.productType || ""}`
+  input.dispatchEvent(
+    new KeyboardEvent("keydown", {
+      key: "a",
+      code: "KeyA",
+      ctrlKey: true,
+      bubbles: true
+    })
   );
-}
-
-async function findProductInDatabase(item) {
-  const canonicalName =
-    getCanonicalNameForItem(item);
-
-  if (!canonicalName) {
-    return null;
-  }
-
-  const {
-    data,
-    error
-  } =
-    await supabaseAdmin
-      .from(
-        "camera_products"
-      )
-      .select(`
-        canonical_name,
-        brand,
-        model,
-        product_type,
-        estimated_resale_price,
-        price_standard_deviation
-      `)
-      .eq(
-        "canonical_name",
-        canonicalName
-      )
-      .maybeSingle();
-
-  if (error) {
-    throw new Error(
-      `Supabase product lookup failed for "${canonicalName}": ${
-        error.message ||
-        String(error)
-      }`
-    );
-  }
-
-  return data || null;
-}
-
-async function saveProductToDatabase({
-  item,
-  estimatedResalePrice,
-  priceStandardDeviation
-}) {
-  const canonicalName =
-    getCanonicalNameForItem(item);
-
-  const price =
-    Number(
-      estimatedResalePrice
-    );
 
   if (
-    !canonicalName ||
-    !Number.isFinite(price) ||
-    price <= 0
+    input instanceof HTMLInputElement ||
+    input instanceof HTMLTextAreaElement
   ) {
-    return false;
-  }
+    input.select();
 
-  /*
-    Persist the price standard deviation next to the cached price.
+    const prototype =
+      input instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
 
-    Without this, a later cache HIT has no standard deviation to put
-    in Google Sheets column F. Only written when it is a real number
-    so a missing value never overwrites a previously saved one.
-  */
-  const stdDevNumber =
-    priceStandardDeviation == null ||
-    priceStandardDeviation === ""
-      ? NaN
-      : Number(
-          priceStandardDeviation
-        );
+    const setter =
+      Object.getOwnPropertyDescriptor(
+        prototype,
+        "value"
+      )?.set;
 
-  const stdDevColumn =
-    Number.isFinite(
-      stdDevNumber
-    )
-      ? {
-          price_standard_deviation:
-            Number(
-              stdDevNumber.toFixed(
-                2
-              )
-            )
-        }
-      : {};
+    if (setter) {
+      setter.call(input, "");
+    } else {
+      input.value = "";
+    }
 
-  const {
-    error
-  } =
-    await supabaseAdmin
-      .from(
-        "camera_products"
-      )
-      .upsert(
-        {
-          ...stdDevColumn,
-
-          canonical_name:
-            canonicalName,
-
-          brand:
-            String(
-              item.brand || ""
-            ).trim(),
-
-          model:
-            String(
-              item.model || ""
-            ).trim(),
-
-          product_type:
-            String(
-              item.productType || ""
-            ).trim(),
-
-          estimated_resale_price:
-            price,
-
-          updated_at:
-            new Date()
-              .toISOString()
-        },
-        {
-          onConflict:
-            "canonical_name"
-        }
-      );
-
-  if (error) {
-    throw new Error(
-      `Supabase product save failed for "${canonicalName}": ${
-        error.message ||
-        String(error)
-      }`
+    input.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        inputType:
+          "deleteContentBackward",
+        data: null
+      })
     );
-  }
 
-  console.log(
-    "[PRODUCT DATABASE] Saved globally to Supabase:",
-    canonicalName,
-    "$" + price,
-    Number.isFinite(stdDevNumber)
-      ? "stdDev $" + stdDevNumber.toFixed(2)
-      : "(no stdDev)"
-  );
-
-  return true;
-}
-process.on("uncaughtException", error => {
-  console.error("UNCAUGHT EXCEPTION:");
-  console.error(error);
-});
-
-process.on("unhandledRejection", reason => {
-  console.error("UNHANDLED REJECTION:");
-  console.error(reason);
-});
-
-app.post(
-  "/processed-marketplace-listings/claim",
-  async (req, res) => {
-    try {
-      const listingId =
-        String(
-          req.body?.listingId || ""
-        ).trim();
-
-      if (!listingId) {
-        return res.status(400).json({
-          error:
-            "Missing listingId."
-        });
-      }
-
-      const {
-        error
-      } =
-        await supabaseAdmin
-          .from(
-            "marketplace_processed_listings"
-          )
-          .insert({
-            listing_id:
-              listingId
-          });
-
-      /*
-        PostgreSQL unique-constraint violation.
-
-        Because listing_id is the primary key,
-        this means another scanner/device
-        already claimed it.
-      */
-      if (
-        error?.code === "23505"
-      ) {
-        console.log(
-          "[PROCESSED LISTINGS] Already claimed:",
-          listingId
-        );
-
-        return res.json({
-          claimed: false,
-          listingId
-        });
-      }
-
-      if (error) {
-        throw error;
-      }
-
-      console.log(
-        "[PROCESSED LISTINGS] Claimed:",
-        listingId
-      );
-
-      res.json({
-        claimed: true,
-        listingId
-      });
-    } catch (error) {
-      console.error(
-        "[PROCESSED LISTINGS] Claim failed:",
-        error
-      );
-
-      res.status(500).json({
-        error:
-          error?.message ||
-          "Could not claim Marketplace listing."
-      });
+    if (setter) {
+      setter.call(input, message);
+    } else {
+      input.value = message;
     }
-  }
-);
+  } else if (input.isContentEditable) {
+    input.textContent = "";
 
-app.post(
-  "/processed-marketplace-listings/check",
-  async (req, res) => {
-    try {
-      const listingIds = [
-        ...new Set(
-          (
-            Array.isArray(req.body?.listingIds)
-              ? req.body.listingIds
-              : []
-          )
-            .map(value =>
-              String(value || "").trim()
-            )
-            .filter(Boolean)
-        )
-      ];
+    const selection =
+      window.getSelection();
 
-      if (!listingIds.length) {
-        res.json({
-          processedListingIds: []
-        });
+    const range =
+      document.createRange();
 
-        return;
-      }
+    range.selectNodeContents(input);
+    range.collapse(true);
 
-      const {
-        data,
-        error
-      } =
-        await supabaseAdmin
-          .from(
-            "marketplace_processed_listings"
-          )
-          .select(
-            "listing_id"
-          )
-          .in(
-            "listing_id",
-            listingIds
-          );
+    selection.removeAllRanges();
+    selection.addRange(range);
 
-      if (error) {
-        throw error;
-      }
-
-      const processedListingIds =
-        Array.isArray(data)
-          ? data
-              .map(row =>
-                String(
-                  row?.listing_id || ""
-                ).trim()
-              )
-              .filter(Boolean)
-          : [];
-
-      res.json({
-        processedListingIds
-      });
-    } catch (error) {
-      console.error(
-        "[PROCESSED LISTINGS] Check failed:",
-        error
-      );
-
-      res.status(500).json({
-        error:
-          error?.message ||
-          "Could not check processed listings."
-      });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — START SCANNER SESSION
-  ============================================================
-*/
-
-app.post(
-  "/marketplace-outreach/session/start",
-  (req, res) => {
-    try {
-      const sessionId =
-        String(
-          req.body?.sessionId || ""
-        ).trim();
-
-      const startedAt =
-        Number(
-          req.body?.startedAt ||
-          Date.now()
-        );
-
-      const listUrl =
-        String(
-          req.body?.listUrl || ""
-        ).trim();
-
-      const scanMode =
-        String(
-          req.body?.scanMode ||
-          "standard"
-        ).trim();
-
-      if (!sessionId) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing sessionId."
-          });
-      }
-
-      outreachDb
-        .prepare(`
-          INSERT INTO marketplace_outreach_sessions (
-            session_id,
-            started_at,
-            list_url,
-            scan_mode,
-            status
-          )
-          VALUES (?, ?, ?, ?, 'open')
-
-          ON CONFLICT(session_id)
-          DO UPDATE SET
-            started_at =
-              excluded.started_at,
-
-            list_url =
-              excluded.list_url,
-
-            scan_mode =
-              excluded.scan_mode,
-
-            status =
-              'open'
-        `)
-        .run(
-          sessionId,
-          startedAt,
-          listUrl,
-          scanMode
-        );
-
-      console.log(
-        "\n[OUTREACH SESSION START]"
-      );
-
-      console.log(
-        "Session:",
-        sessionId
-      );
-
-      console.log(
-        "Scan mode:",
-        scanMode
-      );
-
-      console.log(
-        "Started:",
-        new Date(
-          startedAt
-        ).toISOString()
-      );
-
-      return res.json({
-        ok: true,
-        sessionId
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH SESSION] Start failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not start outreach session."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — QUEUE HIT
-  ============================================================
-*/
-
-app.post(
-  "/marketplace-outreach/queue",
-  (req, res) => {
-    try {
-      const sessionId =
-        String(
-          req.body?.sessionId || ""
-        ).trim();
-
-      const listingId =
-        String(
-          req.body?.listingId || ""
-        ).trim();
-
-      const listingUrl =
-        String(
-          req.body?.listingUrl || ""
-        ).trim();
-
-      const message =
-        String(
-          req.body?.message || ""
-        ).trim();
-
-      const recommendation =
-        String(
-          req.body?.recommendation || ""
-        ).trim();
-
-      const createdAt =
-        Number(
-          req.body?.createdAt ||
-          Date.now()
-        );
-
-      if (!sessionId) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing sessionId."
-          });
-      }
-
-      if (!listingId) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing listingId."
-          });
-      }
-
-      if (!listingUrl) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing listingUrl."
-          });
-      }
-
-      if (!message) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing generated outreach message."
-          });
-      }
-
-      /*
-        Safety fallback:
-
-        If the session-start request somehow failed
-        but the queue request reaches the server,
-        create the session automatically.
-      */
-      outreachDb
-        .prepare(`
-          INSERT OR IGNORE INTO marketplace_outreach_sessions (
-            session_id,
-            started_at,
-            status
-          )
-          VALUES (?, ?, 'open')
-        `)
-        .run(
-          sessionId,
-          createdAt
-        );
-
-      const outreachId =
-        randomUUID();
-
-      const result =
-        outreachDb
-          .prepare(`
-            INSERT OR IGNORE INTO marketplace_outreach_items (
-              id,
-              session_id,
-              listing_id,
-              listing_url,
-              message,
-              recommendation,
-              status,
-              created_at
-            )
-            VALUES (
-              ?,
-              ?,
-              ?,
-              ?,
-              ?,
-              ?,
-              'pending',
-              ?
-            )
-          `)
-          .run(
-            outreachId,
-            sessionId,
-            listingId,
-            listingUrl,
-            message,
-            recommendation,
-            createdAt
-          );
-
-      /*
-        listing_id is UNIQUE.
-
-        If changes === 0, this listing was already
-        queued during this or another session.
-      */
-      if (
-        result.changes === 0
-      ) {
-        const existing =
-          outreachDb
-            .prepare(`
-              SELECT *
-              FROM marketplace_outreach_items
-              WHERE listing_id = ?
-            `)
-            .get(
-              listingId
-            );
-
-        console.log(
-          "[OUTREACH QUEUE] Duplicate ignored:",
-          listingId
-        );
-
-        return res.json({
-          ok: true,
-
-          queued: false,
-          duplicate: true,
-
-          item:
-            normalizeMarketplaceOutreachItem(
-              existing
-            )
-        });
-      }
-
-      console.log(
-        "\n[OUTREACH QUEUE]"
-      );
-
-      console.log(
-        "+ Listing:",
-        listingId
-      );
-
-      console.log(
-        "  Session:",
-        sessionId
-      );
-
-      console.log(
-        "  URL:",
-        listingUrl
-      );
-
-      console.log(
-        "  Recommendation:",
-        recommendation
-      );
-
-      console.log(
-        "  Message:",
+    const inserted =
+      document.execCommand(
+        "insertText",
+        false,
         message
       );
 
-      return res.json({
-        ok: true,
-
-        queued: true,
-        duplicate: false,
-
-        item: {
-          id:
-            outreachId,
-
-          sessionId,
-          listingId,
-          listingUrl,
-          message,
-          recommendation,
-
-          status:
-            "pending",
-
-          createdAt
-        }
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH QUEUE] Queue failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Could not queue Marketplace outreach."
-        });
+    if (!inserted) {
+      input.textContent = message;
     }
   }
-);
 
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — FINALIZE SCANNER SESSION
-  ============================================================
-*/
-
-app.post(
-  "/marketplace-outreach/session/finalize",
-  (req, res) => {
-    try {
-      const sessionId =
-        String(
-          req.body?.sessionId || ""
-        ).trim();
-
-      if (!sessionId) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing sessionId."
-          });
-      }
-
-      const endedAt =
-        Number(
-          req.body?.endedAt ||
-          Date.now()
-        );
-
-      const stopReason =
-        String(
-          req.body?.stopReason || ""
-        ).trim();
-
-      const clickedListings =
-        Number(
-          req.body?.clickedListings ||
-          0
-        );
-
-      const hitsFound =
-        Number(
-          req.body?.hitsFound ||
-          0
-        );
-
-      /*
-        Do not blindly trust the extension's queue
-        count. Read the authoritative value from DB.
-      */
-      const queuedCountRow =
-        outreachDb
-          .prepare(`
-            SELECT COUNT(*) AS count
-            FROM marketplace_outreach_items
-            WHERE session_id = ?
-          `)
-          .get(
-            sessionId
-          );
-
-      const outreachQueued =
-        Number(
-          queuedCountRow?.count ||
-          0
-        );
-
-      const updateResult =
-        outreachDb
-          .prepare(`
-            UPDATE marketplace_outreach_sessions
-
-            SET
-              ended_at = ?,
-              stop_reason = ?,
-              clicked_listings = ?,
-              hits_found = ?,
-              outreach_queued = ?,
-              status = 'finalized'
-
-            WHERE session_id = ?
-          `)
-          .run(
-            endedAt,
-            stopReason,
-            clickedListings,
-            hitsFound,
-            outreachQueued,
-            sessionId
-          );
-
-      if (
-        updateResult.changes === 0
-      ) {
-        return res
-          .status(404)
-          .json({
-            ok: false,
-            error:
-              "Outreach session was not found."
-          });
-      }
-
-      const pendingRows =
-        outreachDb
-          .prepare(`
-            SELECT *
-            FROM marketplace_outreach_items
-
-            WHERE
-              session_id = ?
-              AND status = 'pending'
-
-            ORDER BY
-              created_at ASC
-          `)
-          .all(
-            sessionId
-          );
-
-      const pending =
-        pendingRows.map(
-          normalizeMarketplaceOutreachItem
-        );
-
-      /*
-        Print exactly the queue you were describing
-        into the Node terminal.
-      */
-      console.log(
-        "\n========================================"
-      );
-
-      console.log(
-        "[OUTREACH SESSION FINALIZED]"
-      );
-
-      console.log(
-        "Session:",
-        sessionId
-      );
-
-      console.log(
-        "Listings scanned:",
-        clickedListings
-      );
-
-      console.log(
-        "Hits found:",
-        hitsFound
-      );
-
-      console.log(
-        "Outreach queued:",
-        outreachQueued
-      );
-
-      console.log(
-        "Pending:",
-        pending.length
-      );
-
-      console.log(
-        "========================================"
-      );
-
-      if (!pending.length) {
-        console.log(
-          "No pending outreach listings."
-        );
-      } else {
-        console.log(
-          "\nPENDING OUTREACH:"
-        );
-
-        pending.forEach(
-          (
-            item,
-            index
-          ) => {
-            console.log(
-              `${index + 1}. ${item.listingUrl}`
-            );
-
-            console.log(
-              `   Listing ID: ${item.listingId}`
-            );
-
-            console.log(
-              `   Message: ${item.message}`
-            );
-          }
-        );
-      }
-
-      console.log(
-        "========================================\n"
-      );
-
-      return res.json({
-        ok: true,
-
-        sessionId,
-
-        status:
-          "finalized",
-
-        clickedListings,
-        hitsFound,
-        outreachQueued,
-
-        pendingCount:
-          pending.length,
-
-        pending
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH SESSION] Finalize failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Could not finalize outreach session."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — LATEST READY SESSION
-  ============================================================
-*/
-
-app.get(
-  "/marketplace-outreach/session/latest",
-  (req, res) => {
-    try {
-      const session =
-        outreachDb
-          .prepare(`
-            SELECT
-              s.*,
-
-              (
-                SELECT COUNT(*)
-                FROM marketplace_outreach_items i
-                WHERE
-                  i.session_id =
-                    s.session_id
-                  AND i.status =
-                    'pending'
-              ) AS pending_count
-
-            FROM marketplace_outreach_sessions s
-
-            WHERE
-              s.status =
-                'finalized'
-
-            ORDER BY
-              s.ended_at DESC
-
-            LIMIT 1
-          `)
-          .get();
-
-      if (!session) {
-        return res.json({
-          ok: true,
-          session: null
-        });
-      }
-
-      return res.json({
-        ok: true,
-
-        session: {
-          sessionId:
-            session.session_id,
-
-          startedAt:
-            session.started_at,
-
-          endedAt:
-            session.ended_at,
-
-          stopReason:
-            session.stop_reason || "",
-
-          clickedListings:
-            Number(
-              session.clicked_listings ||
-              0
-            ),
-
-          hitsFound:
-            Number(
-              session.hits_found ||
-              0
-            ),
-
-          outreachQueued:
-            Number(
-              session.outreach_queued ||
-              0
-            ),
-
-          pendingCount:
-            Number(
-              session.pending_count ||
-              0
-            )
-        }
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH SESSION] Latest lookup failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not load latest outreach session."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — CLAIM NEXT PENDING HIT
-  ============================================================
-*/
-
-const claimNextMarketplaceOutreach =
-  outreachDb.transaction(
-    sessionId => {
-      /*
-        Recover jobs abandoned for over 30 minutes.
-
-        Example:
-        Chrome crashes after obtaining a job but before
-        actually sending the message.
-      */
-      const staleBefore =
-        Date.now() -
-        30 * 60 * 1000;
-
-      outreachDb
-        .prepare(`
-          UPDATE marketplace_outreach_items
-
-          SET
-            status = 'pending',
-            claimed_at = NULL
-
-          WHERE
-            status = 'claimed'
-            AND claimed_at IS NOT NULL
-            AND claimed_at < ?
-        `)
-        .run(
-          staleBefore
-        );
-
-      let item;
-
-      if (sessionId) {
-        item =
-          outreachDb
-            .prepare(`
-              SELECT *
-              FROM marketplace_outreach_items
-
-              WHERE
-                status = 'pending'
-                AND session_id = ?
-
-              ORDER BY
-                created_at ASC
-
-              LIMIT 1
-            `)
-            .get(
-              sessionId
-            );
-      } else {
-        item =
-          outreachDb
-            .prepare(`
-              SELECT *
-              FROM marketplace_outreach_items
-
-              WHERE
-                status = 'pending'
-
-              ORDER BY
-                created_at ASC
-
-              LIMIT 1
-            `)
-            .get();
-      }
-
-      if (!item) {
-        return null;
-      }
-
-      const claimedAt =
-        Date.now();
-
-      const result =
-        outreachDb
-          .prepare(`
-            UPDATE marketplace_outreach_items
-
-            SET
-              status = 'claimed',
-              claimed_at = ?,
-              attempts =
-                attempts + 1
-
-            WHERE
-              id = ?
-              AND status = 'pending'
-          `)
-          .run(
-            claimedAt,
-            item.id
-          );
-
-      /*
-        Defensive concurrency check.
-      */
-      if (
-        result.changes !== 1
-      ) {
-        return null;
-      }
-
-      return outreachDb
-        .prepare(`
-          SELECT *
-          FROM marketplace_outreach_items
-          WHERE id = ?
-        `)
-        .get(
-          item.id
-        );
-    }
-  );
-
-  app.get(
-  "/marketplace-outreach/next",
-  (req, res) => {
-    try {
-      const sessionId =
-        String(
-          req.query?.sessionId ||
-          ""
-        ).trim();
-
-      const row =
-        claimNextMarketplaceOutreach(
-          sessionId || null
-        );
-
-      if (!row) {
-        return res.json({
-          ok: true,
-          item: null
-        });
-      }
-
-      const item =
-        normalizeMarketplaceOutreachItem(
-          row
-        );
-
-      console.log(
-        "[OUTREACH CLAIM] Next listing:",
-        {
-          listingId:
-            item.listingId,
-
-          sessionId:
-            item.sessionId,
-
-          attempts:
-            item.attempts
-        }
-      );
-
-      return res.json({
-        ok: true,
-        item
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH CLAIM] Failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Could not claim next outreach listing."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — MARK SENT
-  ============================================================
-*/
-
-app.post(
-  "/marketplace-outreach/:id/sent",
-  (req, res) => {
-    try {
-      const id =
-        String(
-          req.params?.id || ""
-        ).trim();
-
-      if (!id) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing outreach item ID."
-          });
-      }
-
-      const sentAt =
-        Number(
-          req.body?.sentAt ||
-          Date.now()
-        );
-
-      const result =
-        outreachDb
-          .prepare(`
-            UPDATE marketplace_outreach_items
-
-            SET
-              status = 'sent',
-              sent_at = ?,
-              failed_at = NULL,
-              last_error = NULL
-
-            WHERE
-              id = ?
-              AND status != 'sent'
-          `)
-          .run(
-            sentAt,
-            id
-          );
-
-      const item =
-        outreachDb
-          .prepare(`
-            SELECT *
-            FROM marketplace_outreach_items
-            WHERE id = ?
-          `)
-          .get(
-            id
-          );
-
-      if (!item) {
-        return res
-          .status(404)
-          .json({
-            ok: false,
-            error:
-              "Outreach item was not found."
-          });
-      }
-
-      console.log(
-        "[OUTREACH SENT]",
-        {
-          listingId:
-            item.listing_id,
-
-          itemId:
-            id,
-
-          updated:
-            result.changes === 1
-        }
-      );
-
-      return res.json({
-        ok: true,
-
-        item:
-          normalizeMarketplaceOutreachItem(
-            item
-          )
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH SENT] Failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not mark outreach item sent."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — SEND FAILURE
-  ============================================================
-*/
-
-app.post(
-  "/marketplace-outreach/:id/failed",
-  (req, res) => {
-    try {
-      const id =
-        String(
-          req.params?.id || ""
-        ).trim();
-
-      const errorMessage =
-        String(
-          req.body?.error || ""
-        ).trim();
-
-      /*
-        retryable = true:
-            put it back into pending queue.
-
-        retryable = false:
-            permanently mark failed.
-      */
-      const retryable =
-        req.body?.retryable !==
-        false;
-
-      if (!id) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing outreach item ID."
-          });
-      }
-
-      const failedAt =
-        Date.now();
-
-      const status =
-        retryable
-          ? "pending"
-          : "failed";
-
-      outreachDb
-        .prepare(`
-          UPDATE marketplace_outreach_items
-
-          SET
-            status = ?,
-            failed_at = ?,
-            claimed_at = NULL,
-            last_error = ?
-
-          WHERE id = ?
-        `)
-        .run(
-          status,
-          failedAt,
-          errorMessage,
-          id
-        );
-
-      const item =
-        outreachDb
-          .prepare(`
-            SELECT *
-            FROM marketplace_outreach_items
-            WHERE id = ?
-          `)
-          .get(
-            id
-          );
-
-      if (!item) {
-        return res
-          .status(404)
-          .json({
-            ok: false,
-            error:
-              "Outreach item was not found."
-          });
-      }
-
-      console.warn(
-        "[OUTREACH FAILED]",
-        {
-          listingId:
-            item.listing_id,
-
-          retryable,
-
-          attempts:
-            item.attempts,
-
-          error:
-            errorMessage
-        }
-      );
-
-      return res.json({
-        ok: true,
-
-        retryable,
-
-        item:
-          normalizeMarketplaceOutreachItem(
-            item
-          )
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH FAILED] Update failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Could not update failed outreach."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE OUTREACH — STATUS
-  ============================================================
-*/
-
-app.get(
-  "/marketplace-outreach/status",
-  (req, res) => {
-    try {
-      const counts =
-        outreachDb
-          .prepare(`
-            SELECT
-              status,
-              COUNT(*) AS count
-
-            FROM marketplace_outreach_items
-
-            GROUP BY status
-          `)
-          .all();
-
-      const statusCounts = {
-        pending: 0,
-        claimed: 0,
-        sent: 0,
-        failed: 0
-      };
-
-      for (
-        const row of counts
-      ) {
-        statusCounts[
-          row.status
-        ] =
-          Number(
-            row.count || 0
-          );
-      }
-
-      const recent =
-        outreachDb
-          .prepare(`
-            SELECT *
-            FROM marketplace_outreach_items
-
-            ORDER BY
-              created_at DESC
-
-            LIMIT 25
-          `)
-          .all()
-          .map(
-            normalizeMarketplaceOutreachItem
-          );
-
-      return res.json({
-        ok: true,
-
-        counts:
-          statusCounts,
-
-        recent
-      });
-
-    } catch (error) {
-      console.error(
-        "[OUTREACH STATUS] Failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            "Could not read outreach status."
-        });
-    }
-  }
-);
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-const OPENAI_LOG_DIRECTORY = path.resolve(
-  process.env.OPENAI_LOG_DIRECTORY || "openai-api-logs"
-);
-
-/*
-  Prices are in USD per 1 million tokens.
-
-  Update this table if you change models or OpenAI changes pricing.
-*/
-const OPENAI_MODEL_PRICING_USD_PER_MILLION = {
-  "gpt-4.1-mini": {
-    input: 0.40,
-    cachedInput: 0.10,
-    output: 1.60
-  },
-
-  "gpt-4o-mini": {
-    input: 0.15,
-    cachedInput: 0.075,
-    output: 0.60
-  },
-
-  "gpt-5-mini": {
-    input: 0.25,
-    cachedInput: 0.025,
-    output: 2.00
-  },
-
-  "gpt-5.6-luna": {
-    input: 0.20,
-    cachedInput: 0.02,
-    output: 1.20
-  }
-};
-
-
-app.post(
-  "/lookup-product-values",
-  async (req, res) => {
-    try {
-      const items =
-        Array.isArray(
-          req.body?.items
-        )
-          ? req.body.items
-          : [];
-
-      const results =
-        await Promise.all(
-          items.map(
-            async (
-              item,
-              index
-            ) => {
-
-              /*
-  Do not value unresolved physical products
-  using a generic database identity.
-*/
-if (
-  item?.exactIdentityResolved ===
-  false
-) {
-  return {
-    index,
-
-    found:
-      false,
-
-    skipped:
-      true,
-
-    reason:
-      "unresolved_exact_identity",
-
-    canonicalName:
-      ""
-  };
-}
-              const databaseProduct =
-                await findProductInDatabase(
-                  item
-                );
-
-              if (!databaseProduct) {
-                return {
-                  index,
-
-                  found:
-                    false,
-
-                  canonicalName:
-                    getCanonicalNameForItem(
-                      item
-                    )
-                };
-              }
-
-              return {
-                index,
-
-                found:
-                  true,
-
-                canonicalName:
-                  databaseProduct
-                    .canonical_name,
-
-                estimatedResalePrice:
-                  Number(
-                    databaseProduct
-                      .estimated_resale_price
-                  ),
-
-                priceStandardDeviation:
-                  databaseProduct
-                    .price_standard_deviation ==
-                  null
-                    ? null
-                    : Number(
-                        databaseProduct
-                          .price_standard_deviation
-                      )
-              };
-            }
-          )
-        );
-
-      console.log(
-        "[PRODUCT DATABASE] Supabase lookup results:",
-        results
-      );
-
-      res.json({
-        results
-      });
-
-    } catch (error) {
-      console.error(
-        "Global product database lookup failed:",
-        error
-      );
-
-      res
-        .status(500)
-        .json({
-          error:
-            "Global product database lookup failed."
-        });
-    }
-  }
-);
-
-/*
-  Removes large base64 image contents from the saved log.
-
-  The actual image is still sent to OpenAI. It is only omitted from
-  the local log file so the log does not become extremely large.
-*/
-function sanitizeOpenAiLogValue(value) {
-  if (typeof value === "string") {
-    if (value.startsWith("data:image/")) {
-      const commaIndex = value.indexOf(",");
-
-      const metadata =
-        commaIndex >= 0
-          ? value.slice(0, commaIndex)
-          : "data:image";
-
-      const encodedLength =
-        commaIndex >= 0
-          ? value.length - commaIndex - 1
-          : value.length;
-
-      return (
-        `[${metadata}; base64 omitted; ` +
-        `${encodedLength} encoded characters]`
-      );
-    }
-
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(sanitizeOpenAiLogValue);
-  }
-
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, child]) => [
-        key,
-        sanitizeOpenAiLogValue(child)
-      ])
-    );
-  }
-
-  return value;
-}
-
-function calculateOpenAiEstimatedCostUsd(
-  model,
-  usage = {}
-) {
-  const pricing =
-    OPENAI_MODEL_PRICING_USD_PER_MILLION[model];
-
-  if (!pricing) {
-    return null;
-  }
-
-  const inputTokens =
-    Number(usage.input_tokens || 0);
-
-  const outputTokens =
-    Number(usage.output_tokens || 0);
-
-  const cachedInputTokens =
-    Number(
-      usage.input_tokens_details?.cached_tokens || 0
-    );
-
-  const uncachedInputTokens =
-    Math.max(
-      0,
-      inputTokens - cachedInputTokens
-    );
-
-  return (
-    (uncachedInputTokens * pricing.input) /
-      1_000_000 +
-
-    (cachedInputTokens * pricing.cachedInput) /
-      1_000_000 +
-
-    (outputTokens * pricing.output) /
-      1_000_000
-  );
-}
-
-async function downloadImageBuffer(
-  url
-) {
-  const response =
-    await fetch(
-      url
-    );
-
-  if (!response.ok) {
-    throw new Error(
-      `Could not download listing image: ${response.status}`
-    );
-  }
-
-  const contentType =
-    String(
-      response.headers
-        .get(
-          "content-type"
-        ) ||
-      ""
-    )
-      .toLowerCase();
-
-
-  /*
-    Sometimes an expired CDN URL returns
-    HTML/JSON with HTTP 200 instead of
-    an actual image.
-  */
-  if (
-    contentType.includes(
-      "text/html"
-    ) ||
-    contentType.includes(
-      "application/json"
-    ) ||
-    contentType.includes(
-      "text/plain"
-    )
-  ) {
-    throw new Error(
-      `Listing image URL returned non-image content: ${
-        contentType ||
-        "unknown"
-      }`
-    );
-  }
-
-
-  const arrayBuffer =
-    await response
-      .arrayBuffer();
-
-  const buffer =
-    Buffer.from(
-      arrayBuffer
-    );
-
-
-  if (!buffer.length) {
-    throw new Error(
-      "Listing image download returned an empty buffer."
-    );
-  }
-
-
-  return buffer;
-}
-
-function dataUrlToBuffer(dataUrl) {
-  const value =
-    String(dataUrl || "").trim();
-
-  const match =
-    value.match(
-      /^data:image\/[^;]+;base64,(.+)$/i
-    );
-
-  if (!match) {
-    throw new Error(
-      "Invalid image data URL."
-    );
-  }
-
-  return Buffer.from(
-    match[1],
-    "base64"
-  );
-}
-
-
-async function getImageBufferForVision(
-  imageSource
-) {
-  const source =
-    String(imageSource || "").trim();
-
-  if (!source) {
-    throw new Error(
-      "Missing image source for Vision OCR."
-    );
-  }
-
-  if (
-    source.startsWith(
-      "data:image/"
-    )
-  ) {
-    return dataUrlToBuffer(
-      source
-    );
-  }
-
-  return downloadImageBuffer(
-    source
-  );
-}
-
-
-async function readImageTextWithGoogleVision(
-  imageSource
-) {
-  const imageBuffer =
-    await getImageBufferForVision(
-      imageSource
-    );
-
-  const [result] =
-    await visionClient.textDetection({
-      image: {
-        content:
-          imageBuffer
-      }
-    });
-
-  const fullText =
-    String(
-      result
-        ?.fullTextAnnotation
-        ?.text ||
-      result
-        ?.textAnnotations
-        ?.[0]
-        ?.description ||
-      ""
-    ).trim();
-
-  return fullText;
-}
-
-async function createCollageTile(
-  originalBuffer,
-  tileWidth,
-  tileHeight
-) {
-  return sharp(originalBuffer)
-    .rotate()
-    .resize(
-      tileWidth,
-      tileHeight,
-      {
-        fit: "contain",
-        background: {
-          r: 255,
-          g: 255,
-          b: 255,
-          alpha: 1
-        }
-      }
-    )
-    .jpeg({
-      quality: 92
+  input.dispatchEvent(
+    new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      inputType: "insertText",
+      data: message
     })
-    .toBuffer();
-}
+  );
 
-async function createUnavailableCollageTile(
-  tileWidth,
-  tileHeight,
-  imageNumber
-) {
-  const svg =
-    Buffer.from(`
-      <svg
-        width="${tileWidth}"
-        height="${tileHeight}"
-        xmlns="http://www.w3.org/2000/svg"
-      >
-        <rect
-          width="100%"
-          height="100%"
-          fill="#f4f4f4"
-        />
-
-        <text
-          x="50%"
-          y="50%"
-          dominant-baseline="middle"
-          text-anchor="middle"
-          font-family="Arial, sans-serif"
-          font-size="38"
-          fill="#333333"
-        >
-          Image ${imageNumber} unavailable
-        </text>
-      </svg>
-    `);
-
-
-  return sharp(
-    svg
-  )
-    .jpeg({
-      quality: 90
+  input.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      composed: true,
+      inputType: "insertText",
+      data: message
     })
-    .toBuffer();
-}
-
-async function buildMarketplaceCollage(
-  imageUrls,
-  startingImageIndex = 1
-) {
-  const urls =
-    imageUrls;
-
-  if (!urls.length) {
-    throw new Error(
-      "No image URLs supplied for collage."
-    );
-  }
-
-
-  /*
-    Three columns works well for most Marketplace
-    listings without making every tile excessively tiny.
-
-    1 image  -> 1 column
-    2 images -> 2 columns
-    3+       -> 3 columns
-  */
-  const columns =
-    Math.min(
-      3,
-      urls.length
-    );
-
-  const rows =
-    Math.ceil(
-      urls.length /
-      columns
-    );
-
-
-  /*
-    Each original image is fit inside one 900 x 700 tile.
-
-    Increase these later if model text is too small.
-  */
-  const tileWidth =
-    900;
-
-  const tileHeight =
-    700;
-
-
-  /*
-    Red border separating every image.
-  */
-  const border =
-    14;
-
-
-  const collageWidth =
-    columns *
-      tileWidth +
-    (columns + 1) *
-      border;
-
-
-  const collageHeight =
-    rows *
-      tileHeight +
-    (rows + 1) *
-      border;
-
-
-  console.log(
-    "[STEP 2] Building collage:",
-    {
-      imageCount:
-        urls.length,
-
-      columns,
-      rows,
-
-      collageWidth,
-      collageHeight
-    }
   );
 
-
-  /*
-    Download all Marketplace images IN ORDER.
-  */
-  const downloaded =
-  [];
-
-let validImageCount =
-  0;
-
-
-for (
-  let index = 0;
-  index < urls.length;
-  index++
-) {
-  const actualImageNumber =
-    startingImageIndex +
-    index;
-
-  console.log(
-    `[STEP 2] Downloading image ${index + 1}/${urls.length}`
-  );
-
-
-  let tile;
-
-
-  try {
-    const buffer =
-      await downloadImageBuffer(
-        urls[index]
-      );
-
-
-    tile =
-      await createCollageTile(
-        buffer,
-        tileWidth,
-        tileHeight
-      );
-
-
-    validImageCount +=
-      1;
-
-  } catch (error) {
-    console.warn(
-      `[STEP 2] Image ${actualImageNumber} could not be decoded. ` +
-      `Using a placeholder instead.`,
-      {
-        url:
-          urls[index],
-
-        error:
-          error?.message ||
-          String(error)
-      }
-    );
-
-
-    /*
-      Keep a placeholder in the SAME SLOT.
-
-      This is important because the gallery's
-      image numbering must continue matching
-      the Marketplace image indexes.
-    */
-    tile =
-      await createUnavailableCollageTile(
-        tileWidth,
-        tileHeight,
-        actualImageNumber
-      );
-  }
-
-
-  downloaded.push(
-    tile
-  );
-}
-
-
-if (
-  validImageCount ===
-  0
-) {
-  throw new Error(
-    "All Marketplace listing images were unreadable."
-  );
-}
-
-
-  /*
-    Red canvas.
-
-    Because the tiles don't touch one another,
-    the exposed red canvas creates borders between them.
-  */
-  const composites =
-    downloaded.map(
-      (
-        buffer,
-        index
-      ) => {
-        const row =
-          Math.floor(
-            index /
-            columns
-          );
-
-        const column =
-          index %
-          columns;
-
-
-        const left =
-          border +
-          column *
-            (
-              tileWidth +
-              border
-            );
-
-
-        const top =
-          border +
-          row *
-            (
-              tileHeight +
-              border
-            );
-
-
-        return {
-          input:
-            buffer,
-
-          left,
-          top
-        };
-      }
-    );
-
-
-  const collageBuffer =
-    await sharp({
-      create: {
-        width:
-          collageWidth,
-
-        height:
-          collageHeight,
-
-        channels:
-          3,
-
-        background: {
-          r: 255,
-          g: 0,
-          b: 0
-        }
-      }
+  input.dispatchEvent(
+    new Event("change", {
+      bubbles: true
     })
+  );
 
-      .composite(
-        composites
-      )
+  input.dispatchEvent(
+    new KeyboardEvent("keyup", {
+      key: "Unidentified",
+      bubbles: true
+    })
+  );
 
-      .jpeg({
-        quality: 94
-      })
-
-      .toBuffer();
-
-
-return {
-  collageBuffer,
-
-  imageCount:
-    urls.length,
-
-  columns,
-  rows,
-
-  startingImageIndex,
-
-  endingImageIndex:
-    startingImageIndex +
-    urls.length -
-    1
-};
+  input.blur();
+  input.focus();
 }
 
-const MAX_IMAGES_PER_COLLAGE = 6;
+function findMarketplaceSellerSendButton(input) {
+  let container = input;
 
-function chunkArray(
-  array,
-  size
-) {
-  const chunks = [];
-
+  /*
+    Search around the message box first so another
+    Facebook "Send" button is not accidentally clicked.
+  */
   for (
-    let index = 0;
-    index < array.length;
-    index += size
+    let level = 0;
+    level < 7 && container;
+    level += 1
   ) {
-    chunks.push(
-      array.slice(
-        index,
-        index + size
-      )
-    );
-  }
-
-  return chunks;
-}
-
-function normalizeListingFactValue(
-  value
-) {
-  if (
-    value == null
-  ) {
-    return "";
-  }
-
-
-  if (
-    typeof value ===
-      "string" ||
-    typeof value ===
-      "number" ||
-    typeof value ===
-      "boolean"
-  ) {
-    return String(
-      value
-    )
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim();
-  }
-
-
-  if (
-    Array.isArray(
-      value
-    )
-  ) {
-    return value
-      .map(
-        child =>
-          normalizeListingFactValue(
-            child
-          )
-      )
-      .filter(Boolean)
-      .join(", ");
-  }
-
-
-  if (
-    typeof value ===
-      "object"
-  ) {
-    const productValue =
-      value.product ??
-      value.item ??
-      value.name ??
-      value.model ??
-      value.text ??
-      value.description ??
-      null;
-
-
-    if (
-      productValue != null
-    ) {
-      const productText =
-        normalizeListingFactValue(
-          productValue
-        );
-
-
-      const quantity =
-        Number(
-          value.quantity ??
-          value.qty ??
-          value.count
-        );
-
-
-      if (
-        productText &&
-        Number.isFinite(
-          quantity
-        ) &&
-        quantity >
-          0
-      ) {
-        return (
-          `${quantity}x ` +
-          productText
-        );
-      }
-
-
-      return productText;
-    }
-
-
-    /*
-      Unknown object format:
-      preserve useful values instead of
-      turning the object into "[object Object]".
-    */
-    return Object
-      .entries(
-        value
-      )
-      .map(
-        (
-          [
-            key,
-            child
-          ]
-        ) => {
-          const normalized =
-            normalizeListingFactValue(
-              child
-            );
-
-          return normalized
-            ? `${key}: ${normalized}`
-            : "";
-        }
-      )
-      .filter(Boolean)
-      .join(", ");
-  }
-
-
-  return "";
-}
-
-app.post(
-  "/vision-ocr",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const items =
-        Array.isArray(
-          req.body?.items
-        )
-          ? req.body.items
-          : [];
-
-      if (!items.length) {
-        return res
-          .status(400)
-          .json({
-            error:
-              "No OCR items were supplied."
-          });
-      }
-
-      const results = [];
-
-      for (
-        let index = 0;
-        index < items.length;
-        index++
-      ) {
-        const item =
-          items[index] || {};
-
-        const key =
-          String(
-            item.key ||
-            `image_${index + 1}`
-          ).trim();
-
-        const imageSource =
-          String(
-            item.imageSource ||
-            ""
-          ).trim();
-
-        if (!imageSource) {
-          results.push({
-            key,
-            ok: false,
-            text: "",
-            error:
-              "Missing imageSource."
-          });
-
-          continue;
-        }
-
-        try {
-          console.log(
-            `[VISION OCR] Reading ${key}`
-          );
-
-          const text =
-            await readImageTextWithGoogleVision(
-              imageSource
-            );
-
-          console.log(
-            `[VISION OCR] ${key}:`
-          );
-
-          console.log(
-            text ||
-            "(no text detected)"
-          );
-
-          results.push({
-            key,
-            ok: true,
-            text
-          });
-
-        } catch (error) {
-          console.warn(
-            `[VISION OCR] Failed ${key}:`,
-            error
-          );
-
-          results.push({
-            key,
-            ok: false,
-            text: "",
-            error:
-              error?.message ||
-              String(error)
-          });
-        }
-      }
-
-      res.json({
-        ok: true,
-        results
-      });
-
-    } catch (error) {
-      console.error(
-        "[VISION OCR] Endpoint failed:",
-        error
-      );
-
-      res
-        .status(500)
-        .json({
-          error:
-            error?.message ||
-            "Vision OCR failed."
-        });
-    }
-  }
-);
-
-app.post(
-  "/analyze-listing-facts",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const listingText =
-  String(
-    req.body?.listingText ||
-    ""
-  ).trim();
-
-
-if (!listingText) {
-  return res
-    .status(400)
-    .json({
-      error:
-        "Missing listingText."
-    });
-}
-
-
-console.log(
-  "[STEP 1] Google-extracted listing text received:",
-  listingText.length,
-  "characters"
-);
-
-
-
-const prompt = `
-You are analyzing seller-written text extracted from a Facebook Marketplace listing.
-
-The text below came from Google's analysis of a screenshot of the listing.
-
-Your ONLY job is to extract explicit textual facts from the listing title and seller-written description.
-
-CRITICAL — IGNORE TEXT INSIDE SELLER-UPLOADED SCREENSHOTS:
-
-The Marketplace seller may upload screenshots as listing photos.
-
-Those screenshots may show:
-- another website's product listing;
-- Amazon, eBay, Google, Canon, Nikon, or another store page;
-- a product advertisement;
-- a search result;
-- a product specification/reference page;
-- another camera or lens model;
-- prices, ratings, reviews, or product names from another website.
-
-Do NOT treat information appearing inside one of those screenshots as
-seller-written evidence about what is actually included in the Marketplace listing.
-
-For example, if the OCR contains:
-
-"Visit the Canon Store"
-"Sponsored"
-"Canon EOS Rebel T6 DSLR Camera"
-"$749.95"
-"Price history"
-
-but the actual Marketplace listing is for a Canon EOS Rebel T6i,
-IGNORE the T6 information.
-
-Only use information that belongs to the actual Facebook Marketplace:
-- listing title;
-- seller-written description;
-- Details section;
-- explicit included/excluded item statements.
-
-A screenshot uploaded by the seller is reference material, not seller-written listing evidence.
-
-GOOGLE-EXTRACTED LISTING TEXT:
-
-${listingText}
-
-Return exactly one JSON object in this format:
-
-{
-  "explicitlyIncluded": [],
-  "explicitlyExcluded": [],
-  "listingNotes": [],
-  "skipDueToDamage": false,
-  "damageReason": ""
-}
-
-explicitlyIncluded:
-- Products or meaningful items that the seller explicitly states are included, come with the listing, or are being sold as part of it.
-- Include quantities when explicitly stated.
-
-explicitlyExcluded:
-- Products or meaningful items that the seller explicitly states are NOT included.
-
-CRITICAL RULE:
-An item being absent from the title or description DOES NOT mean that it is excluded.
-
-Only add something to explicitlyExcluded when the seller explicitly says it is not included.
-
-listingNotes:
-- Other explicit seller-written facts that may later help determine listing contents.
-- Keep these concise.
-
-skipDueToDamage / damageReason:
-- skipDueToDamage is a boolean. Set it to true ONLY when the seller-written text states SIGNIFICANT damage or a functional fault on the main camera body or on a lens/optic that is being sold. Otherwise false.
-- damageReason: when skipDueToDamage is true, a short quote or paraphrase of the damage the seller stated (max 15 words). Otherwise an empty string.
-- Base this ONLY on what the seller wrote. Never infer damage from silence, from the price, or from the product type.
-
-SIGNIFICANT damage / faults (set skipDueToDamage to true):
-- broken, cracked, shattered, snapped, or bent parts (body, screen, lens glass, mount);
-- will not turn on / does not power on / dead / no power;
-- an error message, or an error code the camera shows;
-- autofocus not working / AF motor failure / focus problems;
-- aperture stuck, sticky, or not working;
-- shutter problems (stuck, will not fire, wrong speeds, sticking, noise/failing);
-- buttons, dials, or the screen/viewfinder not working;
-- water damage, liquid damage, or fell in water;
-- lens fungus/mold, separated elements, or heavy haze;
-- sold explicitly "for parts", "for repair", or "not working".
-
-MINOR / cosmetic wear (these do NOT count; keep skipDueToDamage false):
-- small scratches, scuffs, or scrapes;
-- paint or brassing wear;
-- minor dust (including dust inside a lens that does not affect photos);
-- worn or peeling rubber/grip/eyecup;
-- tiny cosmetic marks, dings, or normal signs of use;
-- damage to a minor accessory only (a scuffed strap, a cracked lens cap, a worn bag).
-
-Important judgment rules:
-- Negated or reassuring statements are NOT damage: "no damage", "not broken", "no cracks", "works perfectly", "fully functional", "no issues".
-- "Untested" or "not sure if it works" alone is NOT significant damage. Only flag it if the seller also states a specific fault.
-- If the seller says a significant fault was FIXED or does not affect use (e.g. "lens cap gets sticky but does not affect use"), treat it as minor.
-- If a mention is ambiguous, or you cannot tell whether it is significant, return false.
-- Also mention any damage or fault (significant or minor) concisely in listingNotes.
-
-Additional rules:
-- Every element in explicitlyIncluded, explicitlyExcluded, and listingNotes MUST be a plain JSON string.
-- Never return objects inside these arrays. If a quantity is known, include it in the string, for example: "2x Canon batteries".
-- Use ONLY the supplied listing text.
-- Do not invent facts.
-- Do not make assumptions.
-- Do not infer products from visual appearance.
-- If there is no explicit evidence for a field, return an empty array.
-- Return valid JSON only.
-- Do not use Markdown.
-- Do not use code fences.
-`.trim();
-
-
-
-      /*
-        OpenAI Responses API supports
-        image inputs using a data URL.
-
-        Screenshot + instructions are
-        submitted in the same request.
-      */
-
-    const response =
-  await createLoggedOpenAiResponse({
-    step:
-      "Step 1 listing fact extraction",
-
-    request: {
-      model:
-        "gpt-4o-mini",
-
-      input: [
-        {
-          role:
-            "user",
-
-          content: [
-            {
-              type:
-                "input_text",
-
-              text:
-                prompt
-            }
-          ]
-        }
-      ]
-    }
-  });
-
-
-
-      const rawText =
-        String(
-          response.output_text ||
-          ""
-        ).trim();
-
-
-      console.log(
-        "[STEP 1] Raw OpenAI response:"
-      );
-
-      console.log(
-        rawText
-      );
-
-
-
-      /*
-        --------------------------------
-        Parse strict JSON response
-        --------------------------------
-      */
-
-      let parsed;
-
-
-      try {
-        parsed =
-          JSON.parse(
-            rawText
-          );
-
-      } catch (error) {
-        console.error(
-          "[STEP 1] Invalid JSON:",
-          rawText
-        );
-
-
-        return res
-          .status(502)
-          .json({
-            error:
-              "OpenAI returned invalid JSON.",
-
-            rawText
-          });
-      }
-
-
-
-      /*
-        --------------------------------
-        Normalize the output
-
-        Even if the model returns something
-        slightly odd, the extension always
-        receives the same structure.
-        --------------------------------
-      */
-
-const result = {
-  explicitlyIncluded:
-    Array.isArray(
-      parsed
-        .explicitlyIncluded
-    )
-      ? parsed
-          .explicitlyIncluded
-          .map(
-            value =>
-              normalizeListingFactValue(
-                value
-              )
-          )
-          .filter(Boolean)
-      : [],
-
-
-  explicitlyExcluded:
-    Array.isArray(
-      parsed
-        .explicitlyExcluded
-    )
-      ? parsed
-          .explicitlyExcluded
-          .map(
-            value =>
-              normalizeListingFactValue(
-                value
-              )
-          )
-          .filter(Boolean)
-      : [],
-
-
-  listingNotes:
-    Array.isArray(
-      parsed
-        .listingNotes
-    )
-      ? parsed
-          .listingNotes
-          .map(
-            value =>
-              normalizeListingFactValue(
-                value
-              )
-          )
-          .filter(Boolean)
-      : [],
-
-
-  /*
-    Significant-damage flag decided by the model per the prompt
-    rules above. Only a real boolean true (or the string "true")
-    counts; anything else is treated as "do not skip".
-  */
-  skipDueToDamage:
-    parsed.skipDueToDamage === true ||
-    String(
-      parsed.skipDueToDamage
-    ).trim().toLowerCase() === "true",
-
-  damageReason:
-    String(
-      parsed.damageReason || ""
-    ).trim()
-};
-
-if (!result.skipDueToDamage) {
-  result.damageReason = "";
-}
-
-
-
-      console.log(
-        "[STEP 1] Parsed listing facts:"
-      );
-
-      console.log(
-        result
-      );
-
-
-      res.json(
-        result
-      );
-
-    } catch (error) {
-      console.error(
-        "[STEP 1] Listing fact extraction failed:",
-        error
-      );
-
-
-      res
-        .status(500)
-        .json({
-          error:
-            error?.message ||
-            "Listing fact extraction failed."
-        });
-    }
-  }
-);
-
-app.post(
-  "/analyze-listing-gallery",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const imageUrls =
-        Array.isArray(
-          req.body?.imageUrls
-        )
-          ? req.body.imageUrls
-              .map(
-                value =>
-                  String(
-                    value || ""
-                  ).trim()
-              )
-              .filter(Boolean)
-          : [];
-
-
-      if (!imageUrls.length) {
-        return res
-          .status(400)
-          .json({
-            error:
-              "No imageUrls were supplied."
-          });
-      }
-
-
-      console.log(
-        `[STEP 2] Received ${imageUrls.length} listing image(s).`
-      );
-
-
-      /*
-        Split into groups of at most 6.
-
-        Example:
-        9 images -> [1-6], [7-9]
-      */
-      const imageGroups =
-        chunkArray(
-          imageUrls,
-          MAX_IMAGES_PER_COLLAGE
-        );
-
-
-      const galleryResults =
-        [];
-
-
-      for (
-        let groupIndex = 0;
-        groupIndex < imageGroups.length;
-        groupIndex++
-      ) {
-        const groupImageUrls =
-          imageGroups[
-            groupIndex
-          ];
-
-
-        /*
-          Global Marketplace image number.
-
-          Group 1 starts at 1.
-          Group 2 starts at 7.
-          Group 3 starts at 13.
-        */
-        const startingImageIndex =
-          groupIndex *
-            MAX_IMAGES_PER_COLLAGE +
-          1;
-
-
-        console.log(
-          `[STEP 2] Processing gallery ${groupIndex + 1}/${imageGroups.length}, starting at Image ${startingImageIndex}`
-        );
-
-
-        const {
-          collageBuffer,
-          imageCount,
-          columns,
-          rows,
-          endingImageIndex
-        } =
-          await buildMarketplaceCollage(
-            groupImageUrls,
-            startingImageIndex
-          );
-
-
-        const collageDataUrl =
-          `data:image/jpeg;base64,${collageBuffer.toString(
-            "base64"
-          )}`;
-
-
-        console.log(
-          `[STEP 2] Gallery ${groupIndex + 1} created:`,
-          collageBuffer.length,
-          "bytes"
-        );
-const priorGallerySummary =
-  galleryResults.map(
-    gallery => ({
-      galleryIndex:
-        gallery.galleryIndex,
-
-      startingImageIndex:
-        gallery.startingImageIndex,
-
-      endingImageIndex:
-        gallery.endingImageIndex,
-
-      galleryAnalysis:
-        gallery.galleryAnalysis
-    })
-  );
-
-
-        const prompt = `
-You are analyzing ONE collage made from photographs from a single Facebook Marketplace listing.
-
-This collage contains original Marketplace Images ${startingImageIndex} through ${endingImageIndex}.
-
-There are ${imageCount} images in this collage.
-
-IMAGE ORDERING:
-
-Read the collage:
-- LEFT TO RIGHT across the first row.
-- Then continue LEFT TO RIGHT across the next row.
-- Continue row by row until the final image.
-
-There are ${columns} columns and ${rows} rows.
-
-The top-left tile is Image ${startingImageIndex}.
-
-The next tile is Image ${startingImageIndex + 1}.
-
-Continue sequentially until Image ${endingImageIndex}.
-
-The red borders separate the original listing images.
-
-YOUR JOB:
-
-YOUR JOB:
-
-Determine which PHYSICAL PRIMARY PRODUCTS appear in each image.
-
-PRODUCT IDS ARE GLOBAL ACROSS THE ENTIRE MARKETPLACE LISTING.
-
-You may be analyzing Gallery 2, Gallery 3, etc., but product numbering does NOT restart for each gallery.
-
-A product ID such as:
-
-camera_1
-camera_2
-lens_1
-lens_2
-
-refers to one specific physical object across ALL galleries in this listing.
-
-If a physical product in the CURRENT gallery is the same physical object previously assigned an ID in an earlier gallery, you MUST reuse that exact product ID.
-
-Example:
-
-Gallery 1:
-camera_1 appears in Images 1-6.
-
-Gallery 2:
-the same physical camera appears again in Image 7.
-
-Correct:
-Image 7 -> camera_1
-
-Incorrect:
-Image 7 -> a newly created camera_1 with separate meaning
-Image 7 -> camera_2
-
-camera_2 should ONLY be created when the current gallery contains a second physical camera that is visually distinct from the existing camera_1.
-
-Likewise:
-
-lens_1 always refers to the same physical lens across galleries.
-lens_2 means a different physical lens.
-
-Never restart product numbering when a new gallery begins.
-
-PREVIOUS GALLERY PRODUCT REGISTRY:
-
-${JSON.stringify(
-  priorGallerySummary,
-  null,
-  2
-)}
-
-The previous gallery registry represents product IDs that have already been assigned.
-
-Treat those IDs as persistent.
-
-When analyzing the current gallery:
-
-- Reuse an existing ID when the product is the same physical object.
-- Create a new ID only when there is sufficient visual evidence of a different physical object.
-- Never assign an existing product ID to a different physical object.
-- Never renumber an existing product.
-- Continue numbering from existing products.
-
-Example:
-
-If previous galleries already contain:
-
-camera_1
-lens_1
-lens_2
-
-and the current gallery contains:
-- the same camera
-- the same first lens
-- one completely different lens
-
-then use:
-
-camera_1
-lens_1
-lens_3
-
-Do NOT restart at lens_1.
-
-CRITICAL — PRODUCTS SHOWN INSIDE SCREENSHOTS ARE NOT PHYSICAL PRODUCTS:
-
-Some Marketplace gallery images may themselves be screenshots.
-
-For example, an uploaded image may show:
-- an Amazon product page;
-- an eBay listing;
-- another website's camera listing;
-- a Google search result;
-- an advertisement;
-- a manufacturer's product page;
-- a reference/specification page.
-
-A camera or lens shown INSIDE such a screenshot is NOT a physical
-Marketplace product.
-
-Do NOT create camera_*, lens_*, or any other productId for
-products that exist only as images inside screenshots, webpages,
-advertisements, packaging artwork, manuals, or reference material.
-
-Only create a productId when the Marketplace photograph directly shows
-the actual physical object being sold.
-
-Strong indications that the image is a screenshot/reference page include:
-- browser or website UI;
-- "Sponsored";
-- "Visit the ... Store";
-- star ratings or review counts;
-- "Price history";
-- web prices;
-- search bars;
-- Buy/Add to Cart controls;
-- product-page layouts.
-
-If an entire Marketplace image is just such a screenshot, return:
-
-"visibleProducts": []
-
-for that image.
-
-For this application, primary products include:
-- camera bodies
-- cameras
-- camera lenses
-
-Do not treat these as primary products:
-- batteries
-- chargers
-- straps
-- lens caps
-- filters
-- hoods
-- cases
-- bags
-- manuals
-- boxes
-- memory cards
-- cables
-- adapters
-- other small accessories
-
-IMPORTANT:
-
-This step is NOT for identifying the exact model.
-
-Do NOT attempt to identify the actual camera or lens model yet.
-
-Instead, create persistent physical-product identifiers such as:
-
-camera_1
-camera_2
-lens_1
-lens_2
-
-If the SAME physical camera appears in multiple images, use the same product ID in all of those images.
-
-Do NOT create a new product ID merely because the same product appears again from another angle.
-
-Likewise, if the same lens appears in multiple photographs, keep the same lens ID.
-
-Only create a new product ID when there is visually sufficient evidence that it is a DIFFERENT physical product.
-
-MODEL READABILITY SCORE:
-
-For every product visible in every image, assign modelReadabilityScore from 1 through 10.
-
-This score measures ONLY how useful that specific image is for determining the exact model from VISIBLE MODEL-IDENTIFYING TEXT OR MARKINGS on that physical product.
-
-CRITICAL DOWNSTREAM OCR RULE:
-
-The image receiving the highest modelReadabilityScore for a physical
-product will be sent to an OCR system.
-
-Therefore, when comparing images of the SAME physical product, strongly
-prefer the image where the product's identifying printed text is most
-likely to be successfully machine-read.
-
-Examples include:
-
-- exact camera model badges such as "60D", "D750", "α7 III"
-- lens family markings such as "EF", "EF-S", "RF", "AF-S", "FE"
-- focal length such as "18-55mm"
-- maximum aperture such as "1:1.8", "f/2.8", "1:3.5-5.6"
-- generation markers such as "II", "III", "G2"
-- feature/model codes such as "STM", "USM", "IS", "VR", "OSS"
-
-A sharp close-up containing readable printed model information should
-score substantially higher than a visually attractive product photo
-where those markings are hidden, tiny, blurred, or facing away.
-
-Do NOT score based on whether YOU can visually recognize the product
-from its shape. The purpose of this score is specifically to select
-the best image for downstream OCR.
-
-Examples of relevant visible markings:
-- camera model badges
-- printed model numbers
-- lens focal-length markings
-- aperture markings
-- lens model names
-- mount/model labels
-- product labels
-
-Scoring guidance:
-
-10:
-The exact model-identifying text is clearly visible and very easy to read.
-
-8-9:
-Most or all useful model-identifying markings are visible and readable with only minor difficulty.
-
-6-7:
-Some meaningful model-identifying text is visible, but it is incomplete, small, angled, or partially unclear.
-
-4-5:
-Only limited identifying text is readable, such as the brand, lens range, or partial model markings.
-
-2-3:
-Very little potentially useful model-identifying text can be read.
-
-1:
-No meaningful model-identifying text is readable on that product in that image.
-
-CRITICAL SCORING RULE:
-
-Score ONLY based on visible model-identifying text or markings.
-
-Do NOT give a higher score because you recognize the product's:
-- shape
-- body design
-- controls
-- color
-- grip
-- silhouette
-- lens geometry
-- general appearance
-
-PRODUCT MATCHING:
-
-You MAY use visual appearance, shape, scratches, accessories, orientation, distinctive physical features, and surrounding context to determine whether a product shown in multiple images is the SAME physical object.
-
-Return exactly one JSON object using this structure:
-
-{
-  "products": [
-    {
-      "productId": "camera_1",
-      "productType": "camera body",
-      "visibleInImages": [1, 2]
-    }
-  ],
-  "images": [
-    {
-      "imageIndex": 1,
-      "visibleProducts": [
-        {
-          "productId": "camera_1",
-          "productType": "camera body",
-          "modelReadabilityScore": 8
-        }
-      ]
-    }
-  ]
-}
-
-Rules:
-
-- Every product ID appearing in images must also appear once in products.
-- visibleInImages must contain every image where that product appears.
-- Use the GLOBAL image numbers described above.
-- Do NOT reset image numbering back to 1 for later collages.
-- Product IDs are GLOBAL across the entire listing.
-- Product numbering must NEVER restart for a later gallery.
-- The same physical product must use the same productId in every gallery where it appears.
-- A new productId may only be created for a genuinely different physical product.
-- Products from previous galleries that are NOT visible in the current gallery should NOT be repeated in the current gallery's products array.
-- modelReadabilityScore must be an integer from 1 through 10.
-- Do not return exact model names.
-- Do not guess model names.
-- Do not include secondary accessories as primary products.
-- Do not use Markdown.
-- Do not use code fences.
-- Return valid JSON only.
-        `.trim();
-
-const priorGalleryImageContent =
-  [];
-
-for (
-  const priorGallery of galleryResults
-) {
-  if (
-    !priorGallery
-      ?.debugCollageDataUrl
-  ) {
-    continue;
-  }
-
-  priorGalleryImageContent.push(
-    {
-      type:
-        "input_text",
-
-      text:
-        `REFERENCE ONLY — Prior Gallery ${priorGallery.galleryIndex}, Marketplace Images ${priorGallery.startingImageIndex}-${priorGallery.endingImageIndex}. Use this image only to determine whether products in the CURRENT gallery are the same physical products previously assigned IDs.`
-    },
-    {
-      type:
-        "input_image",
-
-      image_url:
-        priorGallery
-          .debugCollageDataUrl,
-
-      detail:
-        "high"
-    }
-  );
-}
-
-      const runGalleryModelCall = async attempt =>
-  await createLoggedOpenAiResponse({
-    step:
-      `Step 2 gallery analysis ${groupIndex + 1}` +
-      (
-        attempt > 1
-          ? ` (retry ${attempt - 1})`
-          : ""
-      ),
-
-    request: {
-      model:
-        "gpt-5.6-luna",
-
-      input: [
-        {
-          role:
-            "user",
-
-content: [
-  {
-    type:
-      "input_text",
-
-    text:
-      prompt
-  },
-
-  ...priorGalleryImageContent,
-
-  {
-    type:
-      "input_text",
-
-    text:
-      `CURRENT GALLERY ${groupIndex + 1}: Marketplace Images ${startingImageIndex}-${endingImageIndex}. Analyze THIS gallery and return products/images for THIS gallery only. Prior gallery images above are reference material for maintaining global physical-product IDs.`
-  },
-
-  {
-    type:
-      "input_image",
-
-    image_url:
-      collageDataUrl,
-
-    detail:
-      "high"
-  }
-]
-        }
-      ]
-    }
-  });
-
-      const response =
-        await runGalleryModelCall(1);
-
-        const rawText =
-          String(
-            response.output_text ||
-            ""
-          ).trim();
-
-
-        console.log(
-          `[STEP 2] Raw gallery ${groupIndex + 1} response:`
-        );
-
-        console.log(
-          rawText
-        );
-
-
-        /*
-          Lenient parse first (tolerates trailing garbage or a
-          missing closing brace). If that still fails, retry the
-          model call once before giving up on the whole listing.
-        */
-        let parsed =
-          parseGalleryAnalysisJson(
-            rawText
-          );
-
-        let finalRawText = rawText;
-
-        if (!parsed) {
-          console.warn(
-            `[STEP 2] Gallery ${groupIndex + 1} returned unusable JSON. Retrying once:`,
-            rawText
-          );
-
-          const retryResponse =
-            await runGalleryModelCall(2);
-
-          const retryRawText =
-            String(
-              retryResponse.output_text ||
-              ""
-            ).trim();
-
-          console.log(
-            `[STEP 2] Raw gallery ${groupIndex + 1} retry response:`
-          );
-
-          console.log(
-            retryRawText
-          );
-
-          finalRawText = retryRawText;
-
-          parsed =
-            parseGalleryAnalysisJson(
-              retryRawText
-            );
-        }
-
-        if (!parsed) {
-          console.error(
-            `[STEP 2] Invalid JSON from gallery ${groupIndex + 1} after retry:`,
-            finalRawText
-          );
-
-
-          return res
-            .status(502)
-            .json({
-              error:
-                `OpenAI returned invalid Step-2 JSON for gallery ${groupIndex + 1}.`,
-
-              rawText:
-                finalRawText
-            });
-        }
-
-
-galleryResults.push({
-  galleryIndex:
-    groupIndex + 1,
-
-  startingImageIndex,
-
-  endingImageIndex,
-
-  imageCount,
-
-  columns,
-
-  rows,
-
-  debugCollageDataUrl:
-    collageDataUrl,
-
-  galleryAnalysis:
-    parsed
-});
-      }
-
-
-      /*
-        For now we return each gallery separately.
-
-        We are NOT trying to merge product IDs across
-        separate collages yet.
-      */
-      res.json({
-        ok: true,
-
-        totalImageCount:
-          imageUrls.length,
-
-        galleryCount:
-          galleryResults.length,
-
-        galleries:
-          galleryResults
-      });
-
-    } catch (error) {
-      console.error(
-        "[STEP 2] Gallery analysis failed:",
-        error
-      );
-
-
-      res
-        .status(500)
-        .json({
-          error:
-            error?.message ||
-            "Gallery analysis failed."
-        });
-    }
-  }
-);
-
-/*
-  ============================================================
-  LENIENT MODEL-JSON PARSING
-
-  The model occasionally appends stray characters after an
-  otherwise valid JSON object (e.g. `{...} מס`), or drops the
-  final closing brace. A strict JSON.parse() then failed the
-  whole listing. This tries, in order:
-    1. strict parse (after trimming code fences);
-    2. the first brace-balanced object in the text;
-    3. cut after the last closing bracket and close whatever
-       containers are still open.
-  Returns null when nothing usable can be recovered.
-  ============================================================
-*/
-function extractFirstJsonObject(rawText) {
-  const source =
-    String(rawText || "")
-      .replace(/^\s*```(?:json)?/i, "")
-      .replace(/```\s*$/, "")
-      .trim();
-
-  if (!source) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(source);
-  } catch (error) {
-    // fall through to recovery
-  }
-
-  const start = source.indexOf("{");
-
-  if (start === -1) {
-    return null;
-  }
-
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-
-  for (let i = start; i < source.length; i += 1) {
-    const ch = source[i];
-
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = true;
-    } else if (ch === "{") {
-      depth += 1;
-    } else if (ch === "}") {
-      depth -= 1;
-
-      if (depth === 0) {
-        try {
-          return JSON.parse(
-            source.slice(start, i + 1)
-          );
-        } catch (error) {
-          break;
-        }
-      }
-    }
-  }
-
-  const lastClose =
-    Math.max(
-      source.lastIndexOf("}"),
-      source.lastIndexOf("]")
+    const buttons = Array.from(
+      container.querySelectorAll?.(
+        'button, [role="button"]'
+      ) || []
     );
 
-  if (lastClose <= start) {
-    return null;
-  }
-
-  let candidate =
-    source
-      .slice(start, lastClose + 1)
-      .replace(/,\s*$/, "");
-
-  const stack = [];
-  inString = false;
-  escaped = false;
-
-  for (const ch of candidate) {
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = true;
-    } else if (ch === "{" || ch === "[") {
-      stack.push(ch);
-    } else if (ch === "}" || ch === "]") {
-      stack.pop();
-    }
-  }
-
-  if (inString) {
-    return null;
-  }
-
-  candidate +=
-    stack
-      .reverse()
-      .map(opener => opener === "{" ? "}" : "]")
-      .join("");
-
-  try {
-    return JSON.parse(candidate);
-  } catch (error) {
-    return null;
-  }
-}
-
-function parseGalleryAnalysisJson(rawText) {
-  const parsed =
-    extractFirstJsonObject(rawText);
-
-  if (
-    parsed &&
-    Array.isArray(parsed.products) &&
-    Array.isArray(parsed.images)
-  ) {
-    return parsed;
-  }
-
-  return null;
-}
-
-/*
-  ============================================================
-  NON-SELLABLE "PHANTOM LENS" FILTER
-
-  Gallery analysis and reconciliation sometimes invent a lens
-  product that is not a separately sellable lens:
-    - the built-in lens of a camcorder / compact camera
-      (e.g. "Carl Zeiss Vario-Tessar" on a Sony Handycam);
-    - lens attachments and adapters (microscope adapter,
-      0.43x wide / 2.2x tele converters, extension tubes).
-  A fake lens with no identity then blocks or pollutes an
-  otherwise valid body listing. Products identified here are
-  removed and reported as suppressed so structural recovery
-  does not resurrect them and later passes keep them out.
-
-  Deliberately conservative: a real detachable lens has a mount
-  or a complete focal length, and is never removed by the
-  accessory/built-in rules.
-  ============================================================
-*/
-const FIXED_LENS_CAMERA_PATTERN =
-  /\b(handycam|camcorder|hdr-?[a-z0-9]+|dcr-?[a-z0-9]+|hdc-?[a-z0-9]+|cyber-?\s?shot|dsc-?[a-z0-9]+|coolpix|powershot|ixus|elph|finepix|optio|exilim|easyshare|mavica)\b/i;
-
-const LENS_ACCESSORY_PATTERN =
-  /\b(microscope|adapter|adaptor|converter|teleconverter|tele-?converter|extension tube|macro tube|step-?up ring|close-?up (?:lens|filter)|diopter)\b|\b0?\.\d+x\b|\b\d(?:\.\d+)?x\s*(?:af\s*)?(?:telephoto|tele|wide)/i;
-
-const BUILT_IN_OPTICS_PATTERN =
-  /\b(vario-?(?:tessar|sonnar|elmar)|carl zeiss|built-?in lens)\b/i;
-
-function isMissingLensField(value) {
-  const text =
-    String(value ?? "")
-      .trim();
-
-  return (
-    !text ||
-    /^(unknown|null|none|n\/a)$/i.test(text)
-  );
-}
-
-function identifyNonSellableLensProducts({
-  primaryProducts,
-  googleLensResults
-}) {
-  const products =
-    Array.isArray(primaryProducts)
-      ? primaryProducts
-      : [];
-
-  const isLens =
-    product =>
-      String(
-        product?.productType || ""
-      )
-        .trim()
-        .toLowerCase() === "camera lens";
-
-  const lenses =
-    products.filter(isLens);
-
-  if (!lenses.length) {
-    return [];
-  }
-
-  const cameras =
-    products.filter(
-      product => !isLens(product)
-    );
-
-  const allCamerasFixedLens =
-    cameras.length > 0 &&
-    cameras.every(
-      camera =>
-        FIXED_LENS_CAMERA_PATTERN.test(
-          `${camera?.brand || ""} ${camera?.model || ""}`
-        )
-    );
-
-  const removals = [];
-
-  for (const lens of lenses) {
-    const productId =
-      String(
-        lens?.productId || ""
-      ).trim();
-
-    const identity =
-      lens?.lensIdentity &&
-      typeof lens.lensIdentity === "object"
-        ? lens.lensIdentity
-        : {};
-
-    const visualText =
-      (
-        Array.isArray(googleLensResults)
-          ? googleLensResults
-          : []
-      )
-        .filter(
-          result =>
-            String(
-              result?.targetProductId || ""
-            ).trim() === productId
-        )
-        .map(
-          result =>
-            `${result?.identifiedModel || ""} ${result?.aiOverviewText || ""}`
-        )
-        .join(" ");
-
-    const evidenceText =
-      [
-        ...(
-          Array.isArray(lens?.extracted_evidence)
-            ? lens.extracted_evidence
-            : []
-        ),
-        identity.brand,
-        identity.mountSeries,
-        visualText
-      ]
-        .filter(Boolean)
-        .join(" ");
-
-    const hasFocal =
-      /\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*mm/i
-        .test(
-          String(identity.focalLength || "")
-        );
-
-    const hasAperture =
-      !isMissingLensField(
-        identity.maxAperture
-      );
-
-    const hasMount =
-      !isMissingLensField(
-        identity.mountSeries
-      );
-
-    let reason = null;
-
-    if (allCamerasFixedLens && !hasMount) {
-      reason =
-        "built-in lens of a fixed-lens camera/camcorder, not a separately sellable lens";
-    } else if (
-      !hasFocal &&
-      LENS_ACCESSORY_PATTERN.test(evidenceText)
-    ) {
-      reason =
-        "lens attachment/adapter accessory, not a primary sellable lens";
-    } else if (
-      cameras.length > 0 &&
-      !hasFocal &&
-      !hasAperture &&
-      !hasMount &&
-      BUILT_IN_OPTICS_PATTERN.test(evidenceText)
-    ) {
-      reason =
-        "built-in lens optics markings with no detachable-lens identity";
-    }
-
-    if (reason) {
-      removals.push({
-        productId,
-        productType: "camera lens",
-        suppressedAsNonSellableLens: true,
-        reason
-      });
-    }
-  }
-
-  return removals;
-}
-
-const STEP5_RECONCILIATION_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-
-  properties: {
-    primaryProducts: {
-      type: "array",
-
-      items: {
-        type: "object",
-        additionalProperties: false,
-
-        properties: {
-          productId: {
-            type: "string"
-          },
-
-          galleryIndex: {
-            type: "integer"
-          },
-
-          productType: {
-            type: "string",
-            enum: [
-              "camera body",
-              "camera",
-              "camera lens",
-            ]
-          },
-
-          /*
-            Non-lens models still need a model-name field,
-            but it is isolated from lens extraction.
-          */
-          nonLensIdentity: {
-            type: [
-              "object",
-              "null"
-            ],
-
-            additionalProperties: false,
-
-            properties: {
-              brand: {
-                type: [
-                  "string",
-                  "null"
-                ]
-              },
-
-              modelName: {
-                type: [
-                  "string",
-                  "null"
-                ]
-              }
-            },
-
-            required: [
-              "brand",
-              "modelName"
-            ]
-          },
-
-          /*
-            IMPORTANT:
-
-            There is intentionally NO:
-              model
-              canonicalModel
-
-            inside the LLM-controlled lens structure.
-          */
-          lensIdentity: {
-            type: [
-              "object",
-              "null"
-            ],
-
-            additionalProperties: false,
-
-            properties: {
-              brand: {
-                type: [
-                  "string",
-                  "null"
-                ]
-              },
-
-              mountSeries: {
-                type: [
-                  "string",
-                  "null"
-                ]
-              },
-
-              focalLength: {
-                type: [
-                  "string",
-                  "null"
-                ]
-              },
-
-              maxAperture: {
-                type: [
-                  "string",
-                  "null"
-                ]
-              },
-
-              featureTokens: {
-  type: "array",
-  items: {
-    type: "string"
-  }
-},
-
-              /*
-                Actual literal markings / model codes only.
-
-                Examples:
-                  H-FS14140
-                  H-FSA14140
-                  A006
-
-                Empty array if absent.
-              */
-              modelCodes: {
-                type: "array",
-                items: {
-                  type: "string"
-                }
-              },
-
-              generation: {
-                type: [
-                  "string",
-                  "null"
-                ]
-              }
-            },
-
-         required: [
-  "brand",
-  "mountSeries",
-  "focalLength",
-  "maxAperture",
-  "featureTokens",
-  "modelCodes",
-  "generation"
-]
-          },
-
-          /*
-            These must be literal substrings copied from
-            the supplied Marketplace/OCR source.
-          */
-          extracted_evidence: {
-            type: "array",
-            items: {
-              type: "string"
-            }
-          }
-        },
-
-        required: [
-          "productId",
-          "galleryIndex",
-          "productType",
-          "nonLensIdentity",
-          "lensIdentity",
-          "extracted_evidence"
-        ]
-      }
-    },
-
-    needsGoogleLens: {
-      type: "array",
-
-      items: {
-        type: "object",
-        additionalProperties: false,
-
-        properties: {
-          galleryIndex: {
-            type: "integer"
-          },
-
-          productId: {
-            type: "string"
-          },
-
-          reason: {
-            type: "string"
-          }
-        },
-
-        required: [
-          "galleryIndex",
-          "productId",
-          "reason"
-        ]
-      }
-    }
-  },
-
-  required: [
-    "primaryProducts",
-    "needsGoogleLens"
-  ]
-};
-
-app.post(
-  "/reconcile-primary-products",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const listingTitle =
-        String(
-          req.body?.listingTitle ||
-          ""
-        ).trim();
-
-      const listingDescription =
-        String(
-          req.body?.listingDescription ||
-          ""
-        ).trim();
-
-      const listingScreenshotOcr =
-        String(
-          req.body?.listingScreenshotOcr ||
-          ""
-        ).trim();
-
-      const productOcrResults =
-        Array.isArray(
-          req.body?.productOcrResults
-        )
-          ? req.body.productOcrResults
-          : [];
-
-
-      const explicitFacts =
-        req.body?.explicitFacts || {
-          explicitlyIncluded: [],
-          explicitlyExcluded: [],
-          listingNotes: []
-        };
-
-      const galleryResults =
-  Array.isArray(
-    req.body?.galleryResults
-  )
-    ? req.body.galleryResults.map(
-        gallery => {
-          const {
-            debugCollageDataUrl,
-            ...galleryWithoutDebugImage
-          } = gallery || {};
-
-          return galleryWithoutDebugImage;
-        }
-      )
-    : [];
-
-      const bestGoogleTargets =
-        Array.isArray(
-          req.body?.bestGoogleTargets
-        )
-          ? req.body.bestGoogleTargets
-          : [];
-
-          const preDataForSeoLensfunCandidates =
-  Array.isArray(
-    req.body
-      ?.preDataForSeoLensfunCandidates
-  )
-    ? req.body
-        .preDataForSeoLensfunCandidates
-    : [];
-
-
-function getPreDataForSeoLensfunCandidates(
-  productId
-) {
-  const cleanProductId =
-    String(
-      productId ||
-      ""
-    ).trim();
-
-
-  const entry =
-    preDataForSeoLensfunCandidates.find(
-      item =>
-        String(
-          item?.productId ||
-          ""
-        ).trim() ===
-        cleanProductId
-    );
-
-
-  return Array.isArray(
-    entry?.candidates
-  )
-    ? entry.candidates
-    : [];
-}
-
-const preDataForSeoPrimaryProducts =
-  Array.isArray(
-    req.body
-      ?.preDataForSeoPrimaryProducts
-  )
-    ? req.body
-        .preDataForSeoPrimaryProducts
-    : [];
-
-      const googleLensResults =
-        Array.isArray(
-          req.body?.googleLensResults
-        )
-          ? req.body.googleLensResults
-          : [];
-
-         const hasDataForSeoResults =
-  googleLensResults.some(
-    result =>
-      String(
-        result?.visualEvidenceSource ||
+    const sendButton = buttons.find(element => {
+      const text = String(
+        element.innerText ||
+        element.textContent ||
+        element.getAttribute("aria-label") ||
         ""
-      )
-        .trim()
-        .toLowerCase() ===
-      "dataforseo"
-  );
-
-
-const hasSerpApiResults =
-  googleLensResults.some(
-    result =>
-      String(
-        result?.visualEvidenceSource ||
-        ""
-      )
-        .trim()
-        .toLowerCase() ===
-      "serpapi-google-ai-mode"
-  );
-
-
-/*
-  DataForSEO already went through its own evidence
-  cleaner, so preserve the existing second-pass shortcut.
-
-  SerpApi intentionally mimics the OLD Google Lens
-  behavior and therefore MUST go back through Step 5
-  so its plain-text identification can be reconciled
-  against OCR, seller text, gallery evidence, etc.
-*/
-const isPostDataForSeoPass =
-  hasDataForSeoResults &&
-  !hasSerpApiResults &&
-  preDataForSeoPrimaryProducts.length > 0;
-
-          /*
-  ============================================================
-  VISUAL FALLBACK ATTEMPT TRACKING
-
-  Once DataForSEO has already been attempted for a physical
-  product during this reconciliation run, do not ask the caller
-  to run the visual fallback again.
-
-  Group results count as an attempt for every same-type product
-  represented by that result.
-  ============================================================
-*/
-
-function getDataForSeoResultForProduct(
-  productId
-) {
-  const cleanProductId =
-    String(
-      productId || ""
-    ).trim();
-
-
-  if (!cleanProductId) {
-    return null;
-  }
-
-
-  return (
-    googleLensResults.find(
-      result =>
-        String(
-          result?.targetProductId ||
-          ""
-        ).trim() ===
-          cleanProductId &&
-
-        result?.identificationMode !==
-          "group" &&
-
-        result?.ambiguityResolved !==
-          false
-    ) ||
-    null
-  );
-}
-
-
-function getStrongDataForSeoIdentity(
-  productId
-) {
-  const result =
-    getDataForSeoResultForProduct(
-      productId
-    );
-
-
-  if (!result) {
-    return "";
-  }
-
-
-  const confidence =
-    String(
-      result
-        ?.dataForSeoEvidence
-        ?.confidence ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
-
-
-  const consensus =
-    String(
-      result
-        ?.dataForSeoEvidence
-        ?.consensus ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
-
-
-  /*
-    BOTH conditions are required.
-  */
-/*
-  Accepted DataForSEO confidence levels:
-
-  HIGH + STRONG
-    → authoritative
-
-  MEDIUM + MIXED
-    → also authoritative for the scanner
-
-  Anything weaker
-    → unresolved / retain fallback behavior
-*/
-const acceptedDataForSeoIdentity =
-  (
-    confidence === "high" &&
-    consensus === "strong"
-  );
-
-if (
-  !acceptedDataForSeoIdentity
-) {
-  return "";
-}
-
-
-  const recommendedIdentification =
-    String(
-      result
-        ?.dataForSeoEvidence
-        ?.recommendedIdentification ||
-      result?.identifiedModel ||
-      ""
-    ).trim();
-
-
-  if (
-    !recommendedIdentification ||
-    recommendedIdentification
-      .toLowerCase() ===
-        "unknown"
-  ) {
-    return "";
-  }
-
-
-  return recommendedIdentification;
-}
-
-function getLensfunCorroboratedDataForSeoCandidate(
-  productId
-) {
-  const dataForSeoResult =
-    getDataForSeoResultForProduct(
-      productId
-    );
-
-  if (!dataForSeoResult) {
-    return null;
-  }
-
-  /*
-    This function is ONLY for DataForSEO.
-
-    SerpApi is handled separately by the legacy
-    Google Lens evidence path.
-  */
-  if (
-    String(
-      dataForSeoResult
-        ?.visualEvidenceSource ||
-      ""
-    )
-      .trim()
-      .toLowerCase() ===
-        "serpapi-google-ai-mode"
-  ) {
-    return null;
-  }
-
-  const confidence =
-    String(
-      dataForSeoResult
-        ?.dataForSeoEvidence
-        ?.confidence ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
-
-  const consensus =
-    String(
-      dataForSeoResult
-        ?.dataForSeoEvidence
-        ?.consensus ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
-
-  const isAuthoritativeDataForSeo =
-    (
-      confidence === "high" &&
-      consensus === "strong"
-    );
-
-  if (
-    isAuthoritativeDataForSeo
-  ) {
-    return null;
-  }
-
-  const recommendedIdentification =
-    String(
-      dataForSeoResult
-        ?.dataForSeoEvidence
-        ?.recommendedIdentification ||
-      dataForSeoResult?.identifiedModel ||
-      ""
-    ).trim();
-
-
-  if (
-    !recommendedIdentification ||
-    recommendedIdentification
-      .toLowerCase() ===
-        "unknown"
-  ) {
-    return null;
-  }
-
-
-  const lensfunCandidates =
-    getPreDataForSeoLensfunCandidates(
-      productId
-    );
-
-
-  /*
-    This rule only matters when Lensfun had
-    multiple possible exact models.
-  */
-  if (
-    !Array.isArray(
-      lensfunCandidates
-    ) ||
-    lensfunCandidates.length < 2
-  ) {
-    return null;
-  }
-
-
-  const matchingCandidate =
-    findMatchingLensfunCandidate(
-      recommendedIdentification,
-      lensfunCandidates
-    );
-
-
-  if (!matchingCandidate) {
-    console.log(
-      "[DATAFORSEO + LENSFUN] Weak visual result did not match Lensfun candidate set:",
-      {
-        productId,
-
-        recommendedIdentification,
-
-        confidence,
-
-        consensus,
-
-        allowedModels:
-          lensfunCandidates.map(
-            candidate =>
-              candidate?.model
-          )
-      }
-    );
-
-    return null;
-  }
-
-
-  console.log(
-    "[DATAFORSEO + LENSFUN] Weak visual result corroborated a Lensfun candidate:",
-    {
-      productId,
-
-      recommendedIdentification,
-
-      matchedLensfunModel:
-        matchingCandidate.model,
-
-      confidence,
-
-      consensus
-    }
-  );
-
-
-  return matchingCandidate;
-}
-
-
-function getPreDataForSeoProduct(
-  productId
-) {
-  const cleanProductId =
-    String(
-      productId || ""
-    ).trim();
-
-
-  return (
-    preDataForSeoPrimaryProducts.find(
-      product =>
-        String(
-          product?.productId ||
-          ""
-        ).trim() ===
-        cleanProductId
-    ) ||
-    null
-  );
-}
-
-function wasVisualFallbackAttemptedForProduct(
-  productId
-) {
-  const cleanProductId =
-    String(
-      productId || ""
-    ).trim();
-
-  if (
-    !cleanProductId ||
-    !Array.isArray(
-      googleLensResults
-    )
-  ) {
-    return false;
-  }
-
-
-  return googleLensResults.some(
-    result => {
-      const targetProductId =
-        String(
-          result?.targetProductId ||
-          ""
-        ).trim();
-
-
-      if (
-        targetProductId ===
-        cleanProductId
-      ) {
-        return true;
-      }
-
-
-      const sameTypeProductIds =
-        Array.isArray(
-          result?.sameTypeProductIds
-        )
-          ? result.sameTypeProductIds
-              .map(
-                value =>
-                  String(
-                    value || ""
-                  ).trim()
-              )
-              .filter(Boolean)
-          : [];
-
-
-      return (
-        sameTypeProductIds.includes(
-          cleanProductId
-        )
-      );
-    }
-  );
-}
-
-const prompt = `
-You are performing the FINAL reconciliation step for a Facebook Marketplace
-camera-equipment listing. You will reason briefly per product, then output
-one JSON object.
-
-TASK: Determine the final list of PRIMARY PRODUCTS being sold and identify
-each as specifically as the evidence reliably supports.
-
-PRIMARY PRODUCTS: camera bodies, cameras, camera lenses.
-NOT primary: batteries, chargers, straps, caps, filters, hoods, cases, bags,
-manuals, boxes, memory cards, cables, adapters, screen protectors.
-
-EVIDENCE PRIORITY (strongest to weakest):
-1. Explicit seller-written facts (Source A) and seller title/description (Source 0)
-2. OCR from the product's own image (Source D), matched to the product via
-   productId/gallery mapping — NOT interface text or another product's OCR
-3. Gallery product mapping / readability scores (Source B, C)
-4. Visual search (Source E) — NOT used for lensIdentity fields; see
-   LENS EXTRACTION RULES below for why
-
-==================================================
-INPUTS
-==================================================
-
-LISTING TITLE: ${listingTitle}
-LISTING DESCRIPTION: ${listingDescription}
-SCREENSHOT OCR (may contain Facebook UI text — ignore interface chrome): ${listingScreenshotOcr}
-
-EXPLICIT SELLER FACTS: ${JSON.stringify(explicitFacts, null, 2)}
-- explicitlyIncluded / explicitlyExcluded are direct seller statements.
-- Absence from seller text does NOT mean excluded.
-
-GALLERY PRODUCT MAPPING: ${JSON.stringify(galleryResults, null, 2)}
-- productId is global across the whole listing; same ID in multiple images = same physical item.
-- Different IDs (camera_1, lens_1, lens_2) = different physical products.
-- modelReadabilityScore: higher = stronger evidence for that product in that image.
-
-BEST IMAGE PER PRODUCT: ${JSON.stringify(bestGoogleTargets, null, 2)}
-
-OCR PER PRODUCT (Google Cloud Vision): ${JSON.stringify(productOcrResults, null, 2)}
-- Text may belong to another visible product in the same image — attribute
-  using productId, gallery mapping, readability, and surrounding evidence.
-- May contain cropped/misspaced/duplicated text.
-
-VISUAL SEARCH RESULTS: ${JSON.stringify(googleLensResults, null, 2)}
-- Observations, not ground truth. Use targetProductId/targetProductType to
-  attribute a result to a physical product.
-
-==================================================
-LEXICON REFERENCE — MATCH LITERALLY AGAINST OCR/TITLE/DESCRIPTION
-==================================================
-
-If any token below appears anywhere in authorized evidence for a lens —
-even as the trailing fragment of a cropped string like "1:3.5-5.6 IS" —
-copy it into featureTokens. This is direct transcription, not inference.
-Missing an already-present token is the error; including it is not.
-
-CANON feature tokens: IS, USM, STM, L, DO
-CANON mounts: EF, EF-S, EF-M, RF, RF-S, FD, FL
-NIKON feature tokens: VR, AF-S, AF-P, ED, SWM
-NIKON aperture suffixes (keep attached to maxAperture, not featureTokens): D, G, E
-  e.g. "1:1.4D" -> maxAperture "f/1.4D" ; "1:3.5-5.6G" -> maxAperture "f/3.5-5.6G"
-NIKON mounts: F, F-mount, Nikon F, Z, Z-mount, NIKKOR Z, CX / 1 NIKKOR
-SIGMA/TAMRON/OTHER feature tokens: OS, VC, OIS, OSS, HSM
-GENERIC generation markers (→ \`generation\`, never featureTokens): II, III, Mark II, G2
-
-Common OCR corruptions to recognize, not "correct" — preserve as evidence,
-normalize only the specific fields below:
-- "1:3.5-5.6" -> maxAperture "f/3.5-5.6" (normalize this specific pattern only)
-- "-55mm" or "18-" alone = incomplete zoom range, NOT a prime focal length.
-  Complete it only if other evidence confirms the missing endpoint
-  (e.g. "-55mm" -> "18-55mm" if an 18-55mm family is otherwise supported).
-  Never turn "-55mm" into "55mm."
-
-==================================================
-LENS EXTRACTION RULES
-==================================================
-
-Authorized sources for lens fields: title, description, seller-written facts,
-OCR from that product's own image. Visual search (Source E) is NEVER a source
-for any lensIdentity field, including generation, featureTokens, and
-modelCodes — not even when a visual search answer is quoted verbatim and
-looks unambiguous. Extracting a generation/feature marker from Source E here
-would just be a guess dressed up as structured evidence; the code that
-consumes lensIdentity does its own exact, deterministic comparison against
-Source E answers afterward, and does not trust anything this step infers from
-Source E. If a revision marker like "II"/"III"/"STM" is not present in
-Source A/D (seller text or that product's own OCR), generation and
-featureTokens must reflect only what those sources show — leave them
-incomplete rather than filling gaps from Source E.
-
-- nonLensIdentity MUST be null for lenses.
-- brand / mountSeries: populate only when explicitly supported. Don't infer
-  a mount from format designations (DX, FX are formats, not mounts).
-- focalLength / maxAperture: normalize per the rules above; otherwise verbatim.
-- featureTokens: literal matches from the lexicon table above, found in
-  Source A/D only. [] if none present in those sources.
-- generation: null unless a revision marker is explicitly present in
-  Source A/D. The presence of a feature token (e.g. "IS") never implies a
-  generation, and never implies featureTokens should be left empty.
-- modelCodes: only literal manufacturer SKUs (e.g. "H-FSA14140") found in
-  Source A/D. Never inferred from focal length, aperture, tokens, general
-  knowledge, or Source E.
-
-Worked example:
-OCR: "EF-S -55mm 1:3.5-5.6 IS"
--> focalLength: "18-55mm" (only if another source confirms 18mm end)
-   otherwise leave as best-supported partial, do not invent "55mm" as prime
--> maxAperture: "f/3.5-5.6"
--> featureTokens: ["IS"]
--> generation: null
--> extracted_evidence includes "1:3.5-5.6 IS" in full — not truncated before "IS"
-
-extracted_evidence: verbatim substrings only. No paraphrasing, no OCR
-correction, no invented supporting quotes.
-
-==================================================
-PRODUCT IDENTITY & RECONCILIATION
-==================================================
-
-- Every unique gallery productId = one entry in primaryProducts, even if
-  physically attached (a lens mounted on a body is still two products).
-  Never merge a lens identity into a camera/body entry.
-- Omit a gallery product only if (a) seller explicitly excludes it, or
-  (b) gallery analysis clearly misclassified an accessory as primary.
-  If identity is uncertain, keep the product with unknown fields — never delete.
-- Seller-stated quantities ("2 lenses") matched by 2 gallery IDs → don't add
-  more. Add a *_text_* product only if seller evidence establishes a physical
-  product beyond what gallery IDs already represent.
-- Visual-search conflicts for the same product: trust the image with the
-  higher modelReadabilityScore for that specific product.
-- DataForSEO establishes a new exact identity only when confidence="high"
-  AND consensus="strong" — otherwise treat as supporting evidence only.
-- SerpApi/Google AI Mode single or exclusion results may establish identity
-  if consistent with gallery/seller/OCR evidence; group results must be
-  mapped to individual productIds only when evidence supports it — never
-  assign a whole group answer to one product.
-
-==================================================
-VISUAL FALLBACK
-==================================================
-
-Add a product to needsGoogleLens only if seller text + OCR are genuinely too
-vague for a reliable resale lookup. For camera bodies, a bare series/family
-name with no specific model number is vague, not an identity — "Canon EOS",
-"Rebel", "Sony Alpha", and "Nikon D" each match many distinct camera models,
-so treat them as unresolved rather than guessing which one. A specific model
-("EOS 60D", "Alpha a6000", "D750", "Nikkormat EL", "Nikon F") is sufficient
-even if other fields are unknown - a model does NOT need a numeral to be exact. For lenses, "18-55mm" with no mount/aperture/feature tokens is
-similarly vague. Do NOT request it just because some field is unknown — e.g.
-"EF-S 18-55mm f/3.5-5.6 IS II" is specific enough already. Skip re-requesting
-if visual evidence was already supplied and used.
-
-==================================================
-REQUIRED OUTPUT FORMAT
-==================================================
-
-First, output a brief evidence scan, one entry per productId:
-
-<evidence_scan>
-productId: what title/description/seller-facts say | what OCR (this product's
-image) says, verbatim fragments | what visual search says (if any) | resulting
-fields and why
-</evidence_scan>
-
-Then output exactly one JSON object in a fenced code block:
-
-\`\`\`json
-{
-  "primaryProducts": [
-    {
-      "productId": "camera_1",
-      "galleryIndex": 1,
-      "productType": "camera body",
-      "nonLensIdentity": { "brand": "Canon", "modelName": "EOS 60D" },
-      "lensIdentity": null,
-      "extracted_evidence": ["Canon EOS 60D"]
-    },
-    {
-      "productId": "lens_1",
-      "galleryIndex": 1,
-      "productType": "camera lens",
-      "nonLensIdentity": null,
-      "lensIdentity": {
-        "brand": "Canon",
-        "mountSeries": "EF-S",
-        "focalLength": "18-55mm",
-        "maxAperture": "f/3.5-5.6",
-        "featureTokens": ["IS"],
-        "modelCodes": [],
-        "generation": null
-      },
-      "extracted_evidence": ["EF-S", "18-55mm", "1:3.5-5.6 IS"]
-    }
-  ],
-  "needsGoogleLens": []
-}
-\`\`\`
-
-Rules for this block: productType is exactly one of "camera body", "camera",
-"camera lens". Cameras/bodies: lensIdentity MUST be null. Lenses:
-nonLensIdentity MUST be null, lensIdentity MUST be an object (no bare model
-string, no canonicalModel field). Unknown = null, never invented. Each
-physical product appears exactly once.
-      `.trim();
-
-
-let parsed =
-  null;
-
-let parsedPrimaryProducts =
-  [];
-
-
-if (isPostDataForSeoPass) {
-  /*
-    SECOND PASS:
-
-    Do not send OCR, seller evidence, or Marketplace
-    source text through Step 5 again.
-
-    The first-pass structured JSON is now the
-    authoritative Marketplace evidence state.
-  */
-  parsedPrimaryProducts =
-    preDataForSeoPrimaryProducts.map(
-      product =>
-        JSON.parse(
-          JSON.stringify(
-            product
-          )
-        )
-    );
-
-  console.log(
-    "[STEP 5] Skipping AI reconciliation on post-DataForSEO pass."
-  );
-
-} else {
-  /*
-    FIRST PASS ONLY.
-  */
-  const response =
-    await createLoggedOpenAiResponse({
-      step:
-        "Step 5 primary product reconciliation",
-
-      request: {
-        model:
-          "gpt-4o-mini",
-
-        /*
-          This step is literal transcription (copy tokens that are
-          present, leave fields null when absent), not creative
-          generation. A non-zero temperature was letting the model
-          inconsistently drop literal tokens like "IS" across
-          otherwise-identical runs (see identical OCR input producing
-          featureTokens: [] on some passes and correct extraction on
-          others). Pin this to 0 for reproducible extraction.
-        */
-        temperature:
-          0,
-
-        text: {
-          format: {
-            type:
-              "json_schema",
-
-            name:
-              "step5_primary_product_reconciliation",
-
-            strict:
-              true,
-
-            schema:
-              STEP5_RECONCILIATION_SCHEMA
-          }
-        },
-
-        input: [
-          {
-            role:
-              "user",
-
-            content: [
-              {
-                type:
-                  "input_text",
-
-                text:
-                  prompt
-              }
-            ]
-          }
-        ]
-      }
-    });
-
-
-  const rawText =
-    String(
-      response.output_text ||
-      ""
-    ).trim();
-
-
-  console.log(
-    "[STEP 5] Raw reconciliation response:"
-  );
-
-  console.log(
-    rawText
-  );
-
-
-  try {
-    parsed =
-      extractFirstJsonObject(
-        rawText
-      );
-
-    if (!parsed) {
-      throw new Error(
-        "Unrecoverable Step-5 JSON."
-      );
-    }
-
-  } catch (error) {
-    return res
-      .status(502)
-      .json({
-        error:
-          "OpenAI returned invalid Step-5 JSON.",
-
-        rawText
-      });
-  }
-}
-
-function sanitizeStep5Product(
-  rawProduct
-) {
-  const productId =
-    String(
-      rawProduct?.productId || ""
-    ).trim();
-
-  const productType =
-    String(
-      rawProduct?.productType || ""
-    ).trim();
-
-  const normalizedType =
-    productType.toLowerCase();
-
-  const galleryIndex =
-    Number(
-      rawProduct?.galleryIndex
-    ) || 1;
-
-
-  /*
-    IMPORTANT:
-
-    Step 5 is the ONE AND ONLY boundary where raw
-    Marketplace/OCR evidence is interpreted.
-
-    After Step 5 returns structured JSON, downstream
-    code trusts that structured representation.
-
-    This function performs structural normalization only.
-    It does NOT re-read or re-validate against OCR.
-  */
-  const extractedEvidence =
-    normalizeStringArray(
-      rawProduct?.extracted_evidence
-    );
-
-
-  if (
-    normalizedType ===
-    "camera lens"
-  ) {
-    const rawIdentity =
-      rawProduct?.lensIdentity &&
-      typeof rawProduct.lensIdentity ===
-        "object"
-        ? rawProduct.lensIdentity
-        : {};
-
-
-    return {
-      productId,
-      galleryIndex,
-
-      /*
-        Canonical lens identity is still owned
-        by the dedicated resolver.
-      */
-      brand:
-        null,
-
-      model:
-        null,
-
-      productType,
-
-      lensIdentity: {
-        brand:
-          cleanNullableIdentityField(
-            rawIdentity?.brand
-          ),
-
-        canonicalModel:
-          null,
-
-        mountSeries:
-          cleanNullableIdentityField(
-            rawIdentity?.mountSeries
-          ),
-
-        focalLength:
-          cleanNullableIdentityField(
-            rawIdentity?.focalLength
-          ),
-
-  maxAperture:
-  cleanNullableIdentityField(
-    rawIdentity?.maxAperture
-  ),
-
-featureTokens:
-  normalizeStringArray(
-    rawIdentity?.featureTokens
-  ),
-
-modelCodes:
-  normalizeStringArray(
-    rawIdentity?.modelCodes
-  ),
-
-        generation:
-          cleanNullableIdentityField(
-            rawIdentity?.generation
-          ),
-
-        resolutionMode:
-          null
-      },
-
-      /*
-        Retained for logging/audit only.
-        Downstream identity logic must not parse this.
-      */
-      extracted_evidence:
-        extractedEvidence
-    };
-  }
-
-
-  const nonLensIdentity =
-    rawProduct?.nonLensIdentity &&
-    typeof rawProduct.nonLensIdentity ===
-      "object"
-      ? rawProduct.nonLensIdentity
-      : {};
-
-
-  return {
-    productId,
-    galleryIndex,
-
-    brand:
-      cleanNullableIdentityField(
-        nonLensIdentity?.brand
-      ),
-
-    model:
-      cleanNullableIdentityField(
-        nonLensIdentity?.modelName
-      ),
-
-    productType,
-
-    lensIdentity:
-      null,
-
-    extracted_evidence:
-      extractedEvidence
-  };
-}
-
-/*
-  ============================================================
-  STEP 5 STRUCTURAL VALIDATION
-  ============================================================
-
-  Gallery product IDs represent physical primary products.
-
-  Do not silently allow reconciliation to:
-  - drop a gallery product;
-  - merge a lens into a camera;
-  - attach lensIdentity to a non-lens product.
-*/
-
-const galleryPhysicalProducts =
-  [];
-
-for (
-  const gallery of galleryResults
-) {
-  const products =
-    Array.isArray(
-      gallery?.galleryAnalysis?.products
-    )
-      ? gallery.galleryAnalysis.products
-      : [];
-
-  for (
-    const product of products
-  ) {
-    const productId =
-      String(
-        product?.productId || ""
-      ).trim();
-
-    const productType =
-      String(
-        product?.productType || ""
-      ).trim();
-
-    if (
-      !productId ||
-      !productType
-    ) {
-      continue;
-    }
-
-    /*
-      IDs are global across galleries now,
-      so only keep one registry entry per productId.
-    */
-    if (
-      galleryPhysicalProducts.some(
-        existing =>
-          existing.productId ===
-          productId
-      )
-    ) {
-      continue;
-    }
-
-    galleryPhysicalProducts.push({
-      productId,
-      productType
-    });
-  }
-}
-
-
-if (!isPostDataForSeoPass) {
-  parsedPrimaryProducts =
-    Array.isArray(
-      parsed?.primaryProducts
-    )
-      ? parsed.primaryProducts.map(
-          sanitizeStep5Product
-        )
-      : [];
-}
-
-
-/*
-  ============================================================
-  GALLERY PHANTOM / DUPLICATE VALIDATION
-  ============================================================
-  Runs BEFORE structural recovery so that a product this stage
-  explicitly rejects is not blindly resurrected below, and so it
-  cannot reach paid visual identification. Conservative by design
-  (see evaluateLikelyPhantomGalleryProducts): a product the seller
-  merely failed to mention is kept.
-  Rejections from an earlier pass are carried in
-  req.body.suppressedGalleryProducts so the post-visual pass
-  cannot bring them back either.
-*/
-const priorSuppressedGalleryProducts =
-  Array.isArray(
-    req.body?.suppressedGalleryProducts
-  )
-    ? req.body.suppressedGalleryProducts
-    : [];
-
-const phantomValidation =
-  evaluateLikelyPhantomGalleryProducts({
-    galleryResults,
-    primaryProducts:
-      parsedPrimaryProducts,
-    productOcrResults,
-    listingTitle,
-    listingDescription,
-    explicitFacts,
-    priorSuppressed:
-      priorSuppressedGalleryProducts
-  });
-
-const suppressedGalleryProducts =
-  phantomValidation.suppressed;
-
-/*
-  Remove built-in lenses / lens attachments that were mistaken
-  for separately sellable lens products. They join the suppressed
-  list so recovery will not bring them back and the caller carries
-  them into later passes.
-*/
-const nonSellableLensRemovals =
-  identifyNonSellableLensProducts({
-    primaryProducts:
-      parsedPrimaryProducts,
-    googleLensResults
-  });
-
-for (const removal of nonSellableLensRemovals) {
-  console.warn(
-    "[NON-SELLABLE LENS] Removing phantom lens product:",
-    removal
-  );
-
-  if (
-    !suppressedGalleryProducts.some(
-      entry =>
-        entry?.productId ===
-        removal.productId
-    )
-  ) {
-    suppressedGalleryProducts.push(
-      removal
-    );
-  }
-}
-
-const suppressedGalleryProductIds =
-  new Set(
-    suppressedGalleryProducts.map(
-      entry => entry.productId
-    )
-  );
-
-console.log(
-  "[PHANTOM VALIDATION] Gallery duplicate check:",
-  {
-    sellerLensEnumeration: {
-      reliable:
-        phantomValidation.seller.reliable,
-      sellerLensCount:
-        phantomValidation.seller.sellerLensCount,
-      enumeratedCount:
-        phantomValidation.seller.enumeratedCount,
-      explicitCount:
-        phantomValidation.seller.explicitCount,
-      itemFocalKeys:
-        phantomValidation.seller.itemFocalKeys
-    },
-    diagnostics:
-      phantomValidation.diagnostics,
-    suppressed:
-      suppressedGalleryProducts
-  }
-);
-
-if (suppressedGalleryProductIds.size) {
-  parsedPrimaryProducts =
-    parsedPrimaryProducts.filter(
-      product =>
-        !suppressedGalleryProductIds.has(
-          String(
-            product?.productId || ""
-          ).trim()
-        )
-    );
-}
-
-/*
-  Detect gallery-visible physical products
-  that vanished during reconciliation.
-  Products rejected by phantom validation are NOT "missing".
-*/
-const missingGalleryProducts =
-  galleryPhysicalProducts.filter(
-    galleryProduct =>
-      !suppressedGalleryProductIds.has(
-        galleryProduct.productId
-      ) &&
-      !parsedPrimaryProducts.some(
-        finalProduct =>
-          String(
-            finalProduct?.productId || ""
-          ).trim() ===
-            galleryProduct.productId
-      )
-  );
-
-
-/*
-  Detect lens identity incorrectly attached
-  to a camera body / camera / flash.
-*/
-const invalidLensIdentityProducts =
-  parsedPrimaryProducts.filter(
-    product => {
-      const productType =
-        String(
-          product?.productType || ""
-        )
-          .trim()
-          .toLowerCase();
-
-      return (
-        productType !==
-          "camera lens" &&
-        product?.lensIdentity &&
-        typeof product.lensIdentity ===
-          "object"
-      );
-    }
-  );
-
-
-/*
-  ============================================================
-  STEP 5 PHYSICAL PRODUCT RECOVERY
-  ============================================================
-
-  Step 5 is allowed to organize / refine identities.
-
-  It is NOT allowed to make a physical product that the
-  gallery already detected disappear.
-
-  Previously this condition returned HTTP 502 and caused the
-  entire Marketplace listing analysis to fail/retry.
-
-  Instead:
-
-    1. preserve every gallery product ID;
-    2. restore a missing product from the pre-DataForSEO
-       baseline when available;
-    3. otherwise create a minimal unresolved physical-product
-       placeholder from the gallery registry;
-    4. strip invalid lensIdentity objects from non-lens items.
-
-  Identity can remain unresolved. Physical existence cannot.
-*/
-if (
-  missingGalleryProducts.length ||
-  invalidLensIdentityProducts.length
-) {
-  console.warn(
-    "[STEP 5] Reconciliation structure required recovery:",
-    {
-      missingGalleryProducts,
-
-      invalidLensIdentityProducts:
-        invalidLensIdentityProducts.map(
-          product => ({
-            productId:
-              product?.productId,
-
-            productType:
-              product?.productType
-          })
-        )
-    }
-  );
-}
-
-
-/*
-  Work from a mutable recovered copy rather than rejecting
-  the entire Step-5 response.
-*/
-let recoveredPrimaryProducts =
-  parsedPrimaryProducts.map(
-    product => {
-      const productType =
-        String(
-          product?.productType ||
-          ""
-        )
-          .trim()
-          .toLowerCase();
-
-      /*
-        lensIdentity is only legal on physical camera lenses.
-      */
-      if (
-        productType !==
-          "camera lens" &&
-        product?.lensIdentity
-      ) {
-        console.warn(
-          "[STEP 5 RECOVERY] Removing invalid lensIdentity from non-lens product:",
-          {
-            productId:
-              product?.productId,
-
-            productType:
-              product?.productType
-          }
-        );
-
-        return {
-          ...product,
-
-          lensIdentity:
-            null
-        };
-      }
-
-      return product;
-    }
-  );
-
-
-/*
-  Restore every physical gallery product that Step 5 dropped.
-*/
-for (
-  const missingProduct of
-    missingGalleryProducts
-) {
-  const productId =
-    String(
-      missingProduct?.productId ||
-      ""
-    ).trim();
-
-  const productType =
-    String(
-      missingProduct?.productType ||
-      ""
-    ).trim();
-
-
-  if (!productId) {
-    continue;
-  }
-
-
-  /*
-    On the second reconciliation pass, this is the ideal
-    recovery source because it contains the exact state
-    immediately before DataForSEO was introduced.
-  */
-  const baseline =
-    preDataForSeoPrimaryProducts.find(
-      product =>
-        String(
-          product?.productId ||
-          ""
-        ).trim() ===
-          productId
-    );
-
-
-  if (baseline) {
-    console.warn(
-      "[STEP 5 RECOVERY] Restoring missing product from pre-DataForSEO baseline:",
-      {
-        productId,
-        productType
-      }
-    );
-
-    recoveredPrimaryProducts.push(
-      JSON.parse(
-        JSON.stringify(
-          baseline
-        )
-      )
-    );
-
-    continue;
-  }
-
-
-  /*
-    First-pass fallback:
-
-    We may not yet have a richer identity baseline.
-
-    Preserve the physical product as unresolved rather than
-    inventing an exact model or failing the listing.
-  */
-  console.warn(
-    "[STEP 5 RECOVERY] Restoring missing gallery product as unresolved:",
-    {
-      productId,
-      productType
-    }
-  );
-
-
-  recoveredPrimaryProducts.push({
-    productId,
-
-    galleryIndex:
-      null,
-
-    brand:
-      null,
-
-    model:
-      null,
-
-    productType,
-
-    lensIdentity:
-      productType
-        .toLowerCase() ===
-          "camera lens"
-        ? {
-            brand:
-              null,
-
-            canonicalModel:
-              null,
-
-            mountSeries:
-              null,
-
-            focalLength:
-              null,
-
-          maxAperture:
-  null,
-
-featureTokens:
-  [],
-
-modelCodes:
-  [],
-
-generation:
-  null,
-
-            resolutionMode:
-              null
-          }
-        : null
-  });
-}
-
-    let primaryProducts =
-  recoveredPrimaryProducts;
-
-          /*
-  ============================================================
-  DATAFORSEO EVIDENCE GATE
-
-  If DataForSEO was attempted for a product but did NOT reach
-  high confidence + strong consensus, restore that product to
-  its exact pre-DataForSEO state.
-
-  The second Step-5 call exists only because DataForSEO added
-  new evidence. Weak evidence must therefore not rewrite facts
-  already established by the first reconciliation.
-  ============================================================
-*/
-
-if (
-  googleLensResults.length &&
-  preDataForSeoPrimaryProducts.length
-) {
-  primaryProducts =
-    primaryProducts.map(
-      product => {
-        const productId =
-          String(
-            product?.productId ||
-            ""
-          ).trim();
-
-
-        if (!productId) {
-          return product;
-        }
-
-
-        const dataForSeoResult =
-          getDataForSeoResultForProduct(
-            productId
-          );
-
-
-        /*
-          DataForSEO wasn't used on this product.
-        */
-        if (!dataForSeoResult) {
-          return product;
-        }
-
-        /*
-  SerpApi Google AI Mode uses the legacy Google Lens
-  evidence semantics.
-
-  Step 5 has already reconciled its identification
-  against OCR, seller text, gallery evidence, etc.
-
-  Do NOT apply the DataForSEO confidence rollback
-  to SerpApi results.
-*/
-const visualEvidenceSource =
-  String(
-    dataForSeoResult
-      ?.visualEvidenceSource ||
-    ""
-  )
-    .trim()
-    .toLowerCase();
-
-
-if (
-  visualEvidenceSource ===
-    "serpapi-google-ai-mode"
-) {
-  return product;
-}
-
-
-        /*
-          HIGH + STRONG is handled later by the
-          authoritative DataForSEO lock.
-        */
-        const strongIdentity =
-          getStrongDataForSeoIdentity(
-            productId
-          );
-
-
-        if (strongIdentity) {
-          return product;
-        }
-
-
-        /*
-          ========================================================
-          WEAKER DATAFORSEO + LENSFUN CORROBORATION
-          ========================================================
-
-          DataForSEO itself isn't strong enough to establish
-          an arbitrary exact model.
-
-          But if its exact recommended model is one of the
-          deterministic Lensfun candidates, accept the actual
-          Lensfun candidate as canonical.
-        */
-
-        const corroboratedCandidate =
-          getLensfunCorroboratedDataForSeoCandidate(
-            productId
-          );
-
-
-        if (corroboratedCandidate) {
-          const canonicalIdentity =
-            lensfunCandidateToIdentity(
-              corroboratedCandidate
-            );
-
-
-          canonicalIdentity
-            .resolutionMode =
-            "lensfun-dataforseo-corroborated";
-
-
-          console.log(
-            "[DATAFORSEO GATE] Accepting Lensfun candidate corroborated by weaker visual search:",
-            {
-              productId,
-
-              canonicalModel:
-                canonicalIdentity
-                  ?.canonicalModel
-            }
-          );
-
-
-          return {
-            ...product,
-
-            brand:
-              canonicalIdentity.brand ||
-              product?.brand ||
-              null,
-
-            lensIdentity:
-              canonicalIdentity
-          };
-        }
-
-
-        /*
-          Otherwise DataForSEO was not authoritative
-          and did not corroborate one exact Lensfun candidate.
-
-          Restore the exact state from before DataForSEO.
-        */
-        const baseline =
-          getPreDataForSeoProduct(
-            productId
-          );
-
-
-        if (!baseline) {
-          return product;
-        }
-
-
-        console.log(
-          "[DATAFORSEO GATE] Restoring pre-DataForSEO identity:",
-          {
-            productId,
-
-            confidence:
-              dataForSeoResult
-                ?.dataForSeoEvidence
-                ?.confidence,
-
-            consensus:
-              dataForSeoResult
-                ?.dataForSeoEvidence
-                ?.consensus,
-
-            recommendedIdentification:
-              dataForSeoResult
-                ?.dataForSeoEvidence
-                ?.recommendedIdentification
-          }
-        );
-
-
-        return JSON.parse(
-          JSON.stringify(
-            baseline
-          )
-        );
-      }
-    );
-}
-
-let needsGoogleLens =
-  isPostDataForSeoPass
-    ? []
-    : Array.isArray(
-        parsed?.needsGoogleLens
-      )
-      ? parsed.needsGoogleLens
-          .map(
-            item => ({
-              galleryIndex:
-                Number(
-                  item?.galleryIndex
-                ) || 1,
-
-              productId:
-                String(
-                  item?.productId ||
-                  ""
-                ).trim(),
-
-              reason:
-                String(
-                  item?.reason ||
-                  ""
-                ).trim(),
-
-              /*
-                Default for every product type, including
-                camera bodies/cameras. Uncropped SerpApi AI
-                Mode on the original best image is the only
-                visual fallback provider in active use.
-
-                The dedicated lens resolver below overwrites
-                this for camera lenses once it has evaluated
-                Lensfun candidates.
-              */
-              visualFallbackMode:
-                "serpapi-ai-mode-uncropped"
-            })
-          )
-          .filter(
-            item =>
-              item.productId
-          )
-      : [];
-
-/*
-  ============================================================
-  DETERMINISTIC CAMERA BODY / CAMERA SPECIFICITY GUARD
-  ============================================================
-  Step 5's LLM output is NOT trusted to decide paid visual
-  identification for camera bodies/cameras, in either direction:
-
-    - a vague/missing model is forced INTO needsGoogleLens;
-    - a specific model (e.g. "Nikkormat EL", "Nikon F") has any
-      LLM-requested visual fallback REMOVED, because a paid call
-      cannot add information to an identity the seller/OCR
-      already established;
-    - entries for productIds that are not final primary products
-      (hallucinated or phantom-suppressed) are dropped.
-
-  Skipped on the post-DataForSEO gate pass: needsGoogleLens is
-  intentionally already [] there and that pass reuses baseline
-  products rather than fresh Step-5 output.
-*/
-if (!isPostDataForSeoPass) {
-  const finalPrimaryProductIds =
-    new Set(
-      primaryProducts.map(
-        product =>
-          String(
-            product?.productId || ""
-          ).trim()
-      )
-    );
-
-  needsGoogleLens =
-    needsGoogleLens.filter(
-      item => {
-        const known =
-          finalPrimaryProductIds.has(
-            String(
-              item?.productId || ""
-            ).trim()
-          );
-
-        if (!known) {
-          console.warn(
-            "[STEP 5 GUARD] Dropping needsGoogleLens entry for a product that is not a final primary product (hallucinated or phantom-suppressed):",
-            item?.productId
-          );
-        }
-
-        return known;
-      }
-    );
-
-  for (
-    const product of primaryProducts
-  ) {
-    const productType =
-      String(
-        product?.productType || ""
       )
         .trim()
         .toLowerCase();
 
-    if (
-      productType ===
-      "camera lens"
-    ) {
-      continue;
-    }
-
-    const productId =
-      String(
-        product?.productId || ""
-      ).trim();
-
-    if (!productId) {
-      continue;
-    }
-
-    const assessment =
-      classifyCameraModelSpecificity(
-        product?.brand,
-        product?.model
+      return (
+        isVisibleMarketplaceElement(element) &&
+        text === "send"
       );
+    });
 
-    console.log(
-      `[CAMERA IDENTITY] ${
-        assessment.vague
-          ? "VAGUE"
-          : "SPECIFIC"
-      }:`,
-      {
-        productId,
-        brand:
-          product?.brand || null,
-        model:
-          product?.model || null,
-        code:
-          assessment.code,
-        reason:
-          assessment.reason
-      }
-    );
-
-    const existingIndex =
-      needsGoogleLens.findIndex(
-        item =>
-          String(
-            item?.productId || ""
-          ).trim() ===
-          productId
-      );
-
-    if (!assessment.vague) {
-      if (existingIndex >= 0) {
-        console.warn(
-          "[CAMERA IDENTITY] Removing LLM-requested visual fallback for an already-specific camera identity (SerpApi cannot add information):",
-          {
-            productId,
-            brand:
-              product?.brand,
-            model:
-              product?.model,
-            code:
-              assessment.code
-          }
-        );
-
-        needsGoogleLens.splice(
-          existingIndex,
-          1
-        );
-      }
-
-      continue;
+    if (sendButton) {
+      return sendButton;
     }
 
-    if (
-      wasVisualFallbackAttemptedForProduct(
-        productId
+    container = container.parentElement;
+  }
+
+  /*
+    Fallback: find a visible Send button on the
+    right half of the listing page.
+  */
+  return (
+    Array.from(
+      document.querySelectorAll(
+        'button, [role="button"]'
       )
-    ) {
-      continue;
-    }
-
-    console.warn(
-      "[STEP 5 GUARD] Forcing vague camera body/camera identity into needsGoogleLens:",
-      {
-        productId,
-        model:
-          product?.model,
-        productType:
-          product?.productType,
-        code:
-          assessment.code,
-        reason:
-          assessment.reason
-      }
-    );
-
-    const fallbackEntry = {
-      galleryIndex:
-        Number(
-          product?.galleryIndex
-        ) || 1,
-      productId,
-      reason:
-        `Camera identity "${[product?.brand, product?.model].filter(Boolean).join(" ") || "(none)"}" is not specific enough (${assessment.reason}); visual identification is required.`,
-      visualFallbackMode:
-        "serpapi-ai-mode-uncropped",
-      serpApiReasonCode:
-        "camera-model-genuinely-vague",
-      cameraSpecificityCode:
-        assessment.code
-    };
-
-    if (existingIndex >= 0) {
-      needsGoogleLens[existingIndex] = {
-        ...needsGoogleLens[existingIndex],
-        ...fallbackEntry
-      };
-    } else {
-      needsGoogleLens.push(
-        fallbackEntry
-      );
-    }
-  }
-}
-
-/*
-  ============================================================
-  DEDICATED LENS SPECIFICATION RESOLUTION
-  ============================================================
-*/
-
-const cameraContext =
-  primaryProducts
-    .filter(
-      product =>
-        String(
-          product?.productType || ""
-        )
-          .trim()
-          .toLowerCase() !==
-        "camera lens"
-    )
-    .map(
-      product => ({
-        productId:
-          String(
-            product?.productId || ""
-          ).trim(),
-
-        productType:
-          String(
-            product?.productType || ""
-          ).trim(),
-
-        brand:
-          cleanNullableIdentityField(
-            product?.brand
-          ),
-
-        model:
-          cleanNullableIdentityField(
-            product?.model
-          )
-      })
-    );
-
-
-const lensfunCandidatesByProductId =
-  new Map(
-    preDataForSeoLensfunCandidates.map(
-      entry => [
-        String(
-          entry?.productId ||
-          ""
-        ).trim(),
-
-        Array.isArray(
-          entry?.candidates
-        )
-          ? entry.candidates
-          : []
-      ]
-    )
-  );
-
-for (
-  const product of primaryProducts
-) {
-  const productType =
-    String(
-      product?.productType || ""
-    )
-      .trim()
-      .toLowerCase();
-
-
-  if (
-    productType !==
-    "camera lens"
-  ) {
-    continue;
-  }
-
-  /*
-  ============================================================
-  AUTHORITATIVE CROPPED DATAFORSEO RESULT
-  ============================================================
-*/
-
-const strongDataForSeoIdentity =
-  getStrongDataForSeoIdentity(
-    product?.productId
-  );
-
-
-if (strongDataForSeoIdentity) {
-  const baseline =
-    getPreDataForSeoProduct(
-      product?.productId
-    );
-
-
-  const existingLensIdentity =
-    normalizeLensIdentity(
-      baseline?.lensIdentity ||
-      product?.lensIdentity ||
-      {}
-    );
-
-
-  /*
-    Preserve the ACTUAL DataForSEO confidence metadata.
-
-    getStrongDataForSeoIdentity() now means
-    "accepted / authoritative", not necessarily literally
-    high + strong.
-  */
-  const dataForSeoResult =
-    getDataForSeoResultForProduct(
-      product?.productId
-    );
-
-
-  const actualConfidence =
-    String(
-      dataForSeoResult
-        ?.dataForSeoEvidence
-        ?.confidence ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
-
-
-  const actualConsensus =
-    String(
-      dataForSeoResult
-        ?.dataForSeoEvidence
-        ?.consensus ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
-
-
-  const resolutionMode =
-    actualConfidence === "high" &&
-    actualConsensus === "strong"
-      ? "dataforseo-high-strong"
-      : actualConfidence === "medium" &&
-        actualConsensus === "mixed"
-        ? "dataforseo-medium-mixed"
-        : "dataforseo-accepted";
-
-
-  product.lensIdentity = {
-    ...existingLensIdentity,
-
-    brand:
-      existingLensIdentity
-        .brand ||
-      cleanNullableIdentityField(
-        product?.brand
-      ),
-
-    canonicalModel:
-      strongDataForSeoIdentity,
-
-    resolutionMode
-  };
-
-
-  console.log(
-    "[DATAFORSEO GATE] Exact lens identity accepted:",
-    {
-      productId:
-        product?.productId,
-
-      canonicalModel:
-        strongDataForSeoIdentity,
-
-      confidence:
-        actualConfidence,
-
-      consensus:
-        actualConsensus,
-
-      resolutionMode
-    }
-  );
-
-
-  /*
-    This identity is final for this pass.
-    Do NOT send it through Lensfun again.
-  */
-  needsGoogleLens =
-    needsGoogleLens.filter(
-      item =>
-        String(
-          item?.productId ||
-          ""
-        ).trim() !==
-        String(
-          product?.productId ||
-          ""
-        ).trim()
-    );
-
-
-  continue;
-}
-
-/*
-  ============================================================
-  SECOND PASS
-
-  Lensfun was already executed before DataForSEO.
-
-  The weak-result candidate constraint / baseline restoration
-  has already happened above.
-
-  Do NOT query Lensfun again.
-  ============================================================
-*/
-if (isPostDataForSeoPass) {
-  continue;
-}
-
-  try {
-    const productVisualResult =
-      getDataForSeoResultForProduct(
-        product?.productId
-      );
-
-    const resolution =
-      await resolveCanonicalLens({
-  product,
-  cameraContext,
-
-  visualIdentificationAnswer:
-    productVisualResult
-      ?.identifiedModel ||
-
-    productVisualResult
-      ?.aiOverviewText ||
-
-    ""
-})
-
-      const resolvedProductId =
-  String(
-    product?.productId ||
-    ""
-  ).trim();
-
-
-if (
-  resolvedProductId &&
-  Array.isArray(
-    resolution?.candidates
-  )
-) {
-  lensfunCandidatesByProductId.set(
-    resolvedProductId,
-
-    resolution.candidates.map(
-      candidate => ({
-        candidateId:
-          String(
-            candidate
-              ?.candidateId ||
-            ""
-          ).trim(),
-
-        maker:
-          String(
-            candidate
-              ?.maker ||
-            ""
-          ).trim(),
-
-        model:
-          String(
-            candidate
-              ?.model ||
-            ""
-          ).trim(),
-
-        mount:
-          String(
-            candidate
-              ?.mount ||
-            ""
-          ).trim()
-      })
-    )
-  );
-}
-
-
-    console.log(
-      "[LENS RESOLVER] Complete:",
-      {
-        productId:
-          product?.productId,
-
-        mode:
-          resolution?.mode,
-
-        identity:
-          resolution?.identity
-      }
-    );
-
-
-    if (
-      resolution?.identity
-    ) {
-      /*
-        Overwrite Step-5's provisional evidence identity
-        with the canonical dedicated-resolver identity.
-      */
-      product.lensIdentity =
-        resolution.identity;
-
-
-      /*
-        This lens no longer needs the old
-        Serper Images fallback.
-      */
-      needsGoogleLens =
-        needsGoogleLens.filter(
-          item =>
-            String(
-              item?.productId || ""
-            ).trim() !==
-            String(
-              product?.productId || ""
-            ).trim()
-        );
-    } else {
-  const fallbackProductId =
-    String(
-      product?.productId ||
-      ""
-    ).trim();
-
-  /*
-    Visual identification was already attempted for this exact
-    product and still didn't exactly match any remaining
-    candidate (handled above, before this branch). Requesting
-    SerpApi again would just repeat the same failed cycle, so
-    stop here instead of requeuing it.
-  */
-  if (
-    wasVisualFallbackAttemptedForProduct(
-      fallbackProductId
-    )
-  ) {
-    console.warn(
-      "[LENS RESOLVER] Visual identification already attempted and did not resolve remaining ambiguity. Leaving unresolved rather than requesting fallback again:",
-      {
-        productId:
-          fallbackProductId,
-
-        visualIdentificationAnswer:
-          productVisualResult
-            ?.identifiedModel ||
-          "",
-
-        remainingCandidateCount:
-          Array.isArray(
-            resolution?.candidates
-          )
-            ? resolution.candidates.length
-            : 0
-      }
-    );
-
-    needsGoogleLens =
-      needsGoogleLens.filter(
-        item =>
-          String(
-            item?.productId || ""
-          ).trim() !==
-          fallbackProductId
-      );
-
-    continue;
-  }
-
-  /*
-    resolveCanonicalLens() only ever returns "lensfun" (either
-    exactly one candidate, or a direct visual-answer match,
-    both handled above) or "serpapi-ai-mode-uncropped" (zero or
-    still-ambiguous multiple candidates) - so every unresolved
-    lens here always uses uncropped SerpApi AI Mode on the
-    original best image.
-  */
-  const visualFallbackMode =
-    "serpapi-ai-mode-uncropped";
-
-  const existingFallbackIndex =
-    needsGoogleLens.findIndex(
-      item =>
-        String(
-          item?.productId ||
-          ""
-        ).trim() ===
-        fallbackProductId
-    );
-
-    const fallbackEntry = {
-    galleryIndex:
-      Number(
-        product?.galleryIndex
-      ) || 1,
-    productId:
-      fallbackProductId,
-    reason:
-      resolution?.reason ||
-      "Visual identification is required.",
-    visualFallbackMode,
-    serpApiReasonCode:
-      resolution?.reasonCode ||
-      "distinct-product-identity-unresolved",
-    lensfunCandidateCount:
-      Array.isArray(
-        resolution?.candidates
-      )
-        ? resolution.candidates.length
-        : 0,
-    notFoundInLensfun:
-      resolution?.notFoundInLensfun ===
-      true,
-    identityInsufficient:
-      resolution?.identityInsufficient ===
-      true
-  };
-
-  if (
-    existingFallbackIndex >= 0
-  ) {
-    needsGoogleLens[
-      existingFallbackIndex
-    ] = {
-      ...needsGoogleLens[
-        existingFallbackIndex
-      ],
-
-      ...fallbackEntry
-    };
-
-  } else {
-    needsGoogleLens.push(
-      fallbackEntry
-    );
-  }
-}
-
-  } catch (error) {
-    console.warn(
-      "[LENS RESOLVER] Failed:",
-      {
-        productId:
-          product?.productId,
-
-        error:
-          error?.message ||
-          String(error)
-      }
-    );
-
-
-    /*
-      Don't crash the entire Marketplace analysis.
-      Existing visual Serper fallback can still try.
-    */
-    const alreadyQueued =
-      needsGoogleLens.some(
-        item =>
-          String(
-            item?.productId || ""
-          ).trim() ===
-          String(
-            product?.productId || ""
-          ).trim()
-      );
-
-
-    if (!alreadyQueued) {
-      needsGoogleLens.push({
-        galleryIndex:
-          Number(
-            product?.galleryIndex
-          ) || 1,
-
-        productId:
-          String(
-            product?.productId || ""
-          ).trim(),
-
-                reason:
-          "Dedicated lens resolver failed and visual fallback is required.",
-        visualFallbackMode:
-          "serpapi-ai-mode-uncropped",
-        serpApiReasonCode:
-          "lens-resolver-error",
-        identityInsufficient:
-          true
-      });
-    }
-  }
-}
-
-/*
-  ============================================================
-  REMOVE ALREADY-ATTEMPTED VISUAL FALLBACKS
-
-  DataForSEO is the final visual-search attempt for this run.
-  If it did not establish an exact model, preserve the unresolved
-  product instead of requesting DataForSEO again.
-  ============================================================
-*/
-
-needsGoogleLens =
-  needsGoogleLens.filter(
-    item =>
-      !wasVisualFallbackAttemptedForProduct(
-        item?.productId
-      )
-  );
-
-/*
-  ============================================================
-  PAID-CALL METADATA
-  ============================================================
-  Every surviving needsGoogleLens entry must carry an affirmative,
-  deterministically derived reason plus the evidence snapshot the
-  client-side [SERPAPI GATE] uses for its final sanity check. An
-  LLM-supplied entry without a server-derived reason is not
-  enough to justify a paid call.
-*/
-{
-  const lensProductsForEvidence =
-    primaryProducts.filter(
-      product =>
-        isLensProductType(
-          product?.productType
-        )
-    );
-
-  needsGoogleLens =
-    needsGoogleLens.map(
-      item => {
-        const productId =
-          String(
-            item?.productId || ""
-          ).trim();
-
-        const product =
-          primaryProducts.find(
-            candidate =>
-              String(
-                candidate?.productId || ""
-              ).trim() ===
-              productId
-          );
-
-        const isLens =
-          isLensProductType(
-            product?.productType
-          );
-
-        const lensIdentity =
-          isLens
-            ? normalizeLensIdentity(
-                product?.lensIdentity ||
-                {}
-              )
-            : null;
-
-        const currentIdentity =
-          isLens
-            ? [
-                lensIdentity?.brand,
-                buildNormalizedLensModel(
-                  lensIdentity
-                )
-              ]
-                .filter(Boolean)
-                .join(" ") ||
-              null
-            : [
-                product?.brand,
-                product?.model
-              ]
-                .filter(Boolean)
-                .join(" ") ||
-              null;
-
-        const ocrText =
-          productOcrResults
-            .filter(
-              entry =>
-                String(
-                  entry?.productId || ""
-                ).trim() ===
-                productId
-            )
-            .map(
-              entry =>
-                String(
-                  entry?.ocrText || ""
-                ).trim()
-            )
-            .filter(Boolean)
-            .join("\n");
-
-        const hasOwnStructuredEvidence =
-          isLens
-            ? lensIdentityHasAnyEvidence(
-                lensIdentity
-              )
-            : Boolean(
-                product?.brand ||
-                product?.model
-              );
-
-        const hasUniqueOcrEvidence =
-          isLens
-            ? productHasUniqueLensOcr({
-                productId,
-                productOcrResults,
-                otherLensIdentities:
-                  lensProductsForEvidence
-                    .filter(
-                      other =>
-                        String(
-                          other?.productId ||
-                          ""
-                        ).trim() !==
-                        productId
-                    )
-                    .map(
-                      other =>
-                        normalizeLensIdentity(
-                          other?.lensIdentity ||
-                          {}
-                        )
-                    )
-              })
-            : Boolean(ocrText);
-
-        const serpApiReasonCode =
-          item?.serpApiReasonCode ||
-          (
-            isLens
-              ? (
-                  lensIdentityIsWellSupported(
-                    lensIdentity
-                  )
-                    ? null
-                    : "distinct-product-identity-unresolved"
-                )
-              : "camera-model-genuinely-vague"
-          );
-
-        return {
-          ...item,
-          serpApiReasonCode,
-          currentIdentity,
-          identitySource:
-            isLens
-              ? (
-                  lensIdentity
-                    ?.resolutionMode ||
-                  "step5-structured-evidence"
-                )
-              : "step5-seller-ocr",
-          lensfunCandidateCount:
-            isLens
-              ? (
-                  item
-                    ?.lensfunCandidateCount ??
-                  (
-                    lensfunCandidatesByProductId.get(
-                      productId
-                    ) || []
-                  ).length
-                )
-              : null,
-          sellerEvidence:
-            Array.isArray(
-              product?.extracted_evidence
-            ) &&
-            product
-              .extracted_evidence
-              .length > 0,
-          ocrEvidence:
-            Boolean(ocrText),
-          hasOwnIdentityEvidence:
-            hasOwnStructuredEvidence,
-          hasUniqueOcrEvidence,
-          sellerLensCount:
-            phantomValidation
-              .seller
-              .sellerLensCount ||
-            null,
-          likelyDuplicate:
-            false
-        };
-      }
-    )
-    .filter(
-      item => {
-        if (item.serpApiReasonCode) {
-          return true;
-        }
-
-        console.warn(
-          "[SERPAPI GATE][server] Dropping needsGoogleLens entry with no deterministic affirmative reason:",
-          {
-            productId:
-              item?.productId,
-            llmReason:
-              item?.reason
-          }
-        );
-
+    ).find(element => {
+      if (!isVisibleMarketplaceElement(element)) {
         return false;
       }
-    );
+
+      const text = String(
+  element.innerText ||
+  element.textContent ||
+  element.getAttribute(
+    "aria-label"
+  ) ||
+  ""
+)
+  .trim()
+  .toLowerCase();
+
+      const rect = element.getBoundingClientRect();
+
+      return (
+        text === "send" &&
+        rect.left > window.innerWidth * 0.5
+      );
+    }) || null
+  );
 }
 
-const result = {
-  primaryProducts:
-    primaryProducts
-      .map(
-        product => {
-          const productId =
-            String(
-              product?.productId ||
-              ""
-            ).trim();
+async function getMessagedMarketplaceListingIds() {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_MESSAGED_LISTING_IDS_KEY
+    );
 
+  const ids =
+    stored[
+      MARKETPLACE_MESSAGED_LISTING_IDS_KEY
+    ];
 
-          const galleryIndex =
-            Number(
-              product?.galleryIndex
-            ) || 1;
+  return Array.isArray(ids) ? ids : [];
+}
 
-
-          const productType =
-            String(
-              product?.productType ||
-              ""
-            ).trim();
-
-
-          const normalizedType =
-            productType
-              .toLowerCase();
-
-
-          /*
-            Camera lenses use structured identity.
-          */
-          if (
-            normalizedType ===
-            "camera lens"
-          ) {
-            const lensIdentity =
-              normalizeLensIdentity(
-                product?.lensIdentity ||
-                {}
-              );
-
-
-            const model =
-              buildNormalizedLensModel(
-                lensIdentity
-              );
-
-
-            return {
-              productId,
-
-              galleryIndex,
-
-              brand:
-                lensIdentity.brand,
-
-              model:
-                model || null,
-
-              productType,
-
-              lensIdentity
-            };
-          }
-
-
-          /*
-            Cameras, flashes, etc.
-          */
-          return {
-            productId,
-
-            galleryIndex,
-
-            brand:
-              cleanNullableIdentityField(
-                product?.brand
-              ),
-
-            model:
-              cleanNullableIdentityField(
-                product?.model
-              ),
-
-            productType,
-
-            lensIdentity:
-              null
-          };
-        }
-      )
-      .filter(
-        product =>
-          product.productId &&
-          product.productType
-      ),
-
-    needsGoogleLens,
-  suppressedGalleryProducts,
-  lensfunCandidateConstraints:
-    Array.from(
-      lensfunCandidatesByProductId
-        .entries()
-    ).map(
-      (
-        [
-          productId,
-          candidates
-        ]
-      ) => ({
-        productId,
-
-        candidates:
-          candidates.map(
-            candidate => ({
-              candidateId:
-                candidate.candidateId,
-
-              maker:
-                candidate.maker,
-
-              model:
-                candidate.model,
-
-              mount:
-                candidate.mount
-            })
-          )
-      })
-    )
-};
-
-
-      console.log(
-        "[STEP 5] Final primary products:"
-      );
-
-      console.dir(
-        result,
-        {
-          depth: null
-        }
-      );
-
-
-      res.json(
-        result
-      );
-
-    } catch (error) {
-      console.error(
-        "[STEP 5] Reconciliation failed:",
-        error
-      );
-
-      res
-        .status(500)
-        .json({
-          error:
-            error?.message ||
-            "Final reconciliation failed."
-        });
-    }
-  }
-);
-
-function hasEnoughIdentityForEbaySearch(
-  item
+async function markMarketplaceListingMessaged(
+  listingId
 ) {
-if (
-  item?.exactIdentityResolved ===
-  false
-) {
-  return false;
-}
+  if (!listingId) return;
 
-  const brand =
-    String(
-      item?.brand || ""
-    ).trim();
+  const ids =
+    await getMessagedMarketplaceListingIds();
 
-  const model =
-    String(
-      item?.model || ""
-    ).trim();
-
-  const productType =
-    String(
-      item?.productType || ""
-    ).trim();
-
-
-  return Boolean(
-    brand &&
-    model &&
-    productType
-  );
-}
-function getOpenAiLogFilePath() {
-  const date =
-    new Date()
-      .toISOString()
-      .slice(0, 10);
-
-  return path.join(
-    OPENAI_LOG_DIRECTORY,
-    `openai-api-${date}.jsonl`
-  );
-}
-
-function appendOpenAiLogEntry(entry) {
-  try {
-    fs.mkdirSync(
-      OPENAI_LOG_DIRECTORY,
-      {
-        recursive: true
-      }
-    );
-
-    fs.appendFileSync(
-      getOpenAiLogFilePath(),
-      `${JSON.stringify(entry)}\n`,
-      "utf8"
-    );
-  } catch (error) {
-    console.error(
-      "[OPENAI LOG] Could not write API log entry:",
-      error
-    );
-  }
-}
-
-/*
-  Use this instead of calling openai.responses.create directly.
-
-  It records:
-  - Complete request input
-  - Complete output
-  - Token usage
-  - Cached token usage
-  - Duration
-  - Estimated cost
-  - Errors
-*/
-async function createLoggedOpenAiResponse({
-  step,
-  request
-}) {
-  const requestId =
-    `openai-${Date.now()}-` +
-    Math.random()
-      .toString(36)
-      .slice(2, 9);
-
-  const startedAt = Date.now();
-
-  const sanitizedRequest =
-    sanitizeOpenAiLogValue(request);
-
-  appendOpenAiLogEntry({
-    timestamp: new Date().toISOString(),
-    event: "request",
-    requestId,
-    step,
-    model: request.model || "",
-    input: sanitizedRequest.input ?? null,
-    request: sanitizedRequest
-  });
-
-  console.log(
-    `[OPENAI REQUEST] ${step}`,
-    {
-      requestId,
-      model: request.model || ""
-    }
-  );
-
-  try {
-const response =
-  await openai.responses.create(
-    request
-  );
-
-    const durationMs =
-      Date.now() - startedAt;
-
-   const usage = response?.usage || {};
-
-const inputTokens =
-  Number(usage.input_tokens || 0);
-
-const cachedTokens =
-  Number(
-    usage.input_tokens_details?.cached_tokens || 0
-  );
-
-const uncachedInputTokens =
-  Math.max(
-    0,
-    inputTokens - cachedTokens
-  );
-
-const outputTokens =
-  Number(usage.output_tokens || 0);
-
-const totalTokens =
-  Number(
-    usage.total_tokens ||
-    inputTokens + outputTokens
-  );
-
-const estimatedCostUsd =
-  calculateOpenAiEstimatedCostUsd(
-    request.model,
-    usage
-  );
-
-console.log(
-  `[OPENAI USAGE] ${step}`,
-  {
-    model: request.model,
-    inputTokens,
-    cachedTokens,
-    uncachedInputTokens,
-    outputTokens,
-    totalTokens,
-    estimatedCostUsd
-  }
-);
-
-appendOpenAiLogEntry({
-  timestamp:
-    new Date().toISOString(),
-
-  event:
-    "response",
-
-  requestId,
-
-  step,
-
-  model:
-    request.model || "",
-
-  durationMs,
-
-  usage: {
-    inputTokens,
-    cachedTokens,
-    uncachedInputTokens,
-    outputTokens,
-    totalTokens
-  },
-
-  estimatedCostUsd,
-
-  responseId:
-    response?.id || "",
-
-  outputText:
-    String(
-      response?.output_text || ""
-    )
-});
-
-return response;
-
-  } catch (error) {
-    const durationMs =
-      Date.now() - startedAt;
-
-    appendOpenAiLogEntry({
-      timestamp:
-        new Date().toISOString(),
-
-      event:
-        "error",
-
-      requestId,
-
-      step,
-
-      model:
-        request.model || "",
-
-      durationMs,
-
-      error: {
-        name:
-          error?.name || "",
-
-        message:
-          error?.message ||
-          String(error),
-
-        status:
-          error?.status ?? null,
-
-        code:
-          error?.code ?? null,
-
-        type:
-          error?.type ?? null
-      }
-    });
-
-    console.error(
-      `[OPENAI ERROR] ${step}`,
-      {
-        requestId,
-        model:
-          request.model || "",
-        durationMs,
-        error:
-          error?.message ||
-          String(error)
-      }
-    );
-
-    throw error;
-  }
-}
-
-function getGoogleSheetHitDate() {
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/Los_Angeles",
-    month: "numeric",
-    day: "numeric",
-    year: "2-digit"
-  }).format(new Date());
-}
-
-async function appendSavedDealToGoogleSheet(deal) {
-  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
-  const tabName = process.env.GOOGLE_SHEETS_TAB_NAME || "Main";
-
-  if (!spreadsheetId) {
-    throw new Error("Missing GOOGLE_SHEETS_SPREADSHEET_ID.");
-  }
-
-  if (!process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
-    throw new Error("Missing GOOGLE_OAUTH_REFRESH_TOKEN.");
-  }
-
-  const auth = createGoogleOAuthClient();
-
-  auth.setCredentials({
-    refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN
-  });
-
-  const sheets = google.sheets({ version: "v4", auth });
-
-  const sheetMeta = await sheets.spreadsheets.get({
-    spreadsheetId
-  });
-
-  const sheet = sheetMeta.data.sheets.find(
-    s => s.properties.title === tabName
-  );
-
-  if (!sheet) {
-    throw new Error(`Google Sheet tab not found: ${tabName}`);
-  }
-
-  const sheetId = sheet.properties.sheetId;
-
-  /*
-    ============================================================
-    GOOGLE SHEETS APPEND PREPARATION
-    ============================================================
-
-    ORDER MATTERS:
-
-    1. Clear any active basic column filter.
-    2. Later determine the next row.
-    3. If the sheet is physically out of rows, add rows.
-    4. Write the hit.
-  */
-
-  let sheetRowCount =
-    Number(
-      sheet.properties?.gridProperties?.rowCount ||
-      0
-    );
-
-  /*
-    A normal Google Sheets column filter, like the green
-    filter icon shown in the screenshot, is represented
-    by sheet.basicFilter.
-
-    Remove it BEFORE calculating/writing the new hit rows.
-  */
-  if (sheet.basicFilter) {
-    console.log(
-      "[GOOGLE SHEETS] Active column filter detected. Clearing before hit append."
-    );
-
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-
-      requestBody: {
-        requests: [
-          {
-            clearBasicFilter: {
-              sheetId
-            }
-          }
-        ]
-      }
-    });
-
-    console.log(
-      "[GOOGLE SHEETS] Column filter cleared."
-    );
-  }
-
-  const primaryItems = Array.isArray(deal.items) && deal.items.length
-    ? deal.items.filter(item => item?.isPrimarySellableItem !== false)
-    : [];
-
-  const rowItems =
-  primaryItems.length
-    ? primaryItems
-    : [deal];
-
-const listingRowCount =
-  rowItems.length;
-
-/*
-  True when this is the normal multi-product / itemized
-  lot-result format.
-
-  Listing-level resale/std-dev values must NEVER be used
-  as fallback values for individual rows in this case.
-*/
-const hasItemizedRows =
-  Array.isArray(
-    deal.items
-  ) &&
-  deal.items.length >
-    0;
-
-const recommendationText = deal.recommendation || "";
-
-const normalizedRecommendation =
-  String(recommendationText)
-    .trim()
-    .toLowerCase();
-
-const isNegotiate =
-  normalizedRecommendation === "negotiate";
-
-const isBuyNow =
-  normalizedRecommendation === "buy now";
-
-/*
-  Date when this hit was recorded in Google Sheets.
-  Example: 8/2/26
-*/
-const hitRecordedDate = getGoogleSheetHitDate();
-
-const analysisLogUrl =
-  String(
-    deal.analysisLogUrl ||
-    ""
-  ).trim();
-
-
-const checklistUrl =
-  String(
-    deal.checklistUrl ||
-    ""
-  ).trim();
-
-
-const rows = rowItems.map((item, index) => {
-const analysisLogLink =
-  index === 0 &&
-  analysisLogUrl
-    ? (
-        `=HYPERLINK("${analysisLogUrl}","View Log")`
-      )
-    : "";
-
-    const checklistLink =
-  index === 0 &&
-  checklistUrl
-    ? (
-        `=HYPERLINK("${checklistUrl}","Checklist")`
-      )
-    : "";
-
-    const itemResult = item.result || item.evaluationResult || item;
-
-    // A: use the exact eBay comp search term first
-    const itemName =
-      item.ebaySearchQuery ||
-      item.searchQuery ||
-      item.itemName ||
-      `${item.brand || ""} ${item.model || ""} ${item.productType || ""}`.replace(/\s+/g, " ").trim() ||
-      deal.title ||
-      "";
-
-    // Listing-level values
-    const facebookUrl = index === 0 ? (deal.facebookUrl || "") : "";
-    const decision = index === 0 ? recommendationText : "";
-    const askPrice = index === 0 ? (deal.facebookPrice ?? "") : "";
-
-    // Item-level / analytical values
-      /*
-      ============================================================
-      ITEM-LEVEL ANALYTICAL VALUES
-      ============================================================
-
-      An excluded/invalid comp is still a real primary product,
-      so we keep its row in the Sheet.
-
-      However, it must NOT inherit the resale value or standard
-      deviation from another valid item in the listing.
-    */
-
-    const itemIsExcluded =
-      String(
-        item.status ||
-        ""
-      )
-        .trim()
-        .toLowerCase() ===
-      "excluded";
-
-
-    let estimatedResale =
-      "";
-
-    let priceStdDev =
-      "";
-
-
-    if (!itemIsExcluded) {
-      /*
-        Prefer the value that /evaluate-lot explicitly
-        approved for inclusion.
-
-        Then use this item's own analytical values.
-
-        Only fall back to deal-level values for the old
-        non-itemized single-product format.
-      */
-      estimatedResale =
-        item.includedExpectedSalePrice ??
-        itemResult.expectedSalePrice ??
-        itemResult.estimatedResaleValue ??
-        item.estimatedResaleValue ??
-        (
-          !hasItemizedRows
-            ? deal.estimatedResaleValue
-            : null
-        ) ??
-        "";
-
-
-      priceStdDev =
-        itemResult.priceStandardDeviation ??
-        item.priceStandardDeviation ??
-        (
-          !hasItemizedRows
-            ? deal.priceStandardDeviation
-            : null
-        ) ??
-        "";
-    }
-
-    // H:Q listing-level columns
-    /*
-  Threshold Buy is only relevant for Negotiate listings.
-
-  Buy Now, Pass, Scam, and Error rows must remain blank.
-*/
-const thresholdBuy =
-  index === 0 && isNegotiate
-    ? (
-        deal.maxBuyPrice ??
-        itemResult.maxBuyPrice ??
-        item.maxBuyPrice ??
-        ""
-      )
-    : "";
-
-/*
-  Columns I:P are reserved for manual entry.
-
-  Never copy extension or analysis values into these columns.
-*/
-/*
-  Columns J:L are reserved for manual entry.
-
-  Never copy extension or analysis values into these columns.
-*/
-const manualColumnJ = "";
-const manualColumnK = "";
-const manualColumnL = "";
-
-/*
-  M contains the purchase checklist link.
-  Only the first row gets it for multi-item listings.
-*/
-const checklistColumnM =
-  index === 0
-    ? checklistLink
-    : "";
-
-/*
-  N is listing-level, so only the first row receives the date.
-  If the listing contains multiple items, column N is merged later.
-*/
-const hitDateColumnN =
-  index === 0
-    ? hitRecordedDate
-    : "";
-
-const manualColumnO = "";
-const manualColumnP = "";
-const relistedYN =
-  index === 0
-    ? (deal.relisted ?? deal.relistedYN ?? "")
-    : "";
-
-   return [
-  itemName,        // A
-  facebookUrl,     // B
-  decision,        // C
-  askPrice,        // D
-  estimatedResale, // E
-  priceStdDev,     // F
-  "",              // G — Manual Evaluation
-  thresholdBuy,    // H
-  analysisLogLink, // I — Analysis Log
-  manualColumnJ,   // J
-  manualColumnK,   // K
-  manualColumnL,   // L
-  checklistColumnM, // M — Purchase Checklist
-  hitDateColumnN,  // N
-  manualColumnO,   // O
-  manualColumnP,   // P
-  relistedYN       // Q
-];
-  });
-
-const existingColumnA =
-  await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `${tabName}!A:A`
-  });
-
-const existingRows =
-  existingColumnA.data.values || [];
-
-const insertedStartRowNumber =
-  Math.max(existingRows.length + 1, 2);
-
-const insertedEndRowNumber =
-  insertedStartRowNumber +
-  rows.length -
-  1;
-
-
-/*
-  ============================================================
-  MAKE SURE THE SHEET HAS ENOUGH PHYSICAL ROWS
-  ============================================================
-
-  This happens AFTER the filter has been cleared.
-
-  Example:
-
-  Sheet currently contains rows 1-1119.
-  New listing requires rows 1120-1121.
-
-  sheetRowCount = 1119
-  insertedEndRowNumber = 1121
-
-  Therefore add 2 new rows before trying to write.
-*/
-if (
-  insertedEndRowNumber >
-  sheetRowCount
-) {
-  const rowsToAdd =
-    insertedEndRowNumber -
-    sheetRowCount;
-
-  console.log(
-    "[GOOGLE SHEETS] Sheet is out of rows. Adding rows:",
-    {
-      currentRowCount:
-        sheetRowCount,
-
-      requiredEndRow:
-        insertedEndRowNumber,
-
-      rowsToAdd
-    }
-  );
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-
-    requestBody: {
-      requests: [
-        {
-          insertDimension: {
-            range: {
-              sheetId,
-
-              dimension:
-                "ROWS",
-
-              /*
-                Google Sheets API indexes are zero-based.
-
-                sheetRowCount is therefore exactly the
-                insertion point immediately after the
-                existing final row.
-              */
-              startIndex:
-                sheetRowCount,
-
-              endIndex:
-                sheetRowCount +
-                rowsToAdd
-            },
-
-            /*
-              Preserve formatting/data-validation behavior
-              from the previous bottom row.
-            */
-            inheritFromBefore:
-              true
-          }
-        }
-      ]
-    }
-  });
-
-  sheetRowCount +=
-    rowsToAdd;
-
-  console.log(
-    "[GOOGLE SHEETS] Rows added successfully. New row count:",
-    sheetRowCount
-  );
-}
-
-
-await sheets.spreadsheets.values.update({
-  spreadsheetId,
-  range:
-    `${tabName}!A${insertedStartRowNumber}:Q${insertedEndRowNumber}`,
-  valueInputOption: "USER_ENTERED",
-  requestBody: {
-    values: rows
-  }
-});
-
-const startRowIndex =
-  insertedStartRowNumber - 1;
-
-const endRowIndex =
-  insertedEndRowNumber;
-
-  const requests = [];
-
-const mergedColumns = [
-  1, // B Facebook link
-  2, // C Decision
-  3, // D Ask price
-  7, // H Threshold buy
-  8, // I Analysis Log
-  9, // J
-  10, // K
-  11, // L
-  12, // M
-  13, // N
-  14, // O
-  15, // P
-  16  // Q Relisted
-];
-
-  if (listingRowCount > 1) {
-    for (const columnIndex of mergedColumns) {
-      requests.push({
-        mergeCells: {
-          range: {
-            sheetId,
-            startRowIndex,
-            endRowIndex,
-            startColumnIndex: columnIndex,
-            endColumnIndex: columnIndex + 1
-          },
-          mergeType: "MERGE_ALL"
-        }
-      });
-    }
-  }
-
-  // Center merged columns vertically/horizontally
-  requests.push({
-    repeatCell: {
-      range: {
-        sheetId,
-        startRowIndex,
-        endRowIndex,
-        startColumnIndex: 1,
-        endColumnIndex: 4
-      },
-      cell: {
-        userEnteredFormat: {
-          verticalAlignment: "MIDDLE",
-          horizontalAlignment: "CENTER"
-        }
-      },
-      fields: "userEnteredFormat(verticalAlignment,horizontalAlignment)"
-    }
-  });
-
-  requests.push({
-    repeatCell: {
-      range: {
-        sheetId,
-        startRowIndex,
-        endRowIndex,
-        startColumnIndex: 7,
-        endColumnIndex: 16
-      },
-      cell: {
-        userEnteredFormat: {
-          verticalAlignment: "MIDDLE",
-          horizontalAlignment: "CENTER"
-        }
-      },
-      fields: "userEnteredFormat(verticalAlignment,horizontalAlignment)"
-    }
-  });
-
-  // Force every newly added cell from A:Q to have a white background.
-// This prevents the manual background color from the previous listing
-// from carrying into the newly inserted rows.
-requests.push({
-  repeatCell: {
-    range: {
-      sheetId,
-      startRowIndex,
-      endRowIndex,
-      startColumnIndex: 0,
-      endColumnIndex: 17
-    },
-    cell: {
-      userEnteredFormat: {
-        backgroundColor: {
-          red: 1,
-          green: 1,
-          blue: 1
-        }
-      }
-    },
-    fields: "userEnteredFormat.backgroundColor"
-  }
-});
-
-/*
-  Columns I:M and O:P are controlled manually.
-
-  Column N is intentionally excluded because it stores the
-  date when the hit was recorded.
-*/
-
-/*
-  Clear J:L.
-
-  Column I = Analysis Log
-  Column M = Purchase Checklist
-*/
-
-requests.push({
-  repeatCell: {
-    range: {
-      sheetId,
-      startRowIndex,
-      endRowIndex,
-
-      startColumnIndex:
-        9,
-
-      endColumnIndex:
-        12
-    },
-
-    cell: {
-      userEnteredValue:
-        null
-    },
-
-    fields:
-      "userEnteredValue"
-  }
-});
-
-// Clear O:P.
-requests.push({
-  repeatCell: {
-    range: {
-      sheetId,
-      startRowIndex,
-      endRowIndex,
-      startColumnIndex: 14,
-      endColumnIndex: 16
-    },
-    cell: {
-      userEnteredValue: null
-    },
-    fields: "userEnteredValue"
-  }
-});
-
-// Make Threshold Buy black if the listing is NOT marked Negotiate.
-// This must stay after the white-background request.
-if (!isNegotiate) {
-  requests.push({
-    repeatCell: {
-      range: {
-        sheetId,
-        startRowIndex,
-        endRowIndex,
-        startColumnIndex: 7,
-        endColumnIndex: 8
-      },
-      cell: {
-        userEnteredFormat: {
-          backgroundColor: {
-            red: 0,
-            green: 0,
-            blue: 0
-          }
-        }
-      },
-      fields: "userEnteredFormat.backgroundColor"
-    }
-  });
-}
-
-// Add the black divider underneath the complete listing from A:Q.
-requests.push({
-  updateBorders: {
-    range: {
-      sheetId,
-      startRowIndex,
-      endRowIndex,
-      startColumnIndex: 0,
-      endColumnIndex: 17
-    },
-    bottom: {
-      style: "SOLID_MEDIUM",
-      color: {
-        red: 0,
-        green: 0,
-        blue: 0
-      }
-    }
-  }
-});
-
-// Add a black right-side border to column Q for the complete listing.
-requests.push({
-  updateBorders: {
-    range: {
-      sheetId,
-      startRowIndex,
-      endRowIndex,
-      startColumnIndex: 16,
-      endColumnIndex: 17
-    },
-    right: {
-      style: "SOLID_MEDIUM",
-      color: {
-        red: 0,
-        green: 0,
-        blue: 0
-      }
-    }
-  }
-});
-
-  if (requests.length) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests
-      }
-    });
-  }
-}
-
-function createGoogleOAuthClient() {
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-  const redirectUri =
-    process.env.GOOGLE_OAUTH_REDIRECT_URI || "http://localhost:3000/oauth2callback";
-
-  if (!clientId) {
-    throw new Error("Missing GOOGLE_OAUTH_CLIENT_ID in .env");
-  }
-
-  if (!clientSecret) {
-    throw new Error("Missing GOOGLE_OAUTH_CLIENT_SECRET in .env");
-  }
-
-  return new google.auth.OAuth2(
-    clientId,
-    clientSecret,
-    redirectUri
-  );
-}
-
-app.get("/google-auth-url", (req, res) => {
-  try {
-    const oauth2Client = createGoogleOAuthClient();
-
-    const url = oauth2Client.generateAuthUrl({
-      access_type: "offline",
-      prompt: "consent",
-      scope: ["https://www.googleapis.com/auth/spreadsheets"]
-    });
-
-    res.send(`<a href="${url}">Authorize Google Sheets</a>`);
-  } catch (error) {
-    console.error("Google auth URL failed:", error);
-    res.status(500).send(error.message);
-  }
-});
-
-app.get("/oauth2callback", async (req, res) => {
-  try {
-    const oauth2Client = createGoogleOAuthClient();
-    const { code } = req.query;
-
-    if (!code) {
-      return res.status(400).send("Missing OAuth code.");
-    }
-
-    const { tokens } = await oauth2Client.getToken(code);
-
-    console.log("GOOGLE_OAUTH_REFRESH_TOKEN=", tokens.refresh_token);
-
-    res.send(`
-      <h2>Google Sheets authorized.</h2>
-      <p>Check your server terminal for GOOGLE_OAUTH_REFRESH_TOKEN.</p>
-    `);
-  } catch (error) {
-    console.error("OAuth callback failed:", error);
-    res.status(500).send(error.message);
-  }
-});
-
-function sendServerError(res, error, fallbackMessage) {
-  const malformedAiJson =
-    error?.code === "MALFORMED_AI_JSON" ||
-    error?.name === "MalformedAiJsonError";
-
-  if (malformedAiJson) {
-    return res.status(502).json({
-      ok: false,
-      error: error.message,
-      code: "MALFORMED_AI_JSON",
-      retryEntireListing: true,
-      step: error.step || "unknown",
-      originalError: error.originalError || ""
-    });
-  }
-
-  return res.status(500).json({
-    ok: false,
-    error: error?.message || fallbackMessage,
-    code: "SERVER_ERROR",
-    retryEntireListing: false
-  });
-}
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    time: new Date().toISOString()
-  });
-});
-
-app.post(
-  "/save-deal-to-sheet",
-  async (req, res) => {
-    try {
-      const {
-        deal
-      } =
-        req.body;
-
-      if (!deal) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing deal"
-          });
-      }
-
-      const analysisRunId =
-        sanitizeAnalysisRunId(
-          deal.analysisRunId ||
-          req.get(
-            "X-Analysis-Run-Id"
-          )
-        );
-
-      if (!analysisRunId) {
-        throw new Error(
-          "Hit is missing analysisRunId."
-        );
-      }
-
-      console.log(
-        "[HIT LOG] Preparing permanent Supabase log.",
-        {
-          analysisRunId
-        }
-      );
-
-      /*
-        Upload everything collected during
-        this listing analysis.
-      */
-      const uploadedLog =
-        await uploadAnalysisLogToSupabase(
-          analysisRunId
-        );
-
-      console.log(
-        "[HIT LOG] Supabase upload complete.",
-        {
-          analysisRunId,
-          objectPath:
-            uploadedLog.objectPath,
-          publicUrl:
-            uploadedLog.publicUrl
-        }
-      );
-
-    /*
-  Create/recover a persistent purchase checklist.
-
-  Same Facebook listing = same checklist.
-*/
-
-const checklist =
-  await createOrGetDealChecklist({
-    deal,
-    analysisRunId
-  });
-
-
-console.log(
-  "[DEAL CHECKLIST] Ready:",
-  {
-    analysisRunId,
-
-    checklistUrl:
-      checklist.url
-  }
-);
-
-
-/*
-  Attach both permanent URLs
-  before writing the Google Sheet.
-*/
-
-const dealWithLog = {
-  ...deal,
-
-  analysisRunId,
-
-  analysisLogUrl:
-    uploadedLog.publicUrl,
-
-  checklistUrl:
-    checklist.url
-};
-
-
-await appendSavedDealToGoogleSheet(
-  dealWithLog
-);
-
-
-return res.json({
-  ok:
-    true,
-
-  analysisLogUrl:
-    uploadedLog.publicUrl,
-
-  checklistUrl:
-    checklist.url
-});
-
-    } catch (error) {
-      console.error(
-        "Google Sheets / hit-log save failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Could not save hit."
-        });
-    }
-  }
-);
-
-
-function isWithinLast90Days(soldDate) {
-  if (!soldDate) return false;
-
-  const date = new Date(soldDate);
-  if (Number.isNaN(date.getTime())) return false;
-
-  const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
-  return date.getTime() >= cutoff;
-}
-
-function standardDeviation(numbers) {
-  if (!Array.isArray(numbers) || numbers.length < 2) return null;
-
-  const validNumbers = numbers
-    .map(Number)
-    .filter(num => Number.isFinite(num));
-
-  if (validNumbers.length < 2) return null;
-
-  const mean =
-    validNumbers.reduce((sum, num) => sum + num, 0) / validNumbers.length;
-
-  const variance =
-    validNumbers.reduce((sum, num) => sum + Math.pow(num - mean, 2), 0) /
-    validNumbers.length;
-
-  return Number(Math.sqrt(variance).toFixed(2));
-}
-
-function median(numbers) {
-  if (!numbers.length) return null;
-
-  const sorted = [...numbers].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-
-  if (sorted.length % 2 === 0) {
-    return Number(((sorted[mid - 1] + sorted[mid]) / 2).toFixed(2));
-  }
-
-  return Number(sorted[mid].toFixed(2));
-}
-
-async function updateMarketplaceConversationFollowUpColumn({
-  rowNumber,
-  followUpDue
-}) {
-  const cleanRowNumber =
-    Number(rowNumber);
-
-  if (
-    !Number.isInteger(cleanRowNumber) ||
-    cleanRowNumber < 1
-  ) {
+  if (ids.includes(listingId)) {
     return;
   }
 
+  await chrome.storage.local.set({
+    [MARKETPLACE_MESSAGED_LISTING_IDS_KEY]: [
+      listingId,
+      ...ids
+    ].slice(0, 1000)
+  });
+}
 
-  const spreadsheetId =
-    process.env
-      .GOOGLE_SHEETS_SPREADSHEET_ID;
+async function generateTailoredMarketplaceHitMessage() {
+  const stored =
+    await chrome.storage.local.get([
+      "ebayCompContext",
+      "marketplaceFinalPrimaryProducts"
+    ]);
 
-  const tabName =
-    process.env
-      .GOOGLE_SHEETS_TAB_NAME ||
-    "Main";
+  const context =
+    stored?.ebayCompContext || {};
 
+  const primaryProducts =
+    Array.isArray(
+      stored?.marketplaceFinalPrimaryProducts
+    )
+      ? stored.marketplaceFinalPrimaryProducts
+      : [];
 
-  if (!spreadsheetId) {
-    throw new Error(
-      "Missing GOOGLE_SHEETS_SPREADSHEET_ID."
+  const listingTitle =
+    String(
+      context.originalFacebookTitle ||
+      getListingTitle() ||
+      ""
+    ).trim();
+
+const listingDescription =
+  String(
+    context.facebookDescription ||
+    ""
+  ).trim();
+
+  const response =
+    await fetchLocalServer(
+      "/generate-marketplace-hit-message",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            listingTitle,
+            listingDescription,
+            primaryProducts,
+
+            templateMessage:
+              MARKETPLACE_HIT_MESSAGE
+          })
+      },
+      {
+        timeoutMs: 30000,
+        retries: 0
+      }
     );
-  }
 
+  const data =
+    await readJsonSafely(
+      response
+    );
 
   if (
-    !process.env
-      .GOOGLE_OAUTH_REFRESH_TOKEN
+    !response.ok ||
+    data.error
   ) {
-    throw new Error(
-      "Missing GOOGLE_OAUTH_REFRESH_TOKEN."
+    throw new LocalServerError(
+      data,
+      "Tailored Marketplace message generation failed."
     );
   }
 
+  const message =
+    String(
+      data.message || ""
+    ).trim();
 
-  const auth =
-    createGoogleOAuthClient();
+  if (!message) {
+    throw new Error(
+      "AI returned an empty Marketplace message."
+    );
+  }
+
+  return message;
+}
+
+function getMarketplaceMessageInputText(
+  input
+) {
+  if (!input) {
+    return "";
+  }
+
+  if (
+    input instanceof HTMLInputElement ||
+    input instanceof HTMLTextAreaElement
+  ) {
+    return String(
+      input.value || ""
+    );
+  }
+
+  if (input.isContentEditable) {
+    return String(
+      input.textContent || ""
+    );
+  }
+
+  return "";
+}
 
 
-  auth.setCredentials({
-    refresh_token:
-      process.env
-        .GOOGLE_OAUTH_REFRESH_TOKEN
-  });
+async function waitForMarketplaceMessageSendConfirmation({
+  input,
+  sentMessage,
+  timeoutMs = 7000
+}) {
+  const startedAt =
+    Date.now();
 
+  const expected =
+    String(
+      sentMessage || ""
+    ).trim();
 
-  const sheets =
-    google.sheets({
-      version: "v4",
-      auth
-    });
+  while (
+    Date.now() - startedAt <
+    timeoutMs
+  ) {
+    /*
+      Facebook frequently destroys/recreates the
+      composer after a successful send.
+    */
+    if (
+      !input ||
+      !document.contains(input)
+    ) {
+      return true;
+    }
 
+    const currentValue =
+      getMarketplaceMessageInputText(
+        input
+      ).trim();
 
-  await sheets
-    .spreadsheets
-    .values
-    .update({
-      spreadsheetId,
+    /*
+      Successful sends normally clear the composer
+      or restore Facebook's default message.
+    */
+/*
+  A successful Facebook send normally:
 
-      /*
-        Q = Follow Up
-      */
-      range:
-        `${tabName}!Q${cleanRowNumber}`,
+  1. removes/replaces the composer element, OR
+  2. clears the composer, OR
+  3. restores Facebook's stock "Is this available?"
+     style placeholder/default message.
 
-      valueInputOption:
-        "USER_ENTERED",
+  Do not interpret an arbitrary text mutation as
+  proof that the message was sent.
+*/
+if (!currentValue) {
+  return true;
+}
 
-      requestBody: {
-        values: [
-          [
-            followUpDue
-              ? "Y"
-              : ""
-          ]
-        ]
-      }
-    });
+const normalizedCurrent =
+  currentValue
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 
+const normalizedExpected =
+  expected
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+const restoredDefaultMessage =
+  normalizedCurrent.includes(
+    "is this available"
+  ) &&
+  !normalizedExpected.includes(
+    "is this available"
+  );
+
+if (restoredDefaultMessage) {
+  return true;
+}
+
+    await sleep(250);
+  }
+
+  return false;
+}
+
+async function messageMarketplaceSellerForVerifiedHit(
+  result
+) {
+  if (!AUTO_MESSAGE_ENABLED) {
+    console.log("[AUTO MESSAGE] Skipped: AUTO_MESSAGE_ENABLED is false.");
+
+    return { sent: false, reason: "Auto message disabled." };
+  }
 
   console.log(
-    "[CONVERSATION TRACKER] Follow-up column updated:",
+    "[AUTO MESSAGE] Starting seller-message check.",
     {
-      rowNumber:
-        cleanRowNumber,
-
-      column:
-        "Q",
-
-      value:
-        followUpDue
-          ? "Y"
-          : ""
+      pageUrl: window.location.href,
+      recommendation:
+        result?.recommendation || ""
     }
   );
-}
 
-function mean(numbers) {
-  const values =
-    numbers
-      .map(Number)
-      .filter(
-        Number.isFinite
-      );
-
-
-  if (!values.length) {
-    return null;
-  }
-
-
-  return Number(
-    (
-      values.reduce(
-        (
-          sum,
-          value
-        ) =>
-          sum + value,
-        0
-      ) /
-      values.length
-    ).toFixed(2)
-  );
-}
-
-
-function percentile(
-  numbers,
-  percentileValue
-) {
-  const values =
-    numbers
-      .map(Number)
-      .filter(
-        Number.isFinite
-      )
-      .sort(
-        (a, b) =>
-          a - b
-      );
-
-
-  if (!values.length) {
-    return null;
-  }
-
-
-  if (
-    values.length === 1
-  ) {
-    return Number(
-      values[0].toFixed(2)
-    );
-  }
-
-
-  const position =
-    (
-      percentileValue /
-      100
-    ) *
-    (
-      values.length -
-      1
+  if (!isFacebookMarketplaceListingPage()) {
+    console.log(
+      "[AUTO MESSAGE] Aborted: not on a Marketplace listing page.",
+      window.location.href
     );
 
-
-  const lower =
-    Math.floor(
-      position
-    );
-
-  const upper =
-    Math.ceil(
-      position
-    );
-
-  const weight =
-    position -
-    lower;
-
-
-  const value =
-    values[lower] *
-      (1 - weight) +
-    values[upper] *
-      weight;
-
-
-  return Number(
-    value.toFixed(2)
-  );
-}
-
-
-function coefficientOfVariation(
-  numbers
-) {
-  const avg =
-    mean(numbers);
-
-  const std =
-    standardDeviation(
-      numbers
-    );
-
-
-  if (
-    avg == null ||
-    std == null ||
-    avg === 0
-  ) {
-    return null;
-  }
-
-
-  return Number(
-    (
-      std /
-      avg
-    ).toFixed(6)
-  );
-}
-
-
-function medianOfCheapestFraction(
-  numbers,
-  fraction
-) {
-  const sorted =
-    numbers
-      .map(Number)
-      .filter(
-        Number.isFinite
-      )
-      .sort(
-        (a, b) =>
-          a - b
-      );
-
-
-  if (!sorted.length) {
-    return null;
-  }
-
-
-  const count =
-    Math.max(
-      1,
-
-      Math.ceil(
-        sorted.length *
-        fraction
-      )
-    );
-
-
-  return median(
-    sorted.slice(
-      0,
-      count
-    )
-  );
-}
-
-function calculatePriceFeatures(
-  listings
-) {
-  const prices =
-    listings
-      .map(
-        listing =>
-          Number(
-            listing.price
-          )
-      )
-      .filter(
-        price =>
-          Number.isFinite(
-            price
-          ) &&
-          price > 0
-      );
-
-
-  if (!prices.length) {
     return {
-      count: 0
+      sent: false,
+      reason:
+        "Not on a Marketplace listing page."
     };
   }
 
-
-  const p25 =
-    percentile(
-      prices,
-      25
+  if (!isHitRecommendation(result)) {
+    console.log(
+      "[AUTO MESSAGE] Aborted: final result is not a hit.",
+      result?.recommendation
     );
 
-  const p75 =
-    percentile(
-      prices,
-      75
+    return {
+      sent: false,
+      reason: "Final result is not a hit."
+    };
+  }
+
+  const listingId =
+    getFacebookMarketplaceItemId();
+
+  const messagedIds =
+    await getMessagedMarketplaceListingIds();
+
+  if (
+    listingId &&
+    messagedIds.includes(listingId)
+  ) {
+    console.log(
+      "[AUTO MESSAGE] Aborted: listing is already marked as messaged.",
+      listingId
     );
 
-
-  return {
-    count:
-      prices.length,
-
-    mean:
-      mean(prices),
-
-    median:
-      median(prices),
-
-    p10:
-      percentile(
-        prices,
-        10
-      ),
-
-    p20:
-      percentile(
-        prices,
-        20
-      ),
-
-    p25,
-
-    p30:
-      percentile(
-        prices,
-        30
-      ),
-
-    p40:
-      percentile(
-        prices,
-        40
-      ),
-
-    p75,
-
-    p90:
-      percentile(
-        prices,
-        90
-      ),
-
-    stdDev:
-      standardDeviation(
-        prices
-      ),
-
-    cv:
-      coefficientOfVariation(
-        prices
-      ),
-
-    iqr:
-      (
-        p25 != null &&
-        p75 != null
-      )
-        ? Number(
-            (
-              p75 -
-              p25
-            ).toFixed(2)
-          )
-        : null,
-
-    low:
-      Math.min(
-        ...prices
-      ),
-
-    high:
-      Math.max(
-        ...prices
-      ),
-
-    cheapest20Median:
-      medianOfCheapestFraction(
-        prices,
-        0.20
-      ),
-
-    cheapest30Median:
-      medianOfCheapestFraction(
-        prices,
-        0.30
-      )
-  };
-}
-
-async function saveEbayTrainingData({
-  analysisRunId,
-
-  target,
-
-  soldValidListings,
-
-  soldMedian,
-  soldStdDev,
-  expectedSalePrice,
-
-  activeSearch,
-  validActiveListings
-}) {
-  const activeFeatures =
-    calculatePriceFeatures(
-      validActiveListings
-    );
-
-
-  const soldFeatures =
-    calculatePriceFeatures(
-      soldValidListings
-    );
-
-
-  const activeMedian =
-    activeFeatures
-      .median;
-
-
-  const soldToActiveMedianRatio =
-    (
-      expectedSalePrice != null &&
-      activeMedian != null &&
-      activeMedian > 0
-    )
-      ? Number(
-          (
-            Number(
-              expectedSalePrice
-            ) /
-            activeMedian
-          ).toFixed(6)
-        )
-      : null;
+        return {
+      sent: false,
+      reason: "Already messaged."
+    };
+  }
 
 
   /*
-    This doesn't discard weak observations.
-    It merely marks which records have a strong
-    enough sold-side target to eventually train on.
+    Generate a slightly tailored message for this hit.
+
+    If AI generation fails for any reason, keep using
+    the original generic message so auto mode continues.
   */
-  const trainingEligible =
-    (
-      soldValidListings
-        .length >= 7 &&
-      expectedSalePrice != null &&
-      validActiveListings
-        .length >= 5
-    );
-
-
-  const canonicalName =
-    getCanonicalNameForItem(
-      target
-    );
-
-
-  const {
-    error
-  } =
-    await supabaseAdmin
-      .from(
-        "ebay_active_training_data"
-      )
-      .insert({
-        analysis_run_id:
-          analysisRunId ||
-          null,
-
-        canonical_name:
-          canonicalName ||
-          null,
-
-        ebay_search_query:
-          String(
-            target
-              ?.ebaySearchQuery ||
-            ""
-          ).trim(),
-
-        condition:
-          String(
-            target
-              ?.condition ||
-            ""
-          ).trim(),
-
-        product_type:
-          String(
-            target
-              ?.productType ||
-            ""
-          ).trim(),
-
-        brand:
-          String(
-            target
-              ?.brand ||
-            ""
-          ).trim(),
-
-        model:
-          String(
-            target
-              ?.model ||
-            ""
-          ).trim(),
-
-        negative_search_terms:
-          normalizeTrainingNegativeTerms(
-            target
-              ?.negativeSearchTerms
-          ),
-
-
-        /*
-          SOLD
-        */
-        sold_valid_count:
-          soldValidListings
-            .length,
-
-        sold_median:
-          soldMedian,
-
-        sold_mean:
-          soldFeatures.mean,
-
-        sold_std_dev:
-          soldStdDev,
-
-        sold_cv:
-          soldFeatures.cv,
-
-        sold_p25:
-          soldFeatures.p25,
-
-        sold_p75:
-          soldFeatures.p75,
-
-        sold_low:
-          soldFeatures.low,
-
-        sold_high:
-          soldFeatures.high,
-
-        expected_sale_price:
-          expectedSalePrice,
-
-
-        /*
-          ACTIVE
-        */
-        active_raw_count:
-          activeSearch
-            .rawCount,
-
-        active_valid_count:
-          validActiveListings
-            .length,
-
-        active_mean:
-          activeFeatures.mean,
-
-        active_median:
-          activeFeatures.median,
-
-        active_p10:
-          activeFeatures.p10,
-
-        active_p20:
-          activeFeatures.p20,
-
-        active_p25:
-          activeFeatures.p25,
-
-        active_p30:
-          activeFeatures.p30,
-
-        active_p40:
-          activeFeatures.p40,
-
-        active_p75:
-          activeFeatures.p75,
-
-        active_p90:
-          activeFeatures.p90,
-
-        active_std_dev:
-          activeFeatures.stdDev,
-
-        active_cv:
-          activeFeatures.cv,
-
-        active_iqr:
-          activeFeatures.iqr,
-
-        active_low:
-          activeFeatures.low,
-
-        active_high:
-          activeFeatures.high,
-
-        active_cheapest_20_median:
-          activeFeatures
-            .cheapest20Median,
-
-        active_cheapest_30_median:
-          activeFeatures
-            .cheapest30Median,
-
-        sold_to_active_median_ratio:
-          soldToActiveMedianRatio,
-
-        training_eligible:
-          trainingEligible,
-
-        active_api_total:
-          activeSearch
-            .apiTotal,
-
-        active_valid_listings:
-          validActiveListings,
-
-        sold_valid_listings:
-          soldValidListings
-      });
-
-
-  if (error) {
-    throw new Error(
-      `Could not save eBay training data: ${
-        error.message ||
-        String(error)
-      }`
-    );
-  }
-
-
-  console.log(
-    "[EBAY TRAINING] Saved:",
-    {
-      canonicalName,
-
-      soldCount:
-        soldValidListings
-          .length,
-
-      soldEstimate:
-        expectedSalePrice,
-
-      activeCount:
-        validActiveListings
-          .length,
-
-      activeMedian:
-        activeFeatures
-          .median,
-
-      ratio:
-        soldToActiveMedianRatio,
-
-      trainingEligible
-    }
-  );
-}
-
-function applyExpectedSalePriceBuffer(medianSoldPrice) {
-  const price = Number(medianSoldPrice);
-
-  if (!price || Number.isNaN(price)) {
-    return null;
-  }
-
-  // 10% safety buffer: treat the item as if it sells for 90% of median.
-  return Number(price.toFixed(2));
-}
-
-class MalformedAiJsonError extends Error {
-  constructor(step, rawText, originalError) {
-    super(`AI returned malformed JSON during: ${step}`);
-
-    this.name = "MalformedAiJsonError";
-    this.code = "MALFORMED_AI_JSON";
-    this.step = step;
-    this.rawText = String(rawText || "").slice(0, 4000);
-    this.originalError = originalError?.message || "";
-  }
-}
-
-function extractJsonObject(text, step = "AI JSON parsing") {
-  const cleaned = String(text || "")
-    .replace(/```json/gi, "")
-    .replace(/```/g, "")
-    .trim();
-
-  const firstBrace = cleaned.indexOf("{");
-  const lastBrace = cleaned.lastIndexOf("}");
-
-  if (
-    firstBrace === -1 ||
-    lastBrace === -1 ||
-    lastBrace <= firstBrace
-  ) {
-    throw new MalformedAiJsonError(
-      step,
-      text,
-      new Error("No complete JSON object found.")
-    );
-  }
-
-  const jsonText = cleaned.slice(firstBrace, lastBrace + 1);
+  let messageToSend =
+    MARKETPLACE_HIT_MESSAGE;
 
   try {
-    return JSON.parse(jsonText);
+    messageToSend =
+      await generateTailoredMarketplaceHitMessage();
+      
+    console.log(
+      "[AUTO MESSAGE] AI-tailored message:",
+      messageToSend
+    );
   } catch (error) {
-    throw new MalformedAiJsonError(
-      step,
-      text,
+    console.warn(
+      "[AUTO MESSAGE] Tailored-message generation failed. Falling back to generic message.",
       error
     );
-  }
-}
 
-async function runAiJsonStep({
-  step,
-  maxAttempts = 3,
-  runRequest
-}) {
-  let lastRawText = "";
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const response = await runRequest(attempt);
-
-      const rawText = String(response?.output_text || "").trim();
-      lastRawText = rawText;
-
-      console.log(
-        `[AI JSON] ${step} attempt ${attempt}/${maxAttempts}`
-      );
-      console.log(rawText);
-
- return extractJsonObject(rawText, step);
-    } catch (error) {
-      lastError = error;
-
-      console.error(
-        `[AI JSON] ${step} attempt ${attempt}/${maxAttempts} failed:`,
-        error.message
-      );
-
-      if (attempt < maxAttempts) {
-        await new Promise(resolve => setTimeout(resolve, 750 * attempt));
-      }
-    }
+    messageToSend =
+      MARKETPLACE_HIT_MESSAGE;
   }
 
-  throw new MalformedAiJsonError(
-    step,
-    lastRawText,
-    lastError
+
+  let input = null;
+
+/*
+  Facebook sometimes does not render the inline seller
+  textarea until the message section is scrolled into view
+  or a Message button is clicked.
+*/
+for (let attempt = 1; attempt <= 4; attempt += 1) {
+  console.log(
+    `[AUTO MESSAGE] Looking for message input, attempt ${attempt}/4.`
   );
+
+  input = findMarketplaceSellerMessageInput();
+
+  if (input) {
+    break;
+  }
+
+  /*
+    Try to open a collapsed seller-message composer.
+  */
+  const messageButton = Array.from(
+    document.querySelectorAll(
+      'button, [role="button"]'
+    )
+  ).find(element => {
+    if (!isVisibleMarketplaceElement(element)) {
+      return false;
+    }
+
+    const text = String(
+      element.innerText ||
+      element.textContent ||
+      element.getAttribute("aria-label") ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+    return (
+      text === "message" ||
+      text === "message seller" ||
+      text.includes("send seller a message")
+    );
+  });
+
+  if (messageButton) {
+    console.log(
+      "[AUTO MESSAGE] Clicking Message button to reveal composer."
+    );
+
+    messageButton.click();
+    await sleep(1200);
+  }
+
+  /*
+    Move through the listing details panel so lazy-loaded
+    message controls have an opportunity to render.
+  */
+  window.scrollBy({
+    top: Math.round(window.innerHeight * 0.65),
+    behavior: "smooth"
+  });
+
+  await sleep(1500);
+
+  /*
+    Also accept a matching textarea that exists in the DOM
+    even if Facebook currently reports a zero-size rectangle.
+  */
+  input =
+    findMarketplaceSellerMessageInput() ||
+    document.querySelector(
+      'textarea[data-interactable*="keyup"]'
+    ) ||
+    Array.from(
+      document.querySelectorAll("textarea")
+    ).find(element => {
+      const value = String(
+        element.value ||
+        element.textContent ||
+        ""
+      ).toLowerCase();
+
+      return value.includes(
+        "is this available"
+      );
+    }) ||
+    null;
+
+  if (input) {
+    break;
+  }
+
+  await sleep(1000);
 }
 
-async function aiCleanComps({
-  target,
-  comps,
-  compMode = "sold"
-}) {
+if (!input) {
+  console.warn(
+    "[AUTO MESSAGE] Could not find seller message input after opening and scrolling.",
+    {
+      textareaCount:
+        document.querySelectorAll(
+          "textarea"
+        ).length,
 
-  const isActive =
-  compMode ===
-  "active";
+      interactableTextareaCount:
+        document.querySelectorAll(
+          'textarea[data-interactable]'
+        ).length,
 
-const compLabel =
-  isActive
-    ? "active listings"
-    : "sold listings";
+      visibleButtons: Array.from(
+        document.querySelectorAll(
+          'button, [role="button"]'
+        )
+      )
+        .filter(
+          isVisibleMarketplaceElement
+        )
+        .map(element =>
+          String(
+            element.innerText ||
+            element.textContent ||
+            element.getAttribute(
+              "aria-label"
+            ) ||
+            ""
+          ).trim()
+        )
+        .filter(Boolean)
+        .slice(0, 30)
+    }
+  );
 
-  if (!comps.length) {
+  return {
+    sent: false,
+    reason: "Message input not found."
+  };
+}
+
+input.scrollIntoView({
+  block: "center",
+  inline: "nearest"
+});
+
+await sleep(500);
+
+console.log(
+  "[AUTO MESSAGE] Found seller message input.",
+  input
+);
+
+  console.log(
+    "[AUTO MESSAGE] Found message input.",
+    input
+  );
+
+    setMarketplaceMessageInputValue(
+    input,
+    messageToSend
+  );
+  await sleep(1200);
+
+  const actualValue =
+    input instanceof HTMLInputElement ||
+    input instanceof HTMLTextAreaElement
+      ? input.value
+      : input.textContent;
+
+  console.log(
+    "[AUTO MESSAGE] Input value after insertion:",
+    actualValue
+  );
+
+   if (
+    String(actualValue || "").trim() !==
+    messageToSend.trim()
+  ) {
+    console.warn(
+      "[AUTO MESSAGE] Facebook did not retain the intended message.",
+      {
+        expected: messageToSend,
+        actual: actualValue
+      }
+    );
+
     return {
-      validIndexes: [],
-      invalidComps: []
+      sent: false,
+      reason:
+        "Facebook did not retain the inserted message."
     };
   }
 
-const compListText =
-  comps
-    .map(
-      (
-        comp,
-        index
-      ) => {
-        return (
-          `${index + 1}. ` +
-          `${comp.title} | ` +
-          `$${comp.price}`
-        );
-      }
-    )
-    .join("\n");
+  const sendButton =
+    await waitForMarketplaceElement(
+      () =>
+        findMarketplaceSellerSendButton(
+          input
+        ),
+      8000
+    );
 
-let parsed = await runAiJsonStep({
-  step: "eBay comp cleanup",
-  maxAttempts: 3,
+  if (!sendButton) {
+    console.warn(
+      "[AUTO MESSAGE] Could not find Send button."
+    );
 
-  runRequest: async attempt => {
-    return createLoggedOpenAiResponse({
-  step:
-    `eBay comp cleanup attempt ${attempt}`,
-
-  request: {
-    model: "gpt-4.1-mini",
-    input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-text: `
-You are cleaning eBay ${compLabel} for a reseller.
-
-Target product:
-Brand: ${target.brand || ""}
-Model: ${target.model || ""}
-Product type: ${target.productType || ""}
-Condition: already filtered by eBay search; ignore condition during cleanup.
-Search query: ${target.ebaySearchQuery || ""}
-
-Candidate ${compLabel}:
-${compListText}
-
-Return ONLY raw JSON:
-{
-  "validIndexes": [1, 2, 3],
-  "relatedWrongComps": [
-    {
-      "index": 4,
-      "wrongModelName": "Nikon AF-P 18-55mm",
-      "suggestedNegativeTerms": ["AF-P"]
-    }
-  ],
-  "searchPollution": {
-    "relatedWrongModelCount": 0,
-    "negativeSearchTerms": [],
-    "reason": ""
+    return {
+      sent: false,
+      reason: "Send button not found."
+    };
   }
-}
 
-Do not return an entry for ordinary invalid listings.
-
-Only include a listing in relatedWrongComps when it is a closely
-related but commercially different model that could pollute the search.
-
-Accessories, hoods, caps, manuals, boxes, adapters, unrelated products,
-damaged listings, parts-only listings, bundles with the wrong product
-type, and other ordinary invalid comps should simply be omitted from
-both validIndexes and relatedWrongComps.
-
-Comp matching rules:
-
-- validIndexes must contain only listings for the same commercially distinct product as the target.
-- A listing with a genuinely different model, generation, mount, focal length, aperture, or separately sold variant is invalid.
-- Minor title formatting differences do not make a listing invalid.
-- Missing words in either the target or candidate title do not automatically prove that they are different products.
-- Do not assume that an omitted qualifier means the opposite qualifier.
-- Count a candidate as a related wrong model only when it is a different but closely related product that is polluting the target search.
-- Accessories, hoods, caps, manuals, boxes, adapters, and unrelated products are invalid, but they do not count as related wrong models.
-- Damaged or parts-only listings do not count as related wrong models.
-- Listings whose title says "like in box", "LIKE IN BOX", "LIB", or similar wording (e.g. "like new in box") are invalid and must be omitted from validIndexes. They do not count as related wrong models.
-- relatedWrongModelCount must count only closely related but commercially different models.
-- validExactModelCount must equal the number of listings retained in validIndexes.
-
-Search-pollution rules:
-
-- The minimum required valid-comp count is 7.
-- The minimum related-wrong-model count required for pollution is 8.
-- A search can only be marked polluted when validExactModelCount is below 7.
-- If validExactModelCount is 7 or greater:
-  - pollutedByRelatedModels must be false.
-  - rerunRecommended must be false.
-  - negativeSearchTerms must be [].
-  - The search must not be rerun merely because wrong listings also appeared.
-- If validExactModelCount is below 7, count the related wrong-model listings.
-- Only when validExactModelCount is below 7 and relatedWrongModelCount is at least 8:
-  - pollutedByRelatedModels may be true.
-  - rerunRecommended may be true.
-  - negativeSearchTerms should contain safe exclusions for the dominant wrong related models.
-- If validExactModelCount is below 7 but relatedWrongModelCount is below 8:
-  - pollutedByRelatedModels must be false.
-  - rerunRecommended must be false.
-  - negativeSearchTerms must be [].
-- Never recommend a negative term that may be part of the target product.
-- Never recommend a negative term solely because it is absent from an incomplete target name.
-- If the target identity may be incomplete or ambiguous, do not recommend potentially destructive negative terms.
-
-This is JSON generation attempt ${attempt} of 3.
-Return exactly one complete valid JSON object.
-Do not use Markdown or code fences.
-`.trim()
-            }
-          ]
-        }
-      ]
-  }
-    });
-  }
-});
-
-const validIndexes = Array.isArray(
-  parsed.validIndexes
-)
-  ? parsed.validIndexes
-      .map(Number)
-      .filter(Number.isFinite)
-  : [];
-
-const relatedWrongComps = Array.isArray(
-  parsed.relatedWrongComps
-)
-  ? parsed.relatedWrongComps
-  : [];
-
-const rawSearchPollution =
-  parsed.searchPollution &&
-  typeof parsed.searchPollution === "object"
-    ? parsed.searchPollution
-    : {};
-
-const MINIMUM_VALID_COMPS = 7;
-const MINIMUM_RELATED_WRONG_MODEL_COMPS = 8;
-
-/*
-  validExactModelCount must come from the actual
-  retained comp indexes, not an AI-estimated count.
-*/
-const validExactModelCount =
-  validIndexes.length;
-
-/*
-  Prefer the AI's related-model count because
-  relatedWrongComps may also contain accessories,
-  damaged listings, and unrelated products.
-*/
-const relatedWrongModelCount =
-  Math.max(
-    0,
-    Number(
-      rawSearchPollution.relatedWrongModelCount ||
-      0
-    )
+  console.log(
+    "[AUTO MESSAGE] Found Send button.",
+    sendButton
   );
 
-const belowMinimumCompThreshold =
-  validExactModelCount <
-  MINIMUM_VALID_COMPS;
+  const ariaDisabled =
+    sendButton.getAttribute(
+      "aria-disabled"
+    ) === "true";
 
-const enoughRelatedWrongModels =
-  relatedWrongModelCount >=
-  MINIMUM_RELATED_WRONG_MODEL_COMPS;
+  if (
+    sendButton.disabled ||
+    ariaDisabled
+  ) {
+    console.warn(
+      "[AUTO MESSAGE] Send button is disabled.",
+      {
+        disabled:
+          Boolean(sendButton.disabled),
+        ariaDisabled
+      }
+    );
 
-const pollutedByRelatedModels =
-  belowMinimumCompThreshold &&
-  enoughRelatedWrongModels;
+    return {
+      sent: false,
+      reason: "Send button disabled."
+    };
+  }
 
-const safeNegativeSearchTerms =
-  pollutedByRelatedModels &&
-  Array.isArray(
-    rawSearchPollution.negativeSearchTerms
-  )
-    ? rawSearchPollution.negativeSearchTerms
-    : [];
+  sendButton.scrollIntoView({
+    block: "center",
+    inline: "nearest"
+  });
+
+  sendButton.focus();
+
+  sendButton.dispatchEvent(
+    new MouseEvent("mousedown", {
+      bubbles: true,
+      cancelable: true,
+      view: window
+    })
+  );
+
+  sendButton.dispatchEvent(
+    new MouseEvent("mouseup", {
+      bubbles: true,
+      cancelable: true,
+      view: window
+    })
+  );
+
+  sendButton.click();
+
+console.log(
+  "[AUTO MESSAGE] Send button clicked. Waiting for Facebook confirmation...",
+  listingId
+);
+
+const sendConfirmed =
+  await waitForMarketplaceMessageSendConfirmation({
+    input,
+    sentMessage:
+      messageToSend,
+    timeoutMs:
+      7000
+  });
+
+if (!sendConfirmed) {
+  console.warn(
+    "[AUTO MESSAGE] Send click was not confirmed. Listing will remain eligible for retry.",
+    {
+      listingId,
+      remainingInputValue:
+        getMarketplaceMessageInputText(
+          input
+        )
+    }
+  );
+
+  return {
+    sent: false,
+    reason:
+      "Facebook did not confirm the message send.",
+    listingId
+  };
+}
+
+/*
+  ONLY record the listing after Facebook's
+  composer reacted to the Send action.
+*/
+if (listingId) {
+  await markMarketplaceListingMessaged(
+    listingId
+  );
+}
+
+console.log(
+  "[AUTO MESSAGE] Seller message confirmed:",
+  listingId
+);
 
 return {
-  validIndexes,
-  invalidComps: relatedWrongComps,
-
-  searchPollution: {
-    pollutedByRelatedModels,
-
-    validExactModelCount,
-    relatedWrongModelCount,
-
-    rerunRecommended:
-      pollutedByRelatedModels &&
-      safeNegativeSearchTerms.length > 0,
-
-    negativeSearchTerms:
-      safeNegativeSearchTerms,
-
-    reason:
-      pollutedByRelatedModels
-        ? String(
-            rawSearchPollution.reason ||
-            `Only ${validExactModelCount} valid comps were found, below the minimum of ${MINIMUM_VALID_COMPS}, while ${relatedWrongModelCount} related wrong-model comps were found.`
-          )
-        : validExactModelCount >=
-            MINIMUM_VALID_COMPS
-          ? `Search retained ${validExactModelCount} valid comps, meeting the minimum of ${MINIMUM_VALID_COMPS}; pollution rerun is not permitted.`
-          : `Search retained only ${validExactModelCount} valid comps, but found fewer than ${MINIMUM_RELATED_WRONG_MODEL_COMPS} related wrong-model comps, so it is not classified as polluted.`,
-
-    belowMinimumCompThreshold,
-    enoughRelatedWrongModels,
-
-    minimumValidComps:
-      MINIMUM_VALID_COMPS,
-
-    minimumRelatedWrongModelComps:
-      MINIMUM_RELATED_WRONG_MODEL_COMPS
-  }
+  sent: true,
+  listingId
 };
 }
 
-function makeDealDecision({
-  expectedSalePrice,
-  facebookPrice,
-  validCompCount,
-  valuationLabel =
-    "comp-based resale estimate"
-}) {
-  if (
-    !expectedSalePrice ||
-    !facebookPrice ||
-    !validCompCount
-  ) {
-    return {
-      recommendation:
-        "Pass",
+async function queueMarketplaceSellerForVerifiedHit(
+  result
+) {
+  if (!AUTO_MESSAGE_ENABLED) {
+    console.log("[OUTREACH QUEUE] Skipped: AUTO_MESSAGE_ENABLED is false.");
 
+    return { queued: false, reason: "Auto message disabled." };
+  }
+
+  console.log(
+    "[OUTREACH QUEUE] Starting hit queue check.",
+    {
+      pageUrl:
+        window.location.href,
+
+      recommendation:
+        result?.recommendation || ""
+    }
+  );
+
+  /*
+    Only queue actual Marketplace listings.
+  */
+  if (!isFacebookMarketplaceListingPage()) {
+    console.log(
+      "[OUTREACH QUEUE] Aborted: not on Marketplace listing page."
+    );
+
+    return {
+      queued: false,
       reason:
-        "Not enough valid data to calculate a deal."
+        "Not on a Marketplace listing page."
     };
   }
 
-
-  const targetProfit =
-    85;
-
-  const negotiatedPrice15 =
-    Number(
-      (
-        facebookPrice *
-        0.85
-      ).toFixed(
-        2
-      )
+  /*
+    Only Buy Now / Negotiate results
+    should enter the outreach queue.
+  */
+  if (!isHitRecommendation(result)) {
+    console.log(
+      "[OUTREACH QUEUE] Not a hit. Nothing queued.",
+      result?.recommendation
     );
 
-
-  const marginAtAsk =
-    Number(
-      (
-        expectedSalePrice -
-        facebookPrice
-      ).toFixed(
-        2
-      )
-    );
-
-
-  const marginAt15 =
-    Number(
-      (
-        expectedSalePrice -
-        negotiatedPrice15
-      ).toFixed(
-        2
-      )
-    );
-
-
-  if (
-    marginAtAsk >=
-    targetProfit
-  ) {
     return {
-      recommendation:
-        "Buy Now",
-
+      queued: false,
       reason:
-        `Meets target using ${valuationLabel}: ` +
-        `${validCompCount} valid comps and ` +
-        `$${marginAtAsk} spread at asking price.`
+        "Final result is not a hit."
     };
   }
 
+  const listingUrl =
+    String(
+      window.location.href || ""
+    ).split("?")[0];
 
-  if (
-    marginAt15 >=
-    targetProfit
-  ) {
+  const listingId =
+    getFacebookMarketplaceItemId(
+      listingUrl
+    );
+
+  if (!listingId) {
+    console.warn(
+      "[OUTREACH QUEUE] Could not determine listing ID.",
+      listingUrl
+    );
+
     return {
-      recommendation:
-        "Negotiate",
-
+      queued: false,
       reason:
-        `Using ${valuationLabel}, the listing reaches ` +
-        `$${marginAt15} spread at 15% below ask.`
+        "Could not determine Marketplace listing ID."
     };
   }
 
+  /*
+    Get current scanner session.
+  */
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
+    );
 
-  return {
-    recommendation:
-      "Pass",
+  const state =
+    stored[
+      MARKETPLACE_AUTO_STATE_KEY
+    ] || {};
 
-    reason:
-      `Using ${valuationLabel}, this does not meet the $85 spread target.`
-  };
+  const sessionId =
+    String(
+      state.outreachSessionId ||
+      state.sessionLog?.sessionId ||
+      ""
+    ).trim();
+
+  if (!sessionId) {
+    throw new Error(
+      "Marketplace outreach session ID is missing."
+    );
+  }
+
+  /*
+    Generate exactly the same tailored message
+    that the old auto-message system would have sent.
+  */
+  let generatedMessage =
+    MARKETPLACE_HIT_MESSAGE;
+
+  try {
+    generatedMessage =
+      await generateTailoredMarketplaceHitMessage();
+
+    console.log(
+      "[OUTREACH QUEUE] Generated tailored message:",
+      generatedMessage
+    );
+
+  } catch (error) {
+    console.warn(
+      "[OUTREACH QUEUE] Tailored generation failed. Using fallback.",
+      error
+    );
+
+    generatedMessage =
+      MARKETPLACE_HIT_MESSAGE;
+  }
+
+  /*
+    Send the prepared outreach job to the server.
+
+    IMPORTANT:
+    This does NOT touch Facebook's message box.
+    It only stores the work for Extension B.
+  */
+  const response =
+    await fetchLocalServer(
+      "/marketplace-outreach/queue",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            sessionId,
+
+            listingId,
+
+            listingUrl,
+
+            message:
+              generatedMessage,
+
+            recommendation:
+              result?.recommendation || "",
+
+            createdAt:
+              Date.now()
+          })
+      },
+      {
+        timeoutMs: 10000,
+        retries: 1
+      }
+    );
+
+  const data =
+    await readJsonSafely(
+      response
+    );
+
+if (
+  !response.ok ||
+  data?.ok !== true ||
+  data?.error
+) {
+  throw new LocalServerError(
+    data,
+    "Could not save Marketplace hit to outreach queue."
+  );
 }
 
 /*
-  ============================================================
-  EBAY OFFICIAL API — ACTIVE LISTING TRAINING DATA
-  ============================================================
+  Server rejected this as a duplicate.
+
+  Do NOT increment outreachQueued.
 */
+if (
+  data?.duplicate === true ||
+  data?.queued === false
+) {
+  console.log(
+    "[OUTREACH QUEUE] Listing already exists in outreach queue:",
+    {
+      listingId,
+      listingUrl,
+      existingItem:
+        data?.item || null
+    }
+  );
 
-const EBAY_CLIENT_ID =
-  String(
-    process.env.EBAY_CLIENT_ID ||
-    ""
-  ).trim();
+  return {
+    queued: false,
+    duplicate: true,
+    sessionId,
+    listingId,
+    listingUrl,
+    message:
+      generatedMessage
+  };
+}
 
-const EBAY_CLIENT_SECRET =
-  String(
-    process.env.EBAY_CLIENT_SECRET ||
-    ""
-  ).trim();
+console.log(
+  "[OUTREACH QUEUE] Hit queued successfully:",
+  {
+    sessionId,
+    listingId,
+    listingUrl,
+    message:
+      generatedMessage
+  }
+);
 
-
-let ebayApplicationToken = null;
-let ebayApplicationTokenExpiresAt = 0;
-
-
-async function getEbayApplicationToken() {
   /*
-    Re-use the existing token until shortly before
-    expiration instead of requesting one for every search.
+    Increment scanner-session queue count.
   */
-  if (
-    ebayApplicationToken &&
-    Date.now() <
-      ebayApplicationTokenExpiresAt -
-        60 * 1000
-  ) {
-    return ebayApplicationToken;
-  }
-
-
-  if (
-    !EBAY_CLIENT_ID ||
-    !EBAY_CLIENT_SECRET
-  ) {
-    throw new Error(
-      "Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET."
+  const latestStored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
     );
+
+  const latestState =
+    latestStored[
+      MARKETPLACE_AUTO_STATE_KEY
+    ];
+
+  if (latestState?.running) {
+    const currentLog =
+      latestState.sessionLog || {};
+
+    await updateMarketplaceSessionLog({
+      outreachQueued:
+        Number(
+          currentLog.outreachQueued || 0
+        ) + 1
+    });
   }
 
+  return {
+    queued: true,
 
-  const basicAuth =
-    Buffer
-      .from(
-        `${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`
+    sessionId,
+
+    listingId,
+
+    listingUrl,
+
+    message:
+      generatedMessage
+  };
+}
+
+
+
+function getFacebookMarketplaceItemId(url = window.location.href) {
+  const text = String(url || "");
+
+  try {
+    const parsed = new URL(text, window.location.origin);
+    const match = parsed.pathname.match(/\/marketplace\/item\/(\d+)/);
+    return match ? match[1] : "";
+  } catch (error) {
+    const match = text.match(/\/marketplace\/item\/(\d+)/);
+    return match ? match[1] : "";
+  }
+}
+
+async function getProcessedMarketplaceListingIds(
+  candidateListingIds = []
+) {
+  const listingIds = [
+    ...new Set(
+      (
+        Array.isArray(candidateListingIds)
+          ? candidateListingIds
+          : []
       )
-      .toString("base64");
+        .map(value =>
+          String(value || "").trim()
+        )
+        .filter(Boolean)
+    )
+  ];
 
+  if (!listingIds.length) {
+    return [];
+  }
 
   const response =
-    await fetch(
-      "https://api.ebay.com/identity/v1/oauth2/token",
+    await fetchLocalServer(
+      "/processed-marketplace-listings/check",
       {
         method:
           "POST",
 
         headers: {
-          Authorization:
-            `Basic ${basicAuth}`,
-
           "Content-Type":
-            "application/x-www-form-urlencoded"
+            "application/json"
         },
 
         body:
-          new URLSearchParams({
-            grant_type:
-              "client_credentials",
-
-            scope:
-              "https://api.ebay.com/oauth/api_scope"
+          JSON.stringify({
+            listingIds
           })
       }
     );
 
-
   const data =
-    await response.json();
-
+    await readJsonSafely(
+      response
+    );
 
   if (
     !response.ok ||
-    !data?.access_token
+    data.error
   ) {
-    throw new Error(
-      `Could not get eBay application token: ${
-        JSON.stringify(data)
-      }`
+    throw new LocalServerError(
+      data,
+      "Could not check processed Marketplace listings."
     );
   }
 
-
-  ebayApplicationToken =
-    data.access_token;
-
-  ebayApplicationTokenExpiresAt =
-    Date.now() +
-    Number(
-      data.expires_in || 7200
-    ) * 1000;
-
-
-  return ebayApplicationToken;
-}
-
-function normalizeConditionForEbayApi(
-  condition
-) {
-  const c =
-    String(
-      condition || ""
-    ).toLowerCase();
-
-
-  if (
-    c.includes(
-      "open box"
-    )
-  ) {
-    return "1500";
-  }
-
-
-  if (
-    c.includes(
-      "new"
-    )
-  ) {
-    return "1000";
-  }
-
-
-  if (
-    c.includes("parts") ||
-    c.includes("repair")
-  ) {
-    return "7000";
-  }
-
-
-  if (
-    c.includes(
-      "used"
-    )
-  ) {
-    return "3000";
-  }
-
-
-  return "3000";
-}
-
-function normalizeTrainingNegativeTerms(
-  terms
-) {
-  if (
-    !Array.isArray(
-      terms
-    )
-  ) {
-    return [];
-  }
-
-
-  return [
-    ...new Set(
-      terms
-        .map(term =>
-          String(
-            term || ""
-          ).trim()
-        )
-        .filter(Boolean)
-    )
-  ];
-}
-
-
-function buildEbayApiTrainingQuery(
-  query,
-  negativeSearchTerms = []
-) {
-  const cleanQuery =
-    String(
-      query || ""
-    ).trim();
-
-
-  const negatives =
-    normalizeTrainingNegativeTerms(
-      negativeSearchTerms
-    )
-      .map(term => {
-        /*
-          Same basic syntax as your browser search.
-        */
-        if (
-          /\s/.test(term)
-        ) {
-          return `-"${term.replaceAll(
-            '"',
-            ""
-          )}"`;
-        }
-
-        return `-${term}`;
-      });
-
-
-  return [
-    cleanQuery,
-    ...negatives
-  ]
-    .filter(Boolean)
-    .join(" ");
-}
-
-async function searchEbayActiveListings({
-  query,
-  condition,
-  negativeSearchTerms = []
-}) {
-  const token =
-    await getEbayApplicationToken();
-
-
-const finalQuery =
-  buildEbayApiTrainingQuery(
-    query,
-    negativeSearchTerms
-  );
-
-
-  const conditionId =
-    normalizeConditionForEbayApi(
-      condition
-    );
-
-
-  const params =
-    new URLSearchParams();
-
-  params.set(
-    "q",
-    finalQuery
-  );
-
-  /*
-    Pull a fairly large sample.
-
-    One search call can return many listings, so there
-    is no reason to train on only 10 results.
-  */
-  params.set(
-    "limit",
-    "100"
-  );
-
-  params.set(
-    "filter",
-    `conditionIds:{${conditionId}}`
-  );
-
-
-  const url =
-    "https://api.ebay.com/buy/browse/v1/item_summary/search?" +
-    params.toString();
-
-
-  console.log(
-    "[EBAY ACTIVE TRAINING] Searching:",
-    {
-      query,
-      finalQuery,
-      condition,
-      conditionId
-    }
-  );
-
-
-  const response =
-    await fetch(
-      url,
-      {
-        headers: {
-          Authorization:
-            `Bearer ${token}`,
-
-          "X-EBAY-C-MARKETPLACE-ID":
-            "EBAY_US"
-        }
-      }
-    );
-
-
-  const data =
-    await response.json();
-
-
-  if (!response.ok) {
-    throw new Error(
-      `eBay Browse API failed ${response.status}: ${
-        JSON.stringify(data)
-      }`
-    );
-  }
-
-
-  const rawItems =
-    Array.isArray(
-      data.itemSummaries
-    )
-      ? data.itemSummaries
-      : [];
-
-
-  const listings =
-    rawItems
-      .map(item => {
-        const price =
-          Number(
-            item?.price?.value
-          );
-
-
-        return {
-          title:
-            String(
-              item?.title ||
-              ""
-            ).trim(),
-
-          price:
-            Number.isFinite(price)
-              ? price
-              : null,
-
-          currency:
-            item?.price?.currency ||
-            "USD",
-
-          condition:
-            item?.condition ||
-            "",
-
-          conditionId:
-            item?.conditionId ||
-            "",
-
-          itemId:
-            item?.itemId ||
-            "",
-
-          url:
-            item?.itemWebUrl ||
-            "",
-
-          buyingOptions:
-            Array.isArray(
-              item?.buyingOptions
-            )
-              ? item.buyingOptions
-              : [],
-
-          seller:
-            item?.seller ||
-            null,
-
-          itemEndDate:
-            item?.itemEndDate ||
-            null
-        };
-      })
-      /*
-        A live auction's current bid is NOT equivalent
-        to an asking/listed price.
-
-        Keep fixed-price and Best Offer inventory.
-      */
-      .filter(item => {
-        const options =
-          new Set(
-            item.buyingOptions
-          );
-
-
-        return (
-          options.has(
-            "FIXED_PRICE"
-          ) ||
-          options.has(
-            "BEST_OFFER"
-          )
-        );
-      })
-      .filter(item =>
-        Number.isFinite(
-          item.price
-        ) &&
-        item.price > 0
-      );
-
-
-  console.log(
-    "[EBAY ACTIVE TRAINING] Results:",
-    {
-      apiTotal:
-        Number(
-          data.total || 0
-        ),
-
-      returned:
-        rawItems.length,
-
-      usablePriceListings:
-        listings.length
-    }
-  );
-
-
-  return {
-    query:
-      finalQuery,
-
-    apiTotal:
-      Number(
-        data.total || 0
-      ),
-
-    rawCount:
-      rawItems.length,
-
-    listings
-  };
-}
-
-/*
-  ============================================================
-  Extracted from the /evaluate-active-comps route so that
-  server-side callers (e.g. the Lensfun multi-candidate resale
-  consensus resolver) can run the exact same eBay active-comp
-  evaluation without an HTTP round trip back into this same
-  process.
-
-  Returns the same plain result object that the route used to
-  send via res.json(...). Throws on unexpected failure; the
-  route below is responsible for turning that into an HTTP
-  error response.
-  ============================================================
-*/
-async function evaluateActiveCompsForTarget(
-  target
-) {
-      /*
-        Same hard identity gate as sold comps.
-      */
-      if (
-        !hasEnoughIdentityForEbaySearch(
-          target
-        )
-      ) {
-        return ({
-          ok:
-            true,
-
-          skipped:
-            true,
-
-          source:
-            "active-p15",
-
-          expectedSalePrice:
-            null,
-
-          activeP15:
-            null,
-
-          validActiveCount:
-            0,
-
-          validSoldCount:
-            0,
-
-          medianSoldPrice:
-            null,
-
-          reason:
-            "Product was not identified specifically enough for an eBay search."
-        });
-      }
-
-
-      const facebookPrice =
-        target.facebookPrice;
-
-
-      /*
-        Start with any existing exclusions.
-      */
-      let negativeSearchTerms =
-        normalizeTrainingNegativeTerms(
-          target
-            .negativeSearchTerms ||
-          []
-        );
-
-
-      let activeSearch =
-        null;
-
-      let activeCleanup =
-        null;
-
-      let validActiveListings =
-        [];
-
-
-      /*
-        Maximum two attempts:
-          1. normal query
-          2. pollution-cleaned query
-      */
-      for (
-        let attempt = 0;
-        attempt < 2;
-        attempt += 1
-      ) {
-        activeSearch =
-          await searchEbayActiveListings({
-            query:
-              target
-                .ebaySearchQuery,
-
-            condition:
-              target.condition,
-
-            negativeSearchTerms
-          });
-
-
-        activeCleanup =
-          await aiCleanComps({
-            target,
-
-            comps:
-              activeSearch
-                .listings,
-
-            compMode:
-              "active"
-          });
-
-
-        const validIndexes =
-          Array.isArray(
-            activeCleanup
-              ?.validIndexes
-          )
-            ? activeCleanup
-                .validIndexes
-            : [];
-
-
-        validActiveListings =
-          validIndexes
-            .map(Number)
-            .map(
-              index =>
-                activeSearch
-                  .listings[
-                    index - 1
-                  ]
-            )
-            .filter(Boolean)
-            .filter(
-              listing =>
-                Number.isFinite(
-                  Number(
-                    listing.price
-                  )
-                ) &&
-                Number(
-                  listing.price
-                ) > 0
-            );
-
-
-        const rerunTerms =
-          Array.isArray(
-            activeCleanup
-              ?.searchPollution
-              ?.negativeSearchTerms
-          )
-            ? activeCleanup
-                .searchPollution
-                .negativeSearchTerms
-            : [];
-
-
-        const shouldRerun =
-          attempt === 0 &&
-          activeCleanup
-            ?.searchPollution
-            ?.rerunRecommended ===
-            true &&
-          rerunTerms.length > 0;
-
-
-        if (
-          !shouldRerun
-        ) {
-          break;
-        }
-
-
-        negativeSearchTerms =
-          normalizeTrainingNegativeTerms([
-            ...negativeSearchTerms,
-            ...rerunTerms
-          ]);
-
-
-        console.log(
-          "[ACTIVE EBAY] Rerunning polluted search with exclusions:",
-          negativeSearchTerms
-        );
-      }
-
-
-      const activePrices =
-        validActiveListings
-          .map(
-            listing =>
-              Number(
-                listing.price
-              )
-          )
-          .filter(
-            price =>
-              Number.isFinite(
-                price
-              ) &&
-              price > 0
-          );
-
-
-      const validActiveCount =
-        activePrices.length;
-
-      const minimumValidActiveListings =
-        7;
-
-
-      /*
-        New production estimator.
-
-        Dataset testing showed approximately
-        9.6% MAPE using direct active-market P15.
-      */
-      const activeP15 =
-        percentile(
-          activePrices,
-          15
-        );
-
-
-      const priceStandardDeviation =
-        standardDeviation(
-          activePrices
-        );
-
-
-      if (
-        validActiveCount <
-          minimumValidActiveListings ||
-        activeP15 == null
-      ) {
-        return ({
-          source:
-            "active-p15",
-
-          targetProduct:
-            `${target.brand || ""} ${target.model || ""} ${target.productType || ""}`
-              .trim(),
-
-          condition:
-            target.condition,
-
-          facebookPrice,
-
-          validActiveCount,
-
-          validSoldCount:
-            0,
-
-          medianSoldPrice:
-            null,
-
-          activeP15,
-
-          expectedSalePrice:
-            null,
-
-          priceStandardDeviation,
-
-          recommendation:
-            "Pass",
-
-          reason:
-            `Only ${validActiveCount} reliable active eBay comp(s) remained after cleanup. Minimum required is ${minimumValidActiveListings}.`,
-
-          validComps:
-            validActiveListings
-              .slice(
-                0,
-                20
-              ),
-
-          searchPollution:
-            activeCleanup
-              ?.searchPollution ||
-            null,
-
-          negativeSearchTerms
-        });
-      }
-
-
-      /*
-        Direct P15.
-
-        No additional multiplier.
-      */
-      const expectedSalePrice =
-        Number(
-          activeP15.toFixed(
-            2
-          )
-        );
-
-
-      const maxBuyPrice =
-        Number(
-          (
-            expectedSalePrice -
-            85
-          ).toFixed(
-            2
-          )
-        );
-
-
-      const negotiatedPrice15 =
-        facebookPrice
-          ? Number(
-              (
-                facebookPrice *
-                0.85
-              ).toFixed(
-                2
-              )
-            )
-          : null;
-
-
-      const decision =
-        makeDealDecision({
-          expectedSalePrice,
-
-          facebookPrice,
-
-          validCompCount:
-            validActiveCount,
-
-          valuationLabel:
-            "active-listing 15th percentile"
-        });
-
-
-      /*
-        PRODUCTION MODE ONLY reaches this endpoint.
-
-        Save/update this newly learned resale value
-        in the global product database.
-      */
-      await saveProductToDatabase({
-        item:
-          target,
-
-        estimatedResalePrice:
-          expectedSalePrice,
-
-        priceStandardDeviation
-      });
-
-
-      return ({
-        source:
-          "active-p15",
-
-        targetProduct:
-          `${target.brand || ""} ${target.model || ""} ${target.productType || ""}`
-            .trim(),
-
-        condition:
-          target.condition,
-
-        facebookPrice,
-
-        validActiveCount,
-
-        /*
-          Compatibility with existing UI/context.
-        */
-        validSoldCount:
-          0,
-
-        medianSoldPrice:
-          null,
-
-        activeP15,
-
-        expectedSalePrice,
-
-        priceStandardDeviation,
-
-        lowPrice:
-          activePrices.length
-            ? Math.min(
-                ...activePrices
-              )
-            : null,
-
-        highPrice:
-          activePrices.length
-            ? Math.max(
-                ...activePrices
-              )
-            : null,
-
-        maxBuyPrice,
-
-        negotiatedPrice15,
-
-        recommendation:
-          decision.recommendation,
-
-        reason:
-          decision.reason,
-
-        validComps:
-          validActiveListings
-            .slice(
-              0,
-              20
-            ),
-
-        searchPollution:
-          activeCleanup
-            ?.searchPollution ||
-          null,
-
-        negativeSearchTerms
-      });
-}
-
-app.post(
-  "/evaluate-active-comps",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const target =
-        req.body?.target ||
-        {};
-
-      const result =
-        await evaluateActiveCompsForTarget(
-          target
-        );
-
-      return res.json(
-        result
-      );
-
-    } catch (error) {
-      console.error(
-        "[ACTIVE EBAY] Evaluation failed:",
-        error
-      );
-
-      return sendServerError(
-        res,
-        error,
-        "Could not evaluate active eBay comps."
-      );
-    }
-  }
-);
-
-app.post("/evaluate-comps", async (req, res) => {
-  try {
-    const {
-      target,
-      listings = []
-    } = req.body;
-
-
-    /*
-      HARD SAFETY CHECK
-
-      Never evaluate or run downstream eBay logic for
-      a product that lacks a specific identity.
-    */
-    if (
-      !hasEnoughIdentityForEbaySearch(
-        target
-      )
-    ) {
-      console.warn(
-        "[EBAY] Skipping insufficiently identified product:",
-        {
-          productId:
-            target?.productId ||
-            null,
-
-          brand:
-            target?.brand ||
-            null,
-
-          model:
-            target?.model ||
-            null,
-
-          productType:
-            target?.productType ||
-            null
-        }
-      );
-
-
-      return res.json({
-        ok:
-          true,
-
-        skipped:
-          true,
-
-        reason:
-          "Product was not identified specifically enough for an eBay search.",
-
-        expectedSalePrice:
-          null,
-
-        estimatedResaleValue:
-          null,
-
-        median:
-          null,
-
-        priceStandardDeviation:
-          null,
-
-        validSoldCount:
-          0,
-
-        searchPollution: {
-          pollutedByRelatedModels:
-            false,
-
-          validExactModelCount:
-            0,
-
-          relatedWrongModelCount:
-            0,
-
-          rerunRecommended:
-            false,
-
-          negativeSearchTerms:
-            [],
-
-          reason:
-            ""
-        }
-      });
-    }
-
-
-    const facebookPrice =
-      target.facebookPrice;
-
-
-    console.log(
-      "Received eBay listings:",
-      listings.length
-    );
-
-    const recentListings = listings
-      .filter(item => isWithinLast90Days(item.soldDate))
-      .slice(0, 60);
-
-    console.log("Listings within last 90 days:", recentListings.length);
-    console.log("Sending all recent listings to AI cleanup. Target:", target.brand, target.model);
-
-const aiCleanup = await aiCleanComps({
-  target,
-  comps: recentListings
-});
-
-const searchPollution = aiCleanup.searchPollution || {
-  pollutedByRelatedModels: false,
-  validExactModelCount: 0,
-  relatedWrongModelCount: 0,
-  rerunRecommended: false,
-  negativeSearchTerms: [],
-  reason: ""
-};
-
-const validIndexes = Array.isArray(aiCleanup.validIndexes)
-  ? aiCleanup.validIndexes
-  : [];
-    const validComps = validIndexes
-      .map(index => Number(index))
-      .map(index => recentListings[index - 1])
-      .filter(Boolean)
-      .filter(comp => comp.price);
-
-  const validSoldCount = validComps.length;
-const minimumRelevantSales90Days = 7;
-
-const medianEligibleComps = validComps.filter(comp => !comp.bestOfferAccepted);
-const medianEligibleCount = medianEligibleComps.length;
-const prices = medianEligibleComps.map(comp => comp.price);
-const medianSoldPrice = median(prices);
-const priceStandardDeviation = standardDeviation(prices);
-const expectedSalePrice = applyExpectedSalePriceBuffer(medianSoldPrice);
-const lowPrice = prices.length ? Math.min(...prices) : null;
-const highPrice = prices.length ? Math.max(...prices) : null;
-    const bestOfferExcludedCount = validComps.length - medianEligibleCount;
-    const removedByAiFilter = recentListings.length - validComps.length;
-
-    /*
-  ============================================================
-  ACTIVE EBAY TRAINING COLLECTION
-
-  Only collect/save the FINAL search variant.
-
-  If the sold search is about to be rerun because of
-  related-model pollution, that rerun will come back through
-  /evaluate-comps again with the improved negative terms.
-  ============================================================
-*/
-
-if (
-  !searchPollution
-    .rerunRecommended
-) {
-  try {
-    const activeSearch =
-      await searchEbayActiveListings({
-        query:
-          target
-            .ebaySearchQuery,
-
-        condition:
-          target
-            .condition,
-
-        negativeSearchTerms:
-          target
-            .negativeSearchTerms ||
-          []
-      });
-
-
-    const activeCleanup =
-      await aiCleanComps({
-        target,
-
-        comps:
-          activeSearch
-            .listings,
-
-        compMode:
-          "active"
-      });
-
-
-    const activeValidIndexes =
-      Array.isArray(
-        activeCleanup
-          .validIndexes
-      )
-        ? activeCleanup
-            .validIndexes
-        : [];
-
-
-    const validActiveListings =
-      activeValidIndexes
-        .map(Number)
-        .map(
-          index =>
-            activeSearch
-              .listings[
-                index - 1
-            ]
-        )
-        .filter(Boolean)
-        .filter(
-          listing =>
-            Number.isFinite(
-              Number(
-                listing.price
-              )
-            )
-        );
-
-
-    await saveEbayTrainingData({
-      analysisRunId:
-        String(
-          req.get(
-            "X-Analysis-Run-Id"
-          ) ||
-          ""
-        ).trim(),
-
-      target,
-
-      soldValidListings:
-        medianEligibleComps,
-
-      soldMedian:
-        medianSoldPrice,
-
-      soldStdDev:
-        priceStandardDeviation,
-
-      expectedSalePrice,
-
-      activeSearch,
-
-      validActiveListings
-    });
-
-
-  } catch (error) {
-    /*
-      TRAINING COLLECTION MUST NEVER BREAK
-      THE REAL SCANNER.
-    */
-    console.error(
-      "[EBAY TRAINING] Collection failed:",
-      error
-    );
-  }
-}
-
-if (validSoldCount < minimumRelevantSales90Days) {
- return res.json({
-  targetProduct: `${target.brand || ""} ${target.model || ""} ${target.productType || ""}`.trim(),
-  condition: target.condition,
-  facebookPrice,
-  validSoldCount,
-  medianEligibleCount,
-  medianSoldPrice,
-  priceStandardDeviation,
-  expectedSalePrice: null,
-  salePriceBufferPercent: 0,
-  lowPrice: prices.length ? Math.min(...prices) : null,
-  highPrice: prices.length ? Math.max(...prices) : null,
-  maxBuyPrice: null,
-  negotiatedPrice15: facebookPrice
-    ? Number((facebookPrice * 0.85).toFixed(2))
-    : null,
-  recommendation: "Pass",
-  reason: `Immediate pass: only ${validSoldCount} relevant sold comp(s) in the last 90 days after AI cleanup. Minimum required is ${minimumRelevantSales90Days}.`,
-    validComps: validComps.slice(0, 20),
-  removedByAiFilter,
-  bestOfferExcludedCount,
-  aiCleanup,
-
-  searchPollution,
-  rerunRecommended: Boolean(searchPollution.rerunRecommended),
-  rerunNegativeSearchTerms: searchPollution.negativeSearchTerms || [],
-  rerunReason: searchPollution.reason || "",
-
-  debugCounts: {
-    scrapedListings: listings.length,
-    recentListings: recentListings.length,
-    sentToAiCleanup: recentListings.length,
-    removedByAiFilter,
-    medianEligibleCount,
-    bestOfferExcludedCount,
-    minimumRelevantSales90Days,
-    priceLow: prices.length ? Math.min(...prices) : null,
-    priceHigh: prices.length ? Math.max(...prices) : null,
-    priceStandardDeviation
-  }
-});
-}
-
-    const maxBuyPrice = expectedSalePrice
-      ? Number((expectedSalePrice - 85).toFixed(2))
-      : null;
-
-    const negotiatedPrice15 = facebookPrice
-      ? Number((facebookPrice * 0.85).toFixed(2))
-      : null;
-
-const decision =
-  makeDealDecision({
-    expectedSalePrice,
-
-    facebookPrice,
-
-    validCompCount:
-      validSoldCount,
-
-    valuationLabel:
-      "median sold price"
-  });
-
-  res.json({
-  targetProduct: `${target.brand || ""} ${target.model || ""} ${target.productType || ""}`.trim(),
-  condition: target.condition,
-  facebookPrice,
-  validSoldCount,
-  medianEligibleCount,
-  medianSoldPrice,
-  priceStandardDeviation,
-  expectedSalePrice,
-  salePriceBufferPercent: 0,
-  lowPrice,
-  highPrice,
-  maxBuyPrice,
-  negotiatedPrice15,
-  recommendation: decision.recommendation,
-  reason: decision.reason,
-    validComps: validComps.slice(0, 20),
-  removedByAiFilter,
-  bestOfferExcludedCount,
-  aiCleanup,
-
-  searchPollution,
-  rerunRecommended: Boolean(searchPollution.rerunRecommended),
-  rerunNegativeSearchTerms: searchPollution.negativeSearchTerms || [],
-  rerunReason: searchPollution.reason || "",
-
-  debugCounts: {
-    scrapedListings: listings.length,
-    recentListings: recentListings.length,
-    sentToAiCleanup: recentListings.length,
-    removedByAiFilter,
-    medianEligibleCount,
-    bestOfferExcludedCount,
-    priceLow: lowPrice,
-    priceHigh: highPrice,
-    priceStandardDeviation
-  }
-});
-    } catch (error) {
-    console.error("Comp evaluation endpoint failed:", error);
-
-    return sendServerError(
-      res,
-      error,
-      "Could not evaluate comps."
-    );
-  }
-});
-
-const MAX_RESALE_TO_ASK_RATIO = 2.5;
-
-/*
-  ============================================================
-  SCAM DETECTION TOGGLE
-  ============================================================
-
-  Set to false to turn scam flagging off entirely. While off,
-  makeLotDecision() never returns recommendation "Scam" /
-  scamFlag true, regardless of the resale-to-ask ratio - a lot
-  that would have been flagged just falls through to the normal
-  Buy Now / Negotiate / Pass evaluation below instead.
-
-  This is the single source of truth for scam flagging: nothing
-  else on the client computes it independently, it only reads
-  recommendation === "Scam" from this endpoint's response - so
-  flipping this one boolean is enough to disable it everywhere
-  (the "Scam Listings" panel, badges, saved-listing library).
-*/
-const SCAM_DETECTION_ENABLED = true;
-
-function makeLotDecision({
-  totalExpectedSalePrice,
-  facebookPrice
-}) {
-  if (!totalExpectedSalePrice || !facebookPrice) {
-    return {
-      recommendation: "Pass",
-      reason:
-        "Not enough reliable lot value to calculate a deal.",
-      scamFlag: false,
-      resaleToAskRatio: null
-    };
-  }
-
-  const resaleToAskRatio = Number(
-    (
-      totalExpectedSalePrice /
-      facebookPrice
-    ).toFixed(2)
-  );
-
-  /*
-    Scam safeguard:
-
-    If the combined estimated resale value of every
-    included item is more than 2x the Facebook asking
-    price, prevent the listing from becoming a hit.
-  */
-  if (
-    SCAM_DETECTION_ENABLED &&
-    totalExpectedSalePrice >
-    facebookPrice * MAX_RESALE_TO_ASK_RATIO
-  ) {
-    return {
-      recommendation: "Scam",
-      reason:
-        `Scam risk: the $${totalExpectedSalePrice.toFixed(2)} ` +
-        `estimated resale value is ${resaleToAskRatio}x the ` +
-        `$${facebookPrice.toFixed(2)} asking price, exceeding ` +
-        `the ${MAX_RESALE_TO_ASK_RATIO}x maximum. ` +
-        `This listing cannot be marked as a hit.`,
-      scamFlag: true,
-      resaleToAskRatio
-    };
-  }
-
-  const targetProfit = 85;
-
-  const negotiatedPrice15 = Number(
-    (facebookPrice * 0.85).toFixed(2)
-  );
-
-  const profitAtAsk = Number(
-    (
-      totalExpectedSalePrice -
-      facebookPrice
-    ).toFixed(2)
-  );
-
-  const profitAt15 = Number(
-    (
-      totalExpectedSalePrice -
-      negotiatedPrice15
-    ).toFixed(2)
-  );
-
-  if (profitAtAsk >= targetProfit) {
-    return {
-      recommendation: "Buy Now",
-      reason:
-        `Using the estimated resale values, the lot clears the ` +
-        `$85 target at asking price with a $${profitAtAsk} ` +
-        `estimated profit.`,
-      scamFlag: false,
-      resaleToAskRatio
-    };
-  }
-
-  if (profitAt15 >= targetProfit) {
-    return {
-      recommendation: "Negotiate",
-      reason:
-        `Using the estimated resale values, the lot does not clear the ` +
-        `$85 target at asking price, but it reaches a ` +
-        `$${profitAt15} estimated profit at 15% below ask.`,
-      scamFlag: false,
-      resaleToAskRatio
-    };
-  }
-
-  return {
-    recommendation: "Pass",
-    reason:
-      `Using the estimated resale values, even buying 15% below asking ` +
-      `price does not clear the $85 target.`,
-    scamFlag: false,
-    resaleToAskRatio
-  };
-}
-
-app.post("/evaluate-lot", async (req, res) => {
-  try {
-    const { context } = req.body;
-
-    const facebookPrice = context.facebookPrice;
-    const negotiatedPrice15 = facebookPrice
-      ? Number((facebookPrice * 0.85).toFixed(2))
-      : null;
-
-    const itemResults = context.results || [];
-
-const items = itemResults.map(entry => {
-  const item = entry.item || {};
-  const result = entry.result || {};
-const median =
-  result.medianSoldPrice;
-
-const expectedSalePrice =
-  result.expectedSalePrice ??
-  null;
-
-const validSoldCount =
-  Number(
-    result.validSoldCount ||
-    0
-  );
-
-const validActiveCount =
-  Number(
-    result.validActiveCount ||
-    0
-  );
-
-const minimumReliableComps =
-  7;
-
-const fromDatabase =
-  result.source ===
-  "database";
-
-const fromActiveP15 =
-  result.source ===
-  "active-p15";
-
-const fromSoldComps =
-  !fromDatabase &&
-  !fromActiveP15;
-
-
-const include =
-  expectedSalePrice != null &&
-  (
-    fromDatabase ||
-
-    (
-      fromActiveP15 &&
-      validActiveCount >=
-        minimumReliableComps
-    ) ||
-
-    (
-      fromSoldComps &&
-      median != null &&
-      validSoldCount >=
-        minimumReliableComps
-    )
-  );
-
-  return {
-    ...item,
-
-validActiveCount,
-
-    result: {
-      ...result,
-      expectedSalePrice,
-      priceStandardDeviation: result.priceStandardDeviation ?? null
-    },
-
-    itemName: `${item.brand || ""} ${item.model || ""} ${item.productType || ""}`
-      .replace(/\s+/g, " ")
-      .trim(),
-
-    condition: item.condition || "",
-    searchQuery: item.ebaySearchQuery || "",
-
-    includedMedian: include ? median : null,
-    includedExpectedSalePrice: include ? expectedSalePrice : null,
-    priceStandardDeviation: result.priceStandardDeviation ?? null,
-
-    validSoldCount,
-  status:
-  include
-    ? fromDatabase
-      ? "Included from database"
-      : fromActiveP15
-        ? "Included from active P15"
-        : "Included from sold comps"
-    : "Excluded",
-
-reason:
-  include
-    ? fromDatabase
-      ? "Included using stored global product resale value."
-      : fromActiveP15
-        ? "Included using the 15th percentile of cleaned active eBay listings."
-        : "Included using valid sold comps."
-    : "Excluded because no reliable resale estimate was available."
-  };
-});
-
-    const totalIncludedMedian = Number(
-      items
-        .filter(item => item.includedMedian != null)
-        .reduce((sum, item) => sum + item.includedMedian, 0)
-        .toFixed(2)
-    );
-
-    const totalExpectedSalePrice = Number(
-      items
-        .filter(item => item.includedExpectedSalePrice != null)
-        .reduce((sum, item) => sum + item.includedExpectedSalePrice, 0)
-        .toFixed(2)
-    );
-
-    const spreadAtAsk = facebookPrice
-      ? Number((totalExpectedSalePrice - facebookPrice).toFixed(2))
-      : null;
-
-    const spreadAt15 = facebookPrice && negotiatedPrice15
-      ? Number((totalExpectedSalePrice - negotiatedPrice15).toFixed(2))
-      : null;
-
-    const maxBuyPrice = totalExpectedSalePrice
-      ? Number((totalExpectedSalePrice - 85).toFixed(2))
-      : null;
-
-    const decision = makeLotDecision({
-      totalExpectedSalePrice,
-      facebookPrice
-    });
-
-    res.json({
-  recommendation: decision.recommendation,
-  reason: decision.reason,
-
-  scamFlag: decision.scamFlag === true,
-
-  resaleToAskRatio:
-    decision.resaleToAskRatio ?? null,
-
-  maxResaleToAskRatio:
-    MAX_RESALE_TO_ASK_RATIO,
-
-  facebookPrice,
-      negotiatedPrice15,
-      totalExpectedSalePrice,
-      profitAtAsk: spreadAtAsk,
-      profitAt15: spreadAt15,
-      maxBuyPrice,
-      items,
-      ignoredItems: context.ignoredItems || []
-    });
-  } catch (error) {
-    console.error("Lot evaluation endpoint failed:", error);
-
-    return sendServerError(
-      res,
-      error,
-      "Final lot evaluation failed."
-    );
-  }
-});
-
-
-app.post(
-  "/generate-marketplace-hit-message",
-  async (
-    req,
-    res
-  ) => {
-    const fallbackMessage =
-      String(
-        req.body?.templateMessage ||
-        "Hi, I’d love to buy this. I’m not local, but I’ll cover the full shipping cost if you're willing."
-      ).trim();
-
-    try {
-      const listingTitle =
-        String(
-          req.body?.listingTitle ||
-          ""
-        ).trim();
-
-      const listingDescription =
-        String(
-          req.body?.listingDescription ||
-          ""
-        ).trim();
-
-        const primaryProducts =
-  Array.isArray(
-    req.body?.primaryProducts
+  return Array.isArray(
+    data.processedListingIds
   )
-    ? req.body.primaryProducts
+    ? data.processedListingIds
     : [];
-
-    const primaryProductsText =
-  primaryProducts
-    .map(product => {
-      const productType =
-        String(
-          product?.productType || ""
-        ).trim();
-
-      /*
-        Camera bodies and other products generally use
-        normal brand/model fields.
-      */
-      const brand =
-        String(
-          product?.brand || ""
-        ).trim();
-
-      const model =
-        String(
-          product?.model || ""
-        ).trim();
-
-      /*
-        Lenses use the structured lensIdentity fields
-        produced by Step 5.
-      */
-      const lensIdentity =
-        product?.lensIdentity &&
-        typeof product.lensIdentity === "object"
-          ? product.lensIdentity
-          : null;
-
-      let productName = "";
-
-      if (
-        productType
-          .toLowerCase() ===
-          "camera lens" &&
-        lensIdentity
-      ) {
-      productName = [
-  lensIdentity.brand,
-  lensIdentity.mountSeries,
-  lensIdentity.focalLength,
-  lensIdentity.maxAperture,
-
-  ...(
-    Array.isArray(
-      lensIdentity.featureTokens
-    )
-      ? lensIdentity.featureTokens
-      : []
-  ),
-
-  ...(
-    Array.isArray(
-      lensIdentity.modelCodes
-    )
-      ? lensIdentity.modelCodes
-      : []
-  ),
-
-  lensIdentity.generation
-]
-  .filter(Boolean)
-  .map(
-    value =>
-      String(value).trim()
-  )
-  .filter(Boolean)
-  .join(" ");
-
-        if (productName) {
-          productName += " lens";
-        }
-      } else {
-        productName =
-          [brand, model]
-            .filter(Boolean)
-            .join(" ")
-            .trim();
-      }
-
-      if (!productName) {
-        productName =
-          productType ||
-          String(
-            product?.productId || ""
-          ).trim();
-      }
-
-      return productType
-        ? `${productName} (${productType})`
-        : productName;
-    })
-    .filter(Boolean)
-    .join("\n");
-
-     const prompt = `
-Write one short, casual Facebook Marketplace message to the seller.
-
-EXISTING MESSAGE TO USE AS THE STYLE/LENGTH TEMPLATE:
-${fallbackMessage}
-
-LISTING TITLE:
-${listingTitle || "(not available)"}
-
-LISTING DESCRIPTION:
-${listingDescription || "(not available)"}
-
-PRIMARY PRODUCTS DETECTED IN THE LISTING:
-${primaryProductsText || "(none reliably identified)"}
-
-Requirements:
-- Keep it roughly the same length as the existing message.
-- Keep the tone casual and natural.
-- Naturally reference ONE specific detail about the listing.
-- Prefer referencing one of the detected primary products when that can be done naturally.
-- You may refer to a product by a natural shortened name rather than repeating its entire technical model name.
-- Do not list multiple products robotically.
-- Do not sound like you are summarizing the listing.
-- Say that I am in California.
-- Make clear that I am looking to have the item shipped.
-- Make clear that I will pay the seller before they ship the item.
-- Make clear that I will also cover the shipping cost.
-- Phrase the payment point casually and naturally, such as "I can pay upfront", "I can pay before you ship it", or equivalent wording.
-- Do not imply that the seller needs to ship before receiving payment.
-- Do NOT mention "Buy Now", negotiation, negotiating, offers, offer price, asking price, discounts, profit, resale, or eBay.
-- Do NOT invent any product or listing detail.
-- Only reference products or details supplied above.
-- Do NOT sound overly excited, formal, or robotic.
-- Do NOT add a greeting using the seller's name.
-- Output only the final message.
-- Only use periods and commas for punctuation.
-- No quotation marks.
-- No em-dashes.
-- No markdown.
-- One or two sentences maximum.
-`.trim();
-
-      const response =
-        await createLoggedOpenAiResponse({
-          step:
-            "Marketplace tailored hit message",
-
-          request: {
-            model:
-              "gpt-4o-mini",
-
-            input: [
-              {
-                role:
-                  "user",
-
-                content: [
-                  {
-                    type:
-                      "input_text",
-
-                    text:
-                      prompt
-                  }
-                ]
-              }
-            ],
-
-            max_output_tokens:
-              100
-          }
-        });
+}
 
 
-      let message =
-        String(
-          response.output_text ||
-          ""
-        )
-          .replace(
-            /^["']|["']$/g,
-            ""
-          )
-          .replace(
-            /\s+/g,
-            " "
-          )
-          .trim();
-
-
-      if (!message) {
-        message =
-          fallbackMessage;
-      }
-
-
-      console.log(
-        "[AUTO MESSAGE AI] Generated:",
-        message
-      );
-
-
-      res.json({
-        message
-      });
-
-    } catch (error) {
-      console.error(
-        "[AUTO MESSAGE AI] Generation failed:",
-        error
-      );
-
-
-      /*
-        Don't allow a temporary AI failure to stop
-        the scanner from messaging a good listing.
-      */
-      res.json({
-        message:
-          fallbackMessage,
-
-        fallback:
-          true
-      });
-    }
-  }
-);
-
-/*
-  ============================================================
-  MARKETPLACE CONVERSATION SHEET ELIGIBILITY
-  ============================================================
-*/
-
-async function getMarketplaceConversationSheetStatus(
+async function claimMarketplaceListingId(
   listingId
 ) {
   const cleanListingId =
@@ -19575,770 +4440,4977 @@ async function getMarketplaceConversationSheetStatus(
     ).trim();
 
   if (!cleanListingId) {
-    return {
-      found: false,
-      status: "",
-      eligible: false,
-      rowNumber: null
-    };
+    return false;
   }
 
-  const spreadsheetId =
-    process.env
-      .GOOGLE_SHEETS_SPREADSHEET_ID;
+  const response =
+    await fetchLocalServer(
+      "/processed-marketplace-listings/claim",
+      {
+        method:
+          "POST",
 
-  const tabName =
-    process.env
-      .GOOGLE_SHEETS_TAB_NAME ||
-    "Main";
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
 
-  if (!spreadsheetId) {
-    throw new Error(
-      "Missing GOOGLE_SHEETS_SPREADSHEET_ID."
+        body:
+          JSON.stringify({
+            listingId:
+              cleanListingId
+          })
+      }
     );
-  }
+
+  const data =
+    await readJsonSafely(
+      response
+    );
 
   if (
-    !process.env
-      .GOOGLE_OAUTH_REFRESH_TOKEN
+    !response.ok ||
+    data.error
   ) {
-    throw new Error(
-      "Missing GOOGLE_OAUTH_REFRESH_TOKEN."
+    throw new LocalServerError(
+      data,
+      "Could not claim Marketplace listing."
     );
   }
 
-  const auth =
-    createGoogleOAuthClient();
+  return data.claimed === true;
+}
 
-  auth.setCredentials({
-    refresh_token:
-      process.env
-        .GOOGLE_OAUTH_REFRESH_TOKEN
-  });
+function shouldActivateSearchPollutionRerun(cleanupResult) {
+  const invalidComps = Array.isArray(cleanupResult?.invalidComps)
+    ? cleanupResult.invalidComps
+    : [];
 
-  const sheets =
-    google.sheets({
-      version: "v4",
-      auth
-    });
+  const pollution = cleanupResult?.searchPollution || {};
 
-  /*
-    B = Facebook Marketplace URL
-    J = Ongoing Conversation
+  const removedByAiCleanup = invalidComps.length;
 
-    Because we're requesting B:J:
+  const validExactModelCount = Number(
+    pollution.validExactModelCount ?? cleanupResult?.validIndexes?.length ?? 0
+  );
 
-    row[0] = B
-    row[8] = J
-  */
-  const response =
-    await sheets
-      .spreadsheets
-      .values
-      .get({
-        spreadsheetId,
+  const relatedWrongModelCount = Number(
+    pollution.relatedWrongModelCount ?? 0
+  );
 
-        range:
-          `${tabName}!B:J`
-      });
+  const pollutedByRelatedModels =
+    pollution.pollutedByRelatedModels === true;
 
-  const rows =
-    response.data.values ||
-    [];
-
-  for (
-    let index = 0;
-    index < rows.length;
-    index++
-  ) {
-    const row =
-      rows[index] ||
-      [];
-
-    const facebookUrl =
-      String(
-        row[0] || ""
-      ).trim();
-
-    const ongoingConversation =
-      String(
-        row[8] || ""
-      )
-        .trim()
-        .toUpperCase();
-
-    const match =
-      facebookUrl.match(
-        /\/marketplace\/item\/(\d+)/
-      );
-
-    if (
-      match?.[1] ===
-      cleanListingId
-    ) {
-      return {
-        found: true,
-
-        rowNumber:
-          index + 1,
-
-        status:
-          ongoingConversation,
-
-        eligible:
-          ongoingConversation ===
-          "P"
-      };
-    }
-  }
+  const relatedModelsOverwhelming =
+    pollutedByRelatedModels &&
+    relatedWrongModelCount > validExactModelCount;
 
   return {
-    found: false,
-    rowNumber: null,
-    status: "",
-    eligible: false
+    shouldRerun:
+      removedByAiCleanup >= 45 &&
+      relatedModelsOverwhelming,
+
+    removedByAiCleanup,
+    validExactModelCount,
+    relatedWrongModelCount,
+    pollutedByRelatedModels,
+    relatedModelsOverwhelming
   };
 }
 
-app.get(
-  "/marketplace-conversations",
-  async (req, res) => {
-    try {
-      const {
-        data,
-        error
-      } =
-        await supabaseAdmin
-          .from(
-            "marketplace_conversations"
-          )
-          .select("*")
-          .order(
-            "last_message_at",
-            {
-              ascending:
-                false,
+async function saveSessionListingClicked({
+  facebookUrl,
+  listingId,
+  title,
+  sourceText
+}) {
+  const stored = await chrome.storage.local.get(SESSION_LISTINGS_KEY);
 
-              nullsFirst:
-                false
-            }
-          );
+  const existing = Array.isArray(stored[SESSION_LISTINGS_KEY])
+    ? stored[SESSION_LISTINGS_KEY]
+    : [];
 
-      if (error) {
-        throw error;
-      }
+  const cleanUrl = String(facebookUrl || "").split("?")[0];
+  const cleanListingId = listingId || getFacebookMarketplaceItemId(cleanUrl);
 
+  const entry = {
+    id: cleanListingId || `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    listingId: cleanListingId,
+    facebookUrl: cleanUrl,
+    title: title || "",
+    sourceText: sourceText || "",
+    clickedAt: new Date().toISOString(),
+    recommendation: "",
+    reason: "",
+    facebookPrice: null,
+    estimatedResaleValue: null,
+    profitAtAsk: null,
+    profitAt35: null,
+    maxBuyPrice: null,
+    result: null
+  };
 
-      const conversations =
-        [];
+  const withoutDuplicate = existing.filter(saved => {
+    if (cleanListingId) return saved.listingId !== cleanListingId;
+    return saved.facebookUrl !== cleanUrl;
+  });
 
+  await chrome.storage.local.set({
+    [SESSION_LISTINGS_KEY]: [entry, ...withoutDuplicate]
+  });
 
-      for (
-        const conversation of
-          data || []
-      ) {
-        const listingId =
-          String(
-            conversation
-              .listing_id ||
-            ""
-          ).trim();
+  console.log("Saved clicked listing to session library:", entry);
+}
 
-        if (!listingId) {
-          continue;
-        }
-
-
-        /*
-          Re-check J every time.
-
-          This means changing P -> N immediately
-          removes the conversation from active results.
-        */
-        const sheet =
-          await getMarketplaceConversationSheetStatus(
-            listingId
-          );
-
-
-        if (
-          sheet.status !== "P"
-        ) {
-          continue;
-        }
-
-
-        const status =
-          calculateMarketplaceConversationStatus({
-            lastMessageSender:
-              conversation
-                .last_message_sender,
-
-            lastMessageAt:
-              conversation
-                .last_message_at
-          });
-
-
-        conversations.push({
-          ...conversation,
-
-          status,
-
-          sheetStatus:
-            "P",
-
-          sheetRow:
-            sheet.rowNumber
-        });
-      }
-
-
-      return res.json({
-        ok: true,
-
-        conversations
-      });
-
-    } catch (error) {
-      console.error(
-        "[CONVERSATION TRACKER] Fetch failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Could not load conversations."
-        });
-    }
+async function updateSessionListingResult(finalResult) {
+    if (!(await isLibrarySavingEnabled())) {
+    return;
   }
+  const stored = await chrome.storage.local.get([
+    SESSION_LISTINGS_KEY,
+    MARKETPLACE_AUTO_STATE_KEY
+  ]);
+
+  const library = Array.isArray(stored[SESSION_LISTINGS_KEY])
+    ? stored[SESSION_LISTINGS_KEY]
+    : [];
+
+  const state = stored[MARKETPLACE_AUTO_STATE_KEY] || {};
+
+  const currentUrl =
+    state.currentListingUrl ||
+    getCurrentFacebookListingUrl().split("?")[0];
+
+  const listingId = getFacebookMarketplaceItemId(currentUrl);
+
+  const updatedLibrary = library.map(entry => {
+    const sameListing =
+      (listingId && entry.listingId === listingId) ||
+      (currentUrl && entry.facebookUrl === currentUrl);
+
+    if (!sameListing) return entry;
+
+    return {
+      ...entry,
+      title:
+        entry.title ||
+        finalResult?.targetProduct ||
+        finalResult?.title ||
+        "",
+      recommendation: finalResult?.recommendation || "",
+      reason: finalResult?.reason || "",
+      facebookPrice: finalResult?.facebookPrice ?? entry.facebookPrice ?? null,
+      estimatedResaleValue:
+        finalResult?.totalExpectedSalePrice ??
+        finalResult?.expectedSalePrice ??
+        entry.estimatedResaleValue ??
+        null,
+      profitAtAsk: finalResult?.profitAtAsk ?? entry.profitAtAsk ?? null,
+      profitAt35: finalResult?.profitAt35 ?? entry.profitAt35 ?? null,
+      maxBuyPrice: finalResult?.maxBuyPrice ?? entry.maxBuyPrice ?? null,
+      result: finalResult || null,
+      analyzedAt: new Date().toISOString()
+    };
+  });
+
+  await chrome.storage.local.set({
+    [SESSION_LISTINGS_KEY]: updatedLibrary
+  });
+
+  console.log("Updated session listing result:", {
+    listingId,
+    currentUrl,
+    recommendation: finalResult?.recommendation
+  });
+}
+
+async function clearSessionListingsLibrary() {
+  const confirmed = confirm(
+    "Clear all session listings?\n\nThis cannot be undone."
+  );
+
+  if (!confirmed) return;
+
+  await chrome.storage.local.set({
+    [SESSION_LISTINGS_KEY]: []
+  });
+
+  console.log("Session listings library cleared.");
+
+  await showSessionListingsLibrary();
+}
+
+async function saveScamListing({
+  context,
+  result
+}) {
+  if (!(await isLibrarySavingEnabled())) {
+    return;
+  }
+
+  const stored = await chrome.storage.local.get(
+    SCAM_LISTINGS_KEY
+  );
+
+  const existing = Array.isArray(
+    stored[SCAM_LISTINGS_KEY]
+  )
+    ? stored[SCAM_LISTINGS_KEY]
+    : [];
+
+  const facebookUrl =
+    context?.facebookUrl ||
+    getCurrentFacebookListingUrl().split("?")[0];
+
+  const listingId =
+    getFacebookMarketplaceItemId(facebookUrl);
+
+  const entry = {
+    id:
+      listingId ||
+      `${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2)}`,
+
+    listingId,
+
+    title:
+      context?.originalFacebookTitle ||
+      result?.title ||
+      "",
+
+    description:
+      context?.facebookDescription ||
+      "",
+
+    facebookUrl,
+
+    facebookPrice:
+      result?.facebookPrice ??
+      context?.facebookPrice ??
+      null,
+
+    estimatedResaleValue:
+      result?.totalExpectedSalePrice ??
+      result?.expectedSalePrice ??
+      null,
+
+    resaleToAskRatio:
+      result?.resaleToAskRatio ??
+      null,
+
+    maxResaleToAskRatio:
+      result?.maxResaleToAskRatio ??
+      2.5,
+
+    recommendation:
+      result?.recommendation ||
+      "Scam",
+
+    reason:
+      result?.reason ||
+      "Listing exceeded the scam-value threshold.",
+
+    items:
+      Array.isArray(result?.items)
+        ? result.items
+        : [],
+
+    ignoredItems:
+      result?.ignoredItems ||
+      context?.ignoredItems ||
+      [],
+
+    savedAt: Date.now(),
+
+    rawResult:
+      result || null
+  };
+
+  const withoutDuplicate =
+    existing.filter(saved => {
+      if (listingId) {
+        return saved.listingId !== listingId;
+      }
+
+      return saved.facebookUrl !== facebookUrl;
+    });
+
+  const updatedLibrary = [
+    entry,
+    ...withoutDuplicate
+  ].slice(0, 250);
+
+  await chrome.storage.local.set({
+    [SCAM_LISTINGS_KEY]: updatedLibrary
+  });
+
+  console.log(
+    "Saved scam Marketplace listing:",
+    entry
+  );
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function isFacebookMarketplaceListPage() {
+  return (
+    window.location.hostname.includes("facebook.com") &&
+    window.location.href.includes("/marketplace") &&
+    !window.location.href.includes("/marketplace/item/")
+  );
+}
+
+function isFacebookMarketplaceListingPage() {
+  return (
+    window.location.hostname.includes("facebook.com") &&
+    window.location.href.includes("/marketplace/item/")
+  );
+}
+
+function getVisibleMarketplaceListingLinks() {
+  const links = Array.from(document.querySelectorAll("a[href*='/marketplace/item/']"));
+
+  const cleaned = links
+    .map(link => {
+      const href = link.href.split("?")[0];
+
+      const img = link.querySelector("img");
+      const linkRect = link.getBoundingClientRect();
+      const imgRect = img ? img.getBoundingClientRect() : null;
+
+      const rect =
+        imgRect && imgRect.width > 40 && imgRect.height > 40
+          ? imgRect
+          : linkRect;
+
+     return {
+  el: link,
+  href,
+  fullHref: link.href,
+  listingId: getFacebookMarketplaceItemId(href),
+  rect,
+  text: link.innerText || ""
+};
+    })
+    .filter(item => item.href)
+    .filter(item => item.href.includes("/marketplace/item/"))
+    .filter(item => item.rect.width > 40 || item.rect.height > 40)
+    .filter(item => item.rect.top > 60)
+    .filter(item => item.rect.top < window.innerHeight + 300)
+    .sort((a, b) => {
+      if (Math.abs(a.rect.top - b.rect.top) > 20) {
+        return a.rect.top - b.rect.top;
+      }
+      return a.rect.left - b.rect.left;
+    });
+
+  const seen = new Set();
+
+  const unique = cleaned.filter(item => {
+    if (seen.has(item.href)) return false;
+    seen.add(item.href);
+    return true;
+  });
+
+  console.log("Visible Marketplace listing links found:", unique.length, unique.map(item => item.href));
+
+  return unique;
+}
+
+async function startMarketplaceAutoAnalyzer(
+  minutesToRun = null,
+  options = {}
+) {
+  const serverIsRunning =
+    await isLocalServerRunning();
+
+  if (!serverIsRunning) {
+    alert(
+      "The local analysis server is not running.\n\n" +
+      "Start the server at http://127.0.0.1:3000, then try the scan again."
+    );
+
+    return;
+  }
+
+  if (!isFacebookMarketplaceListPage()) {
+    alert(
+      "Start this from a Facebook Marketplace listing/search results page."
+    );
+    return;
+  }
+
+  /*
+  Start every scanner session with a clean
+  in-memory pipeline registry.
+
+  Jobs from a previous stopped/crashed session
+  must never block a new scan.
+*/
+await clearMarketplaceAnalysisJobRegistry();
+
+console.log(
+  "[PIPELINE] Cleared stale analysis jobs and finish lock."
 );
 
-const MARKETPLACE_FOLLOW_UP_MS =
-  48 *
-  60 *
-  60 *
-  1000;
+  const now = Date.now();
 
+  const durationMinutes =
+    Number(minutesToRun);
 
-function calculateMarketplaceConversationStatus({
-  lastMessageSender,
-  lastMessageAt
-}) {
-  const sender =
-    String(
-      lastMessageSender || ""
-    )
-      .trim()
-      .toLowerCase();
+  const hasTimer =
+    Number.isFinite(durationMinutes) &&
+    durationMinutes > 0;
+
+  const scanMode =
+    options.scanMode ===
+    MARKETPLACE_RANDOM_KEYWORD_MODE
+      ? MARKETPLACE_RANDOM_KEYWORD_MODE
+      : "standard";
+
+  const currentSearchTerm =
+    getMarketplaceSearchTermFromUrl(
+      window.location.href
+    );
+
+  const outreachSessionId =
+  createMarketplaceOutreachSessionId();
+
+const state = {
+  running: true,
+
+  outreachSessionId,
+
+  scanMode,
+
+  listUrl: window.location.href,
+
+    processedListingUrls: [],
+    currentListingUrl: "",
+
+    waitingForAnalysis: false,
+    analysisDone: false,
+    lastResult: null,
+
+    createdAt: now,
+
+    stopAt: hasTimer
+      ? now +
+        durationMinutes *
+          60 *
+          1000
+      : null,
+
+    timerMinutes: hasTimer
+      ? durationMinutes
+      : null,
+
+    /*
+      Random-keyword search tracking.
+    */
+    currentSearchTerm,
+    previousSearchTerm: "",
+
+    usedSearchTerms:
+      scanMode ===
+      MARKETPLACE_RANDOM_KEYWORD_MODE
+        ? [currentSearchTerm].filter(
+            Boolean
+          )
+        : [],
+
+    searchStartedAt: now,
+    searchSwitchCount: 0,
+
+    /*
+      This is only set after the results page fails
+      to produce an unprocessed listing.
+    */
+    noFreshListingSince: null,
+
+    /*
+      Reset whenever a fresh listing is opened.
+    */
+    lastFreshListingOpenedAt: now,
+
+    sessionLog: {
+  sessionId: outreachSessionId,
+  startedAt: now,
+  clickedListings: 0,
+  messagesSent: 0,
+  hitsFound: 0,
+  outreachQueued: 0
+}
+  };
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_AUTO_STATE_KEY]:
+      state
+  });
+
+  try {
+  const response =
+    await fetchLocalServer(
+      "/marketplace-outreach/session/start",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            sessionId:
+              outreachSessionId,
+
+            startedAt:
+              now,
+
+            listUrl:
+              window.location.href,
+
+            scanMode
+          })
+      },
+      {
+        timeoutMs: 10000,
+        retries: 1
+      }
+    );
+
+  const data =
+    await readJsonSafely(
+      response
+    );
 
   if (
-    sender === "seller"
+    !response.ok ||
+    data?.error
   ) {
-    return "waiting_for_me";
+    console.warn(
+      "[OUTREACH QUEUE] Could not start server session:",
+      data
+    );
+  } else {
+    console.log(
+      "[OUTREACH QUEUE] Server session started:",
+      outreachSessionId
+    );
   }
 
+} catch (error) {
+  console.warn(
+    "[OUTREACH QUEUE] Could not create server session:",
+    error
+  );
+}
+
+  await refreshMarketplaceAutoStatsPanel();
+
+  console.log(
+    hasTimer
+      ? (
+          scanMode ===
+          MARKETPLACE_RANDOM_KEYWORD_MODE
+            ? `Random Keyword Scan started for ${durationMinutes} minute(s).`
+            : `Auto analyzer started for ${durationMinutes} minute(s).`
+        )
+      : (
+          scanMode ===
+          MARKETPLACE_RANDOM_KEYWORD_MODE
+            ? "Random Keyword Scan started with no timer."
+            : "Auto analyzer started with no timer."
+        )
+  );
+
+  await openNextMarketplaceListing();
+}
+
+async function stopMarketplaceAutoAnalyzer(options = {}) {
+  const stored = await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
+  const state = stored[MARKETPLACE_AUTO_STATE_KEY] || {};
+
+  const sessionLog = state.sessionLog || {};
+  const startedAt = sessionLog.startedAt || state.createdAt || Date.now();
+  const endedAt = Date.now();
+
+  const duration = formatSessionDuration(endedAt - startedAt);
+  const clickedListings = sessionLog.clickedListings || 0;
+  const hitsFound = sessionLog.hitsFound || 0;
+  const stopReason = options.reason || "Manual stop";
+
+  const outreachSessionId =
+  String(
+    state.outreachSessionId ||
+    sessionLog.sessionId ||
+    ""
+  ).trim();
+
+const outreachQueued =
+  Number(
+    sessionLog.outreachQueued || 0
+  );
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_AUTO_STATE_KEY]: {
+      ...state,
+      running: false,
+      waitingForAnalysis: false,
+      analysisDone: false,
+      currentListingUrl: "",
+      stoppedAt: Date.now(),
+      stopReason
+    }
+  });
+
+ console.log("Marketplace auto analyzer stopped.");
+
+if (outreachSessionId) {
+  try {
+    const finalizeResponse =
+      await fetchLocalServer(
+        "/marketplace-outreach/session/finalize",
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              sessionId:
+                outreachSessionId,
+
+              endedAt,
+
+              stopReason,
+
+              clickedListings,
+
+              hitsFound,
+
+              outreachQueued
+            })
+        },
+        {
+          timeoutMs: 10000,
+          retries: 1
+        }
+      );
+
+    const finalizeData =
+      await readJsonSafely(
+        finalizeResponse
+      );
+
+    if (
+      !finalizeResponse.ok ||
+      finalizeData?.error
+    ) {
+      console.warn(
+        "[OUTREACH QUEUE] Session finalization failed:",
+        finalizeData
+      );
+    } else {
+      console.log(
+        "[OUTREACH QUEUE] Session finalized:",
+        finalizeData
+      );
+    }
+
+  } catch (error) {
+    console.warn(
+      "[OUTREACH QUEUE] Could not finalize outreach session:",
+      error
+    );
+  }
+}
+
+await refreshMarketplaceAutoStatsPanel();
+
+alert(
+  `Auto session stopped.\n\n` +
+  `Reason: ${stopReason}\n` +
+  `Session length: ${duration}\n` +
+  `Listings clicked through: ${clickedListings}\n` +
+  `Hits found: ${hitsFound}\n` +
+  `Outreach queued: ${outreachQueued}\n\n` +
+  `Outreach session:\n${outreachSessionId || "None"}`
+);
+}
+async function updateMarketplaceSessionLog(updates = {}) {
+  const stored = await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
+  const state = stored[MARKETPLACE_AUTO_STATE_KEY];
+
+  if (!state) return;
+
+  const currentLog = state.sessionLog || {
+    startedAt: Date.now(),
+    clickedListings: 0,
+    hitsFound: 0
+  };
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_AUTO_STATE_KEY]: {
+      ...state,
+      sessionLog: {
+        ...currentLog,
+        ...updates
+      }
+    }
+  });
+}
+
+async function openNextMarketplaceListing() {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
+    );
+
+  let state =
+    stored[MARKETPLACE_AUTO_STATE_KEY];
+
+  if (!state?.running) return;
+
+await pruneStaleMarketplaceAnalysisJobs();
+
+const activeAnalysisJobCount =
+  await countActiveMarketplaceAnalysisJobs();
+
+
+if (
+  activeAnalysisJobCount >=
+  MAX_CONCURRENT_MARKETPLACE_ANALYSES
+) {
+  console.log(
+    "[MARKETPLACE BROWSE] A listing is already being analyzed. Waiting for it to finish before starting another:",
+    activeAnalysisJobCount
+  );
+
+  await waitForMarketplaceChildListingToFinish();
+
+  return;
+}
+
   if (
-    sender === "me"
+    !(await isMarketplaceAutoAnalyzerRunning())
   ) {
-    if (lastMessageAt) {
-      const timestamp =
-        new Date(
-          lastMessageAt
-        ).getTime();
+    return;
+  }
+
+  let links =
+    getVisibleMarketplaceListingLinks();
+
+  let waitAttempts = 0;
+
+  while (
+    !links.length &&
+    waitAttempts < 8
+  ) {
+    console.log(
+      "Waiting for Marketplace listings to load..."
+    );
+
+    await sleep(1000);
+
+    if (
+      !(await isMarketplaceAutoAnalyzerRunning())
+    ) {
+      console.log(
+        "Auto analyzer stopped while waiting for listings."
+      );
+
+      return;
+    }
+
+    links =
+      getVisibleMarketplaceListingLinks();
+
+    waitAttempts += 1;
+  }
+
+const processedListingIds =
+  await getProcessedMarketplaceListingIds(
+    links.map(
+      link =>
+        link.listingId
+    )
+  );
+
+let next = links.find(link => {
+  return (
+    link.listingId &&
+    !processedListingIds.includes(
+      link.listingId
+    )
+  );
+});
+
+  let scrollAttempts = 0;
+
+  while (
+    !next &&
+    scrollAttempts < 10
+  ) {
+    /*
+      Start the 30-second exhaustion timer only
+      after the results page cannot produce a fresh
+      visible listing.
+    */
+    if (
+      state.scanMode ===
+        MARKETPLACE_RANDOM_KEYWORD_MODE &&
+      !state.noFreshListingSince
+    ) {
+      state = {
+        ...state,
+        noFreshListingSince:
+          Date.now()
+      };
+
+      await chrome.storage.local.set({
+        [MARKETPLACE_AUTO_STATE_KEY]:
+          state
+      });
+
+      console.log(
+        "[KEYWORD EXHAUSTION TIMER STARTED]",
+        {
+          term:
+            state.currentSearchTerm ||
+            getMarketplaceSearchTermFromUrl(),
+          delayMs:
+            MARKETPLACE_SEARCH_EXHAUSTION_DELAY_MS
+        }
+      );
+    }
+
+    console.log(
+      "No unprocessed visible listing found. Scrolling for more listings..."
+    );
+
+    window.scrollBy({
+      top: Math.round(
+        window.innerHeight * 0.9
+      ),
+      behavior: "smooth"
+    });
+
+    await sleep(
+      randomInt(1800, 3200)
+    );
+
+    if (
+      !(await isMarketplaceAutoAnalyzerRunning())
+    ) {
+      console.log(
+        "Auto analyzer stopped while scrolling for listings."
+      );
+
+      return;
+    }
+
+    links =
+      getVisibleMarketplaceListingLinks();
+
+const latestProcessedListingIds =
+  await getProcessedMarketplaceListingIds(
+    links.map(
+      link =>
+        link.listingId
+    )
+  );
+
+    next = links.find(link => {
+      return (
+        link.listingId &&
+        !latestProcessedListingIds.includes(
+          link.listingId
+        )
+      );
+    });
+
+    console.log(
+      `Scroll attempt ${scrollAttempts + 1}: ` +
+      `found ${links.length} visible listing link(s).`
+    );
+
+    /*
+      A fresh listing appeared. Clear the exhaustion
+      timer before opening it.
+    */
+    if (next) {
+      const latestStored =
+        await chrome.storage.local.get(
+          MARKETPLACE_AUTO_STATE_KEY
+        );
+
+      const latestState =
+        latestStored[
+          MARKETPLACE_AUTO_STATE_KEY
+        ];
+
+      if (latestState?.running) {
+        state = {
+          ...latestState,
+          noFreshListingSince: null
+        };
+
+        await chrome.storage.local.set({
+          [MARKETPLACE_AUTO_STATE_KEY]:
+            state
+        });
+      }
+
+      break;
+    }
+
+    /*
+      Random Keyword Scan only:
+      switch terms after 30 seconds without finding
+      an unprocessed listing.
+    */
+    if (
+      state.scanMode ===
+      MARKETPLACE_RANDOM_KEYWORD_MODE
+    ) {
+      const latestStored =
+        await chrome.storage.local.get(
+          MARKETPLACE_AUTO_STATE_KEY
+        );
+
+      state =
+        latestStored[
+          MARKETPLACE_AUTO_STATE_KEY
+        ] || state;
+
+      const noFreshListingSince =
+        Number(
+          state.noFreshListingSince || 0
+        );
+
+      const exhaustedForMs =
+        noFreshListingSince
+          ? Date.now() -
+            noFreshListingSince
+          : 0;
+
+      console.log(
+        "[KEYWORD EXHAUSTION CHECK]",
+        {
+          term:
+            state.currentSearchTerm ||
+            getMarketplaceSearchTermFromUrl(),
+          exhaustedForMs,
+          requiredMs:
+            MARKETPLACE_SEARCH_EXHAUSTION_DELAY_MS
+        }
+      );
 
       if (
-        Number.isFinite(
-          timestamp
-        ) &&
-        Date.now() -
-          timestamp >=
-          MARKETPLACE_FOLLOW_UP_MS
+        exhaustedForMs >=
+        MARKETPLACE_SEARCH_EXHAUSTION_DELAY_MS
       ) {
-        return "follow_up_due";
+        await switchToRandomMarketplaceSearchTerm(
+          `No unprocessed listing was found for ` +
+          `${Math.round(
+            exhaustedForMs / 1000
+          )} seconds.`
+        );
+
+        return;
       }
     }
 
-    return "waiting_for_seller";
+    scrollAttempts += 1;
   }
 
-  return "unknown";
+  if (!next) {
+    /*
+      The standard Auto Scan retains its current
+      behavior.
+    */
+    if (
+      state.scanMode !==
+      MARKETPLACE_RANDOM_KEYWORD_MODE
+    ) {
+      console.log(
+        "No new Marketplace listings found. Waiting, scrolling more, then retrying."
+      );
+
+      window.scrollBy({
+        top: Math.round(
+          window.innerHeight * 2
+        ),
+        behavior: "smooth"
+      });
+
+      await sleep(
+        randomInt(8000, 12000)
+      );
+
+      if (
+        !(await isMarketplaceAutoAnalyzerRunning())
+      ) {
+        return;
+      }
+
+      await openNextMarketplaceListing();
+      return;
+    }
+
+    /*
+      Random Keyword Scan:
+      ten scrolls can sometimes finish before the
+      full 30-second threshold. Wait only for the
+      remaining portion, then make one final check.
+    */
+    const latestStored =
+      await chrome.storage.local.get(
+        MARKETPLACE_AUTO_STATE_KEY
+      );
+
+    state =
+      latestStored[
+        MARKETPLACE_AUTO_STATE_KEY
+      ] || state;
+
+    const startedAt =
+      Number(
+        state.noFreshListingSince ||
+        Date.now()
+      );
+
+    const elapsedMs =
+      Date.now() - startedAt;
+
+    const remainingMs =
+      Math.max(
+        0,
+        MARKETPLACE_SEARCH_EXHAUSTION_DELAY_MS -
+          elapsedMs
+      );
+
+    if (remainingMs > 0) {
+      console.log(
+        `[KEYWORD EXHAUSTION WAIT] ` +
+        `Waiting ${remainingMs}ms before final check.`
+      );
+
+      await sleep(remainingMs);
+    }
+
+    if (
+      !(await isMarketplaceAutoAnalyzerRunning())
+    ) {
+      return;
+    }
+
+    /*
+      Give Facebook one final opportunity to load
+      more cards before switching.
+    */
+    window.scrollBy({
+      top: Math.round(
+        window.innerHeight * 1.5
+      ),
+      behavior: "smooth"
+    });
+
+    await sleep(
+      randomInt(1800, 2600)
+    );
+
+    const finalLinks =
+      getVisibleMarketplaceListingLinks();
+
+      const finalProcessedIds =
+  await getProcessedMarketplaceListingIds(
+    finalLinks.map(
+      link =>
+        link.listingId
+    )
+  );
+
+next = finalLinks.find(link => {
+      return (
+        link.listingId &&
+        !finalProcessedIds.includes(
+          link.listingId
+        )
+      );
+    });
+
+    if (!next) {
+      await switchToRandomMarketplaceSearchTerm(
+        "No unprocessed listing appeared during the 30-second exhaustion window."
+      );
+
+      return;
+    }
+  }
+
+  await sleep(
+    randomInt(600, 1200)
+  );
+
+  if (
+    !(await isMarketplaceAutoAnalyzerRunning())
+  ) {
+    console.log(
+      "Auto analyzer stopped before opening selected listing."
+    );
+
+    return;
+  }
+
+  /*
+    Re-read state to avoid overwriting changes made
+    while scrolling.
+  */
+  const latestStored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
+    );
+
+  const latestState =
+    latestStored[
+      MARKETPLACE_AUTO_STATE_KEY
+    ] || state;
+
+  const openedAt = Date.now();
+
+  const updatedState = {
+    ...latestState,
+
+    listUrl:
+      latestState.listUrl ||
+      window.location.href,
+
+    currentListingUrl:
+      next.href,
+
+    waitingForAnalysis: false,
+    analysisDone: false,
+    lastResult: null,
+
+    /*
+      A fresh listing has been found, so reset the
+      keyword exhaustion timer.
+    */
+    noFreshListingSince: null,
+    lastFreshListingOpenedAt:
+      openedAt
+  };
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_AUTO_STATE_KEY]:
+      updatedState
+  });
+
+  console.log(
+    "Opening next Marketplace listing:",
+    next.fullHref
+  );
+
+  const freshStored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
+    );
+
+  const freshState =
+    freshStored[
+      MARKETPLACE_AUTO_STATE_KEY
+    ];
+
+  const currentLog =
+    freshState?.sessionLog || {
+      startedAt: Date.now(),
+      clickedListings: 0,
+      hitsFound: 0
+    };
+
+  await updateMarketplaceSessionLog({
+    clickedListings:
+      currentLog.clickedListings + 1
+  });
+
+  await saveSessionListingClicked({
+    facebookUrl: next.href,
+    listingId: next.listingId,
+    title: "",
+    sourceText: next.text || ""
+  });
+
+const claimed =
+  await claimMarketplaceListingId(
+    next.listingId
+  );
+
+if (!claimed) {
+  console.log(
+    "[AUTO SCAN] Listing was claimed by another device. Finding another listing:",
+    next.listingId
+  );
+
+  await openNextMarketplaceListing();
+
+  return;
 }
 
 
-app.post(
-  "/marketplace-conversation",
-  async (req, res) => {
-    try {
-      const incoming =
-        req.body?.conversation ||
-        {};
-
-      const accountId =
-        String(
-          incoming.accountId ||
-          "default"
-        ).trim();
-
-      const conversationId =
-        String(
-          incoming.conversationId ||
-          ""
-        ).trim();
-
-      if (!conversationId) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error:
-              "Missing conversationId."
-          });
-      }
-
-
-      /*
-        First check whether we already know
-        this Messenger -> Marketplace mapping.
-      */
-      const {
-        data: existing,
-        error: existingError
-      } =
-        await supabaseAdmin
-          .from(
-            "marketplace_conversations"
-          )
-          .select("*")
-          .eq(
-            "account_id",
-            accountId
-          )
-          .eq(
-            "conversation_id",
-            conversationId
-          )
-          .maybeSingle();
-
-      if (existingError) {
-        throw existingError;
-      }
-
-
-      /*
-        The opened Messenger thread can provide
-        the listing ID.
-
-        A later sidebar scan might not, so preserve
-        the existing mapping.
-      */
-      const listingId =
-        String(
-          incoming.listingId ||
-          existing?.listing_id ||
-          ""
-        ).trim();
-
-      if (!listingId) {
-        return res.json({
-          ok: true,
-
-          tracked: false,
-
-          reason:
-            "Marketplace listing ID has not been mapped yet.",
-
-          conversationId
-        });
-      }
-
-
-      /*
-        COLUMN J IS THE SOURCE OF TRUTH.
-
-        P     = track
-        N     = ignore
-        blank = ignore
-      */
-      const sheet =
-        await getMarketplaceConversationSheetStatus(
-          listingId
-        );
-
-
-      if (
-        sheet.status !== "P"
-      ) {
-        console.log(
-          "[CONVERSATION TRACKER] Ignored because Sheet J is not P:",
-          {
-            conversationId,
-            listingId,
-            sheetStatus:
-              sheet.status ||
-              "(blank)"
-          }
-        );
-
-
-        return res.json({
-          ok: true,
-
-          tracked: false,
-
-          conversationId,
-          listingId,
-
-          sheetStatus:
-            sheet.status,
-
-          reason:
-            sheet.status === "N"
-              ? "Conversation marked N."
-              : "Conversation is not marked P."
-        });
-      }
-
-
-      function preserveText(
-        incomingValue,
-        existingValue = null
-      ) {
-        const clean =
-          String(
-            incomingValue ||
-            ""
-          ).trim();
-
-        return (
-          clean ||
-          existingValue ||
-          null
-        );
-      }
-
-
-      const listingUrl =
-        preserveText(
-          incoming.listingUrl,
-          existing?.listing_url
-        );
-
-      const sellerName =
-        preserveText(
-          incoming.sellerName,
-          existing?.seller_name
-        );
-
-      const conversationUrl =
-        preserveText(
-          incoming.conversationUrl,
-          existing
-            ?.conversation_url
-        );
-
-      const lastMessageText =
-        preserveText(
-          incoming.lastMessageText,
-          existing
-            ?.last_message_text
-        );
-
-
-      const incomingSender =
-        String(
-          incoming.lastMessageSender ||
-          ""
-        )
-          .trim()
-          .toLowerCase();
-
-      const lastMessageSender =
-        (
-          incomingSender === "me" ||
-          incomingSender ===
-            "seller"
-        )
-          ? incomingSender
-          : (
-              existing
-                ?.last_message_sender ||
-              "unknown"
-            );
-
-
-      let lastMessageAt =
-        existing
-          ?.last_message_at ||
-        null;
-
-      if (
-        incoming.lastMessageAt
-      ) {
-        const parsed =
-          new Date(
-            incoming.lastMessageAt
-          );
-
-        if (
-          !Number.isNaN(
-            parsed.getTime()
-          )
-        ) {
-          lastMessageAt =
-            parsed.toISOString();
-        }
-      }
-
-
-      const unread =
-        typeof incoming.unread ===
-          "boolean"
-          ? incoming.unread
-          : Boolean(
-              existing?.unread
-            );
-
-
-      const status =
-        calculateMarketplaceConversationStatus({
-          lastMessageSender,
-          lastMessageAt
-        });
-
-
-      const now =
-        new Date()
-          .toISOString();
-
-
-      const row = {
-        account_id:
-          accountId,
-
-        conversation_id:
-          conversationId,
-
-        listing_id:
-          listingId,
-
-        listing_url:
-          listingUrl,
-
-        seller_name:
-          sellerName,
-
-        conversation_url:
-          conversationUrl,
-
-        last_message_text:
-          lastMessageText,
-
-        last_message_sender:
-          lastMessageSender,
-
-        last_message_at:
-          lastMessageAt,
-
-        last_scanned_at:
-          now,
-
-        unread,
-
-        status,
-
-        updated_at:
-          now
-      };
-
-
-      const {
-        data,
-        error
-      } =
-        await supabaseAdmin
-          .from(
-            "marketplace_conversations"
-          )
-          .upsert(
-            row,
-            {
-              onConflict:
-                "account_id,conversation_id"
-            }
-          )
-          .select()
-          .single();
-
-
-      if (error) {
-        throw error;
-      }
-
-      await updateMarketplaceConversationFollowUpColumn({
-  rowNumber:
-    sheet.rowNumber,
-
-  followUpDue:
-    status ===
-    "follow_up_due"
-});
-
-
-      console.log(
-        "[CONVERSATION TRACKER] Tracking:",
-        {
-          conversationId,
-          listingId,
-          sellerName,
-          lastMessageSender,
-          lastMessageAt,
-          status,
-          sheetStatus:
-            "P"
-        }
-      );
-
-
-      return res.json({
-        ok: true,
-
-        tracked: true,
-
-        sheetStatus:
-          "P",
-
-        conversation:
-          data
-      });
-
-    } catch (error) {
-      console.error(
-        "[CONVERSATION TRACKER] Update failed:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "Conversation update failed."
-        });
-    }
+/*
+  Reserve the analysis slot BEFORE opening
+  the Marketplace child tab.
+
+  This prevents another browse-controller
+  invocation from seeing an empty slot during
+  the delay between tab creation and
+  aiCheckListing() starting.
+*/
+const reservedJobId =
+  `listing-${next.listingId}`;
+
+await patchMarketplaceAnalysisJobById(
+  reservedJobId,
+  {
+    listingId:
+      next.listingId,
+
+    url:
+      next.fullHref
+        .split("?")[0],
+
+    status:
+      "opening",
+
+    stage:
+      "reserved-before-tab-open",
+
+    startedAt:
+      Date.now()
+  },
+  {
+    currentUrl:
+      next.fullHref
+        .split("?")[0]
   }
 );
 
-app.get(
-  "/marketplace-conversation-targets",
-  async (req, res) => {
+
+let openResult;
+
+try {
+  openResult =
+    await openMarketplaceListingInNewTab(
+      next.fullHref
+    );
+
+} catch (error) {
+  await failMarketplaceAnalysisJobById(
+    reservedJobId,
+    error?.message ||
+      "Marketplace listing tab failed to open.",
+    "tab-open-failed"
+  );
+
+  throw error;
+}
+
+
+console.log(
+  "[MARKETPLACE TAB] Listing opened in independent tab:",
+  {
+    listingId:
+      next.listingId,
+
+    url:
+      next.fullHref,
+
+    tabId:
+      openResult?.tabId
+  }
+);
+
+console.log(
+  "[MARKETPLACE TAB] Listing opened in independent tab:",
+  {
+    listingId:
+      next.listingId,
+
+    url:
+      next.fullHref,
+
+    tabId:
+      openResult?.tabId
+  }
+);
+
+
+/*
+  IMPORTANT:
+
+  The browse tab stays exactly where it is.
+
+  Wait here until the listing tab finishes and
+  clears currentListingUrl from shared auto state.
+*/
+await waitForMarketplaceChildListingToFinish();
+}
+
+async function waitForMarketplaceChildListingToFinish() {
+  console.log(
+    "[MARKETPLACE BROWSE] Watching active listing jobs..."
+  );
+
+  while (true) {
+    await sleep(
+      750
+    );
+
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_AUTO_STATE_KEY
+      );
+
+    const state =
+      stored[
+        MARKETPLACE_AUTO_STATE_KEY
+      ];
+
+
+    if (
+      !state?.running
+    ) {
+      console.log(
+        "[MARKETPLACE BROWSE] Scanner stopped."
+      );
+
+      return;
+    }
+
+
+    /*
+      Recover child tabs that died without updating
+      their job status.
+    */
+    await pruneStaleMarketplaceAnalysisJobs();
+
+
+    const jobs =
+      await getMarketplaceAnalysisJobs();
+
+
+    const activeJobs =
+      jobs.filter(
+        job =>
+          !isMarketplaceAnalysisJobTerminal(
+            job
+          )
+      );
+
+
+    /*
+      Listings are processed strictly one at a time now. A
+      listing parked waiting on DataForSEO used to be treated as
+      a signal to open a second listing in the background - that
+      parallel-processing path has been removed. The current
+      listing, parked or not, simply keeps its slot until it
+      reaches a terminal status below.
+    */
+
+
+    /*
+      All jobs finished.
+    */
+    if (
+      activeJobs.length === 0
+    ) {
+      console.log(
+        "[MARKETPLACE BROWSE] All active listing jobs finished."
+      );
+
+      await sleep(
+        randomInt(
+          5000,
+          10000
+        )
+      );
+
+      if (
+        !(await isMarketplaceAutoAnalyzerRunning())
+      ) {
+        return;
+      }
+
+      await openNextMarketplaceListing();
+
+      return;
+    }
+
+
+    /*
+      The single analysis slot is currently occupied.
+
+      Do not open another listing. The stale-job
+      watchdog above still runs every 750ms.
+    */
+    if (
+      activeJobs.length >=
+      MAX_CONCURRENT_MARKETPLACE_ANALYSES
+    ) {
+      continue;
+    }
+
+
+    /*
+      A normal foreground listing is still running.
+    */
+    if (
+      String(
+        state.currentListingUrl ||
+        ""
+      ).trim()
+    ) {
+      continue;
+    }
+
+
+    /*
+      These are VALID background states.
+
+      In particular, resume-ready and finishing must
+      NOT be treated as orphaned simply because the
+      DataForSEO listing cleared currentListingUrl.
+    */
+    const legitimateBackgroundJobs =
+      activeJobs.filter(
+        job =>
+          isMarketplaceBackgroundAnalysisJob(
+            job
+          )
+      );
+
+    if (
+      legitimateBackgroundJobs.length ===
+      activeJobs.length
+    ) {
+      continue;
+    }
+
+
+    /*
+      Actual orphan recovery.
+
+      Give status transitions 90 seconds before
+      declaring the foreground job dead.
+    */
+    const now =
+      Date.now();
+
+    const orphanedJobs =
+      activeJobs.filter(
+        job =>
+          !isMarketplaceBackgroundAnalysisJob(
+            job
+          ) &&
+          now -
+            getMarketplaceAnalysisJobLastActivityAt(
+              job
+            ) >=
+            MARKETPLACE_ORPHAN_GRACE_MS
+      );
+
+
+    if (
+      orphanedJobs.length === 0
+    ) {
+      continue;
+    }
+
+
+    console.warn(
+      "[MARKETPLACE BROWSE] Orphaned job(s) detected:",
+      orphanedJobs
+    );
+
+
+    for (
+      const job of orphanedJobs
+    ) {
+      await failMarketplaceAnalysisJobById(
+        job.jobId,
+        "Job remained active after losing its foreground Marketplace slot.",
+        "orphaned"
+      );
+
+      const lockStored =
+        await chrome.storage.local.get(
+          MARKETPLACE_FINISH_LOCK_KEY
+        );
+
+      if (
+        lockStored[
+          MARKETPLACE_FINISH_LOCK_KEY
+        ] ===
+          job.jobId
+      ) {
+        await chrome.storage.local.remove(
+          MARKETPLACE_FINISH_LOCK_KEY
+        );
+      }
+    }
+
+
+    await sleep(
+      randomInt(
+        1000,
+        2000
+      )
+    );
+
+
+    if (
+      !(await isMarketplaceAutoAnalyzerRunning())
+    ) {
+      return;
+    }
+
+
+    await openNextMarketplaceListing();
+
+    return;
+  }
+}
+
+async function resumeMarketplaceAutoAnalyzerIfNeeded() {
+  try {
+    const stored = await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
+    );
+
+    const state = stored[MARKETPLACE_AUTO_STATE_KEY];
+
+    if (!state?.running) {
+      return;
+    }
+
+if (isFacebookMarketplaceListingPage()) {
+  /*
+    IMPORTANT:
+
+    A finished analysis must be consumed before we
+    consider starting another analysis.
+
+    This also recovers correctly if the content script
+    was restarted after the eBay tab finished.
+  */
+  if (
+    state.analysisDone ||
+    state.waitingForAnalysis
+  ) {
+    await waitForMarketplaceAnalysisToFinish();
+    return;
+  }
+
+  const waitBeforeClickMs =
+    randomInt(
+      1000,
+      3000
+    );
+
+      console.log(
+        `Auto analyzer waiting ${waitBeforeClickMs}ms before clicking AI button...`
+      );
+
+      await sleep(waitBeforeClickMs);
+
+      if (!(await isMarketplaceAutoAnalyzerRunning())) {
+        console.log(
+          "Auto analyzer stopped before clicking AI button."
+        );
+        return;
+      }
+
+      const button = document.getElementById(
+        "ebay-comp-checker-btn"
+      );
+
+      if (!button) {
+        console.warn(
+          "AI Check eBay Sold button not found."
+        );
+        return;
+      }
+
+      await chrome.storage.local.set({
+        [MARKETPLACE_AUTO_STATE_KEY]: {
+          ...state,
+          waitingForAnalysis: true,
+          analysisDone: false
+        }
+      });
+
+      await refreshMarketplaceAutoStatsPanel();
+
+      console.log(
+        "Auto analyzer clicking AI Check eBay Sold."
+      );
+
+      button.click();
+
+      await waitForMarketplaceAnalysisToFinish();
+      return;
+    }
+
+    if (isFacebookMarketplaceListPage()) {
+      const waitBeforeNextMs = randomInt(5000, 10000);
+
+      console.log(
+        `Auto analyzer back on list page. Waiting ${waitBeforeNextMs}ms before next listing...`
+      );
+
+      await sleep(waitBeforeNextMs);
+
+      if (!(await isMarketplaceAutoAnalyzerRunning())) {
+        console.log(
+          "Auto analyzer stopped before opening next listing."
+        );
+        return;
+      }
+
+      await openNextMarketplaceListing();
+    }
+  } catch (error) {
+    if (handleExtensionContextError(error)) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function openMarketplaceListingInNewTab(
+  url
+) {
+  return new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+      chrome.runtime.sendMessage(
+        {
+          type:
+            "OPEN_MARKETPLACE_LISTING_TAB",
+
+          url
+        },
+
+        response => {
+          if (
+            chrome.runtime.lastError
+          ) {
+            reject(
+              new Error(
+                chrome.runtime
+                  .lastError
+                  .message
+              )
+            );
+
+            return;
+          }
+
+          if (
+            !response ||
+            response.ok !== true
+          ) {
+            reject(
+              new Error(
+                response?.error ||
+                "Could not open Marketplace listing tab."
+              )
+            );
+
+            return;
+          }
+
+          resolve(
+            response
+          );
+        }
+      );
+    }
+  );
+}
+
+
+async function closeCurrentMarketplaceListingTab() {
+  return new Promise(
+    resolve => {
+      chrome.runtime.sendMessage(
+        {
+          type:
+            "CLOSE_CURRENT_MARKETPLACE_LISTING_TAB"
+        },
+
+        response => {
+          if (
+            chrome.runtime.lastError
+          ) {
+            console.warn(
+              "[MARKETPLACE TAB] Could not close listing tab:",
+              chrome.runtime
+                .lastError
+                .message
+            );
+          }
+
+          resolve(
+            response || null
+          );
+        }
+      );
+    }
+  );
+}
+
+async function closeMarketplaceAutoEbayTabs() {
+  return new Promise(resolve => {
+    if (
+      typeof chrome === "undefined" ||
+      !chrome.runtime ||
+      !chrome.runtime.sendMessage
+    ) {
+      resolve();
+      return;
+    }
+
+    chrome.runtime.sendMessage(
+      {
+        type: "CLOSE_MARKETPLACE_AUTO_EBAY_TABS"
+      },
+      response => {
+        if (chrome.runtime.lastError) {
+          console.warn(
+            "Could not close eBay tabs:",
+            chrome.runtime.lastError.message
+          );
+        } else {
+          console.log("Closed eBay tabs after auto timeout:", response);
+        }
+
+        resolve();
+      }
+    );
+  });
+}
+
+function getRemainingMarketplaceAutoMinutes(state) {
+  if (!state?.stopAt) return null;
+
+  const remainingMs = Math.max(0, state.stopAt - Date.now());
+
+  if (remainingMs <= 0) return 0;
+
+  // Round up so 24m 10s becomes 25 minutes, not 24.
+  return Math.ceil(remainingMs / 60000);
+}
+
+async function waitForMarketplaceAnalysisToFinish() {
+
+  const analysisJobId =
+  getCurrentMarketplaceAnalysisJobId();
+  const startedAt = Date.now();
+  const maxWaitMs = 3 * 60 * 1000;
+
+  while (true) {
+    const stored = await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
+    const state = stored[MARKETPLACE_AUTO_STATE_KEY];
+
+    if (!state?.running) return;
+
+const jobs =
+  await getMarketplaceAnalysisJobs();
+
+const currentJob =
+  jobs.find(
+    job =>
+      job?.jobId ===
+      analysisJobId
+  );
+
+if (
+  currentJob?.status ===
+    "complete"
+) {
+  const finalResult =
+    currentJob.finalResult ||
+    {
+      recommendation:
+        "Done",
+
+      reason:
+        "Analysis completed."
+    };
+
+  if (!AUTO_MESSAGE_ENABLED) {
+    /*
+      MODE 0:
+      Auto message is switched off. Do not message the seller,
+      do not queue outreach, and do not take the outreach lock.
+    */
+    console.log(
+      "[AUTO MESSAGE] Disabled (AUTO_MESSAGE_ENABLED = false). Skipping seller outreach."
+    );
+  } else if (USE_SEPARATE_OUTREACH_EXTENSION) {
+    /*
+      MODE 1:
+      Do NOT message seller here.
+
+      Save the hit to the server so the separate
+      outreach extension can handle it later.
+    */
     try {
-      const spreadsheetId =
-        process.env
-          .GOOGLE_SHEETS_SPREADSHEET_ID;
+await queueMarketplaceSellerForVerifiedHit(
+  finalResult
+);
 
-      const tabName =
-        process.env
-          .GOOGLE_SHEETS_TAB_NAME ||
-        "Main";
+    } catch (queueError) {
+      console.warn(
+        "[OUTREACH QUEUE] Automatic hit queue failed:",
+        queueError
+      );
+
+      /*
+        Never silently discard a verified hit.
+      */
+      if (
+isHitRecommendation(
+  finalResult
+)
+      ) {
+        await stopMarketplaceAutoAnalyzer({
+          reason:
+            "Verified Hit could not be saved to outreach queue."
+        });
+
+        return;
+      }
+    }
+
+} else {
+  /*
+    MODE 2:
+    Message seller directly.
+
+    Only ONE listing tab may interact with
+    Facebook's seller-message UI at a time.
+  */
+
+  const outreachListingId =
+    getFacebookMarketplaceItemId();
+
+  await acquireMarketplaceOutreachLock(
+    outreachListingId
+  );
+
+  try {
+    let messageResult = null;
+    let messageError = null;
+
+    const MAX_MESSAGE_ATTEMPTS = 3;
+
+for (
+  let attempt = 1;
+  attempt <= MAX_MESSAGE_ATTEMPTS;
+  attempt += 1
+) {
+  console.log(
+    `[DIRECT OUTREACH] Send attempt ${attempt}/${MAX_MESSAGE_ATTEMPTS}`
+  );
+
+  try {
+    messageResult =
+      await messageMarketplaceSellerForVerifiedHit(
+        finalResult
+      );
+
+    console.log(
+      "[DIRECT OUTREACH] Immediate outreach result:",
+      messageResult
+    );
+
+    if (messageResult?.sent === true) {
+      const freshStored =
+        await chrome.storage.local.get(
+          MARKETPLACE_AUTO_STATE_KEY
+        );
+
+      const freshState =
+        freshStored[
+          MARKETPLACE_AUTO_STATE_KEY
+        ];
+
+      const freshLog =
+        freshState?.sessionLog || {};
+
+      await updateMarketplaceSessionLog({
+        messagesSent:
+          Number(
+            freshLog.messagesSent || 0
+          ) + 1
+      });
+
+      break;
+    }
+
+    if (
+      messageResult?.reason ===
+      "Already messaged."
+    ) {
+      break;
+    }
+
+    /*
+      Skip logging as a warning when the reason is an expected,
+      non-failure abort (not a hit, wrong page, already messaged).
+      Only genuine automation failures (button/input not found,
+      Facebook not confirming the send, etc.) should be reported
+      as warnings.
+    */
+    const NON_FAILURE_OUTREACH_REASONS = [
+      "Final result is not a hit.",
+      "Not on a Marketplace listing page.",
+      "Already messaged."
+    ];
+
+    const outreachSkipReason =
+      messageResult?.reason ||
+      "Unknown reason";
+
+    if (
+      NON_FAILURE_OUTREACH_REASONS.includes(
+        outreachSkipReason
+      )
+    ) {
+      console.log(
+        "[DIRECT OUTREACH] Message was NOT sent:",
+        {
+          attempt,
+          reason: outreachSkipReason
+        }
+      );
+    } else {
+      console.warn(
+        "[DIRECT OUTREACH] Message was NOT sent:",
+        {
+          attempt,
+          reason: outreachSkipReason
+        }
+      );
+    }
+
+  } catch (error) {
+    messageError = error;
+
+    console.warn(
+      "[DIRECT OUTREACH] Message attempt threw:",
+      {
+        attempt,
+        error
+      }
+    );
+  }
+
+  if (
+    attempt <
+    MAX_MESSAGE_ATTEMPTS
+  ) {
+    await sleep(
+      randomInt(3000, 6000)
+    );
+
+    window.scrollTo({
+      top: Math.max(
+        0,
+        document.body.scrollHeight *
+          0.35
+      ),
+      behavior: "smooth"
+    });
+
+    await sleep(1000);
+  }
+}
+
+    const messageSucceeded =
+      messageResult?.sent === true;
+
+    const alreadyMessaged =
+      messageResult?.reason ===
+      "Already messaged.";
+
+    /*
+      CRITICAL:
+
+      Never silently discard a verified hit
+      whose outreach failed.
+    */
+    if (
+  isHitRecommendation(finalResult) &&
+  !messageSucceeded &&
+  !alreadyMessaged
+) {
+  console.error(
+    "[DIRECT OUTREACH] VERIFIED HIT OUTREACH FAILED AFTER RETRIES.",
+    {
+      listingId:
+        outreachListingId,
+
+      listingUrl:
+        window.location.href
+          .split("?")[0],
+
+      recommendation:
+        finalResult?.recommendation,
+
+      attempts:
+        MAX_MESSAGE_ATTEMPTS,
+
+      lastResult:
+        messageResult,
+
+      lastError:
+        messageError
+          ? String(
+              messageError?.message ||
+              messageError
+            )
+          : null
+    }
+  );
+
+  /*
+    IMPORTANT:
+
+    The hit has already been recorded by the normal
+    hit-save path. A Facebook messaging failure should
+    not terminate the entire scanner session.
+
+    Leave this listing unmarked as messaged so it can
+    be inspected/retried separately, then allow the
+    scanner to continue.
+  */
+  console.warn(
+    "[DIRECT OUTREACH] Hit remains saved, but outreach failed. Continuing scanner.",
+    {
+      listingId:
+        outreachListingId,
+
+      reason:
+        messageResult?.reason ||
+        messageError?.message ||
+        "Unknown messaging failure"
+    }
+  );
+}
+
+  } finally {
+    /*
+      Always release the serialization lock,
+      including errors and scanner-stop cases.
+    */
+    await releaseMarketplaceOutreachLock(
+      outreachListingId
+    );
+  }
+}
 
 
-      if (!spreadsheetId) {
-        throw new Error(
-          "Missing GOOGLE_SHEETS_SPREADSHEET_ID."
+ /*
+  queueMarketplaceSellerForVerifiedHit() may have
+  updated sessionLog.outreachQueued.
+
+  Re-read state before writing the completed-listing
+  state so we do not overwrite that update.
+*/
+const latestStoredAfterQueue =
+  await chrome.storage.local.get(
+    MARKETPLACE_AUTO_STATE_KEY
+  );
+
+const latestStateAfterQueue =
+  latestStoredAfterQueue[
+    MARKETPLACE_AUTO_STATE_KEY
+  ] || state;
+
+const currentUrl =
+  window.location.href
+    .split("?")[0];
+
+
+const sharedCurrentUrl =
+  String(
+    latestStateAfterQueue
+      .currentListingUrl ||
+    ""
+  )
+    .split("?")[0];
+
+
+const updatedState = {
+  ...latestStateAfterQueue,
+
+  processedListingUrls:
+    [
+      ...new Set([
+        ...(
+          latestStateAfterQueue
+            .processedListingUrls ||
+          []
+        ),
+
+        currentUrl
+      ])
+    ],
+
+  /*
+    Only clear the shared foreground URL if THIS
+    tab is still the foreground listing.
+
+    If Listing B has already replaced it, leave B alone.
+  */
+  currentListingUrl:
+    sharedCurrentUrl ===
+      currentUrl
+      ? ""
+      : latestStateAfterQueue
+          .currentListingUrl,
+
+  dataForSeoListingParked:
+    false
+};
+
+      await chrome.storage.local.set({
+        [MARKETPLACE_AUTO_STATE_KEY]: updatedState
+      });
+
+    console.log(
+  "[MARKETPLACE TAB] Analysis finished. Closing independent listing tab."
+);
+
+await sleep(
+  500
+);
+
+await closeCurrentMarketplaceListingTab();
+
+return;
+    }
+
+if (Date.now() - startedAt > maxWaitMs) {
+  console.warn(
+    "Timed out waiting for eBay analysis to finish."
+  );
+
+/*
+  CRITICAL:
+
+  A child listing must retry ITS OWN URL.
+
+  state.currentListingUrl may belong to the newer
+  listing while this tab is parked in DataForSEO.
+*/
+const currentUrl =
+  String(
+    window.location.href ||
+    ""
+  ).split("?")[0];
+
+  const currentListingId =
+    getFacebookMarketplaceItemId(
+      currentUrl
+    );
+
+    const latestJobsAtTimeout =
+  await getMarketplaceAnalysisJobs();
+
+const otherActiveJobsAtTimeout =
+  latestJobsAtTimeout.filter(
+    job =>
+      job?.jobId !==
+        analysisJobId &&
+      !isMarketplaceAnalysisJobTerminal(
+        job
+      )
+  );
+
+
+const latestStoredAtTimeout =
+  await chrome.storage.local.get(
+    MARKETPLACE_AUTO_STATE_KEY
+  );
+
+const latestStateAtTimeout =
+  latestStoredAtTimeout[
+    MARKETPLACE_AUTO_STATE_KEY
+  ] || state;
+
+const sharedCurrentUrlAtTimeout =
+  String(
+    latestStateAtTimeout
+      .currentListingUrl ||
+    ""
+  ).split("?")[0];
+
+
+/*
+  Never allow an old timed-out child to reload the
+  newer foreground listing or clear its shared state.
+*/
+if (
+  (
+    sharedCurrentUrlAtTimeout &&
+    sharedCurrentUrlAtTimeout !==
+      currentUrl
+  ) ||
+  otherActiveJobsAtTimeout.length > 0
+) {
+  const abandonedResult = {
+    recommendation:
+      "Error",
+
+    reason:
+      "Listing analysis timed out while another Marketplace listing was active. The stale child was abandoned instead of retrying another listing.",
+
+    facebookPrice:
+      null,
+
+    estimatedResaleValue:
+      null,
+
+    profitAtAsk:
+      null,
+
+    profitAt35:
+      null
+  };
+
+
+  await updateSessionListingResult(
+    abandonedResult
+  );
+
+
+  await failMarketplaceAnalysisJobById(
+    analysisJobId,
+    abandonedResult.reason,
+    "timeout-with-other-job"
+  );
+
+
+  console.warn(
+    "[MARKETPLACE TAB] Abandoning stale child:",
+    {
+      analysisJobId,
+      currentUrl,
+      sharedCurrentUrlAtTimeout
+    }
+  );
+
+
+  await closeCurrentMarketplaceListingTab();
+
+  return;
+}
+
+  const previousRetryCount =
+    await getListingAnalysisRetryCount(
+      currentListingId
+    );
+
+  /*
+    First timeout:
+    close the old eBay tabs and rerun the entire
+    Facebook listing analysis from the beginning.
+  */
+  if (
+    currentListingId &&
+    previousRetryCount <
+      MAX_LISTING_ANALYSIS_RETRIES
+  ) {
+    const nextRetryCount =
+      await incrementListingAnalysisRetryCount(
+        currentListingId
+      );
+
+    console.warn(
+      `Retrying complete listing analysis. ` +
+      `Retry ${nextRetryCount}/` +
+      `${MAX_LISTING_ANALYSIS_RETRIES}.`,
+      {
+        currentListingId,
+        currentUrl
+      }
+    );
+
+    await closeMarketplaceAutoEbayTabs();
+
+    /*
+      Delete the incomplete comp context so the
+      retry cannot resume stale eBay progress.
+    */
+    await chrome.storage.local.remove(
+      "ebayCompContext"
+    );
+
+    await chrome.storage.local.set({
+      [MARKETPLACE_AUTO_STATE_KEY]: {
+        ...state,
+
+        /*
+          Keep the same listing as the active listing.
+        */
+        currentListingUrl: currentUrl,
+
+        /*
+          On page reload, resumeMarketplaceAutoAnalyzerIfNeeded()
+          will click the analysis button again.
+        */
+        waitingForAnalysis: false,
+        analysisDone: false,
+
+        lastResult: {
+          recommendation: "Retrying",
+          reason:
+            `The first analysis attempt did not complete. ` +
+            `Restarting the complete listing analysis ` +
+            `from the beginning. Retry ` +
+            `${nextRetryCount}/` +
+            `${MAX_LISTING_ANALYSIS_RETRIES}.`
+        },
+
+        lastResultAt: Date.now()
+      }
+    });
+
+    /*
+      Reload the Marketplace listing itself.
+      The auto-resume logic will start aiCheckListing()
+      again after the page loads.
+    */
+    window.location.href = currentUrl;
+    return;
+  }
+
+  /*
+    Second timeout:
+    the retry also failed, so record a terminal
+    result and continue to the next listing.
+  */
+  console.error(
+    "Complete listing analysis retry limit reached.",
+    {
+      currentListingId,
+      currentUrl,
+      previousRetryCount
+    }
+  );
+
+  const finalTimeoutResult = {
+    recommendation: "Error",
+    reason:
+      `The complete listing analysis failed to finish ` +
+      `after the original attempt and ` +
+      `${MAX_LISTING_ANALYSIS_RETRIES} retry.`,
+    facebookPrice: null,
+    estimatedResaleValue: null,
+    profitAtAsk: null,
+    profitAt35: null
+  };
+
+  /*
+    Update the Session Listings card before clearing
+    the current listing from auto state.
+  */
+  await updateSessionListingResult(
+    finalTimeoutResult
+  );
+
+  await clearListingAnalysisRetryCount(
+    currentListingId
+  );
+
+  await closeMarketplaceAutoEbayTabs();
+
+  await chrome.storage.local.remove(
+    "ebayCompContext"
+  );
+
+  const processedListingUrls = [
+    ...(state.processedListingUrls || []),
+    currentUrl
+  ];
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_AUTO_STATE_KEY]: {
+      ...state,
+      processedListingUrls: [
+        ...new Set(processedListingUrls)
+      ],
+      currentListingUrl: "",
+      waitingForAnalysis: false,
+      analysisDone: false,
+      lastResult: finalTimeoutResult,
+      lastResultAt: Date.now()
+    }
+  });
+
+console.log(
+  "[MARKETPLACE TAB] Listing failed after retry limit. Closing child tab."
+);
+
+await sleep(
+  500
+);
+
+await closeCurrentMarketplaceListingTab();
+
+return;
+}
+  }
+}
+
+function getMarketplaceCarouselThumbnailCount() {
+  const imgs = Array.from(document.querySelectorAll("img"))
+    .map(img => {
+      const rect = img.getBoundingClientRect();
+
+      return {
+        src: img.src || "",
+        rect,
+        width: rect.width,
+        height: rect.height,
+        area: rect.width * rect.height
+      };
+    })
+    .filter(img => img.src.includes("fbcdn.net"))
+    .filter(img => img.width >= 20 && img.width <= 80)
+    .filter(img => img.height >= 20 && img.height <= 80)
+
+    // Thumbnail strip is usually near the bottom of the main photo area,
+    // not down in Today's Picks.
+    .filter(img => img.rect.top > window.innerHeight * 0.55)
+    .filter(img => img.rect.top < window.innerHeight - 10)
+
+    // Keep it inside the main image column.
+    .filter(img => img.rect.left > 80)
+    .filter(img => img.rect.left < window.innerWidth * 0.65);
+
+  if (!imgs.length) {
+    console.log("No carousel thumbnails detected.");
+    return null;
+  }
+
+  // Group thumbnails by vertical row. The real carousel thumbnails should
+  // sit on almost the same y-coordinate.
+  const rows = [];
+
+  for (const img of imgs) {
+    let row = rows.find(existing =>
+      Math.abs(existing.top - img.rect.top) < 12
+    );
+
+    if (!row) {
+      row = {
+        top: img.rect.top,
+        imgs: []
+      };
+      rows.push(row);
+    }
+
+    row.imgs.push(img);
+  }
+
+  rows.sort((a, b) => b.imgs.length - a.imgs.length);
+
+  const bestRow = rows[0];
+  const uniqueThumbs = [];
+
+  for (const img of bestRow.imgs.sort((a, b) => a.rect.left - b.rect.left)) {
+    const duplicate = uniqueThumbs.some(existing =>
+      Math.abs(existing.rect.left - img.rect.left) < 8 &&
+      Math.abs(existing.rect.top - img.rect.top) < 8
+    );
+
+    if (!duplicate) {
+      uniqueThumbs.push(img);
+    }
+  }
+
+  console.log("Carousel thumbnail candidates:", imgs);
+  console.log("Best carousel thumbnail row:", uniqueThumbs);
+
+  return uniqueThumbs.length || null;
+}
+
+async function getListingImageUrls() {
+  const seen = new Set();
+
+  /*
+    Reject Facebook loading graphics, placeholders, progress indicators,
+    and images contained inside loading elements.
+  */
+  function elementLooksLikeLoader(img) {
+    const text = [
+      img.alt,
+      img.title,
+      img.getAttribute("aria-label"),
+      img.closest('[role="progressbar"]')?.getAttribute("aria-label"),
+      img.closest('[aria-busy="true"]')?.getAttribute("aria-label")
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
+    if (
+      text.includes("loading") ||
+      text.includes("progress") ||
+      text.includes("please wait")
+    ) {
+      return true;
+    }
+
+    if (
+      img.closest(
+        '[role="progressbar"], [aria-busy="true"]'
+      )
+    ) {
+      return true;
+    }
+
+    const src = String(
+      img.currentSrc ||
+      img.src ||
+      ""
+    ).toLowerCase();
+
+    return (
+      src.includes("spinner") ||
+      src.includes("loading") ||
+      src.includes("progress") ||
+      src.includes("placeholder") ||
+      src.includes("shimmer")
+    );
+  }
+
+  /*
+    Check whether Facebook currently has a visible loader in the
+    Marketplace media area.
+  */
+  function visibleMarketplaceLoaderExists() {
+    const loaders = Array.from(
+      document.querySelectorAll(
+        [
+          '[role="progressbar"]',
+          '[aria-busy="true"]',
+          '[aria-label*="Loading" i]'
+        ].join(", ")
+      )
+    );
+
+    return loaders.some(loader => {
+      const rect =
+        loader.getBoundingClientRect();
+
+      const style =
+        window.getComputedStyle(loader);
+
+      return (
+        rect.width > 20 &&
+        rect.height > 20 &&
+        rect.bottom > 80 &&
+        rect.top < window.innerHeight &&
+        rect.left < window.innerWidth * 0.75 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity || 1) > 0
+      );
+    });
+  }
+
+  /*
+    Do not scrape immediately after opening a listing or clicking the
+    next-photo button. Wait until:
+
+    1. No visible loader remains.
+    2. The visible image candidates remain unchanged for several checks.
+  */
+  async function waitForMarketplacePhotoToSettle(
+    timeoutMs = 4500
+  ) {
+    const startedAt = Date.now();
+
+    let stableChecks = 0;
+    let previousSignature = "";
+
+    while (
+      Date.now() - startedAt <
+      timeoutMs
+    ) {
+      const candidates = Array.from(
+        document.querySelectorAll("img")
+      )
+        .filter(
+          img =>
+            !elementLooksLikeLoader(img)
+        )
+        .map(img => {
+          const rect =
+            img.getBoundingClientRect();
+
+          return {
+            src:
+              img.currentSrc ||
+              img.src ||
+              "",
+
+            width: rect.width,
+            height: rect.height,
+
+            top:
+              Math.round(rect.top),
+
+            left:
+              Math.round(rect.left)
+          };
+        })
+        .filter(
+          img =>
+            img.src.includes("fbcdn.net")
+        )
+        .filter(
+          img =>
+            img.width >= 220 &&
+            img.height >= 180
+        )
+        .filter(
+          img =>
+            img.top > -250
+        )
+        .filter(
+          img =>
+            img.top <
+            window.innerHeight + 250
+        )
+        .filter(
+          img =>
+            img.left <
+            window.innerWidth * 0.72
+        )
+        .sort(
+          (a, b) =>
+            b.width * b.height -
+            a.width * a.height
+        )
+        .slice(0, 3);
+
+      const signature =
+        JSON.stringify(candidates);
+
+      const loaderVisible =
+        visibleMarketplaceLoaderExists();
+
+      if (
+        !loaderVisible &&
+        signature &&
+        signature === previousSignature
+      ) {
+        stableChecks += 1;
+      } else {
+        stableChecks = 0;
+      }
+
+      if (stableChecks >= 2) {
+        return;
+      }
+
+      previousSignature = signature;
+
+      await sleep(300);
+    }
+  }
+
+  function collectVisibleListingImages() {
+    const allImages = Array.from(
+      document.querySelectorAll("img")
+    );
+
+    let listingImages = allImages
+      .map(img => {
+        const rect =
+          img.getBoundingClientRect();
+
+        return {
+          el: img,
+
+          src:
+            img.currentSrc ||
+            img.src ||
+            "",
+
+          naturalWidth:
+            img.naturalWidth || 0,
+
+          naturalHeight:
+            img.naturalHeight || 0,
+
+          rect,
+
+          renderedArea:
+            Math.max(0, rect.width) *
+            Math.max(0, rect.height)
+        };
+      })
+
+      .filter(img => img.src)
+      .filter(
+        img =>
+          img.src.startsWith("http")
+      )
+      .filter(
+        img =>
+          img.src.includes("fbcdn.net")
+      )
+
+      // Reject Facebook loaders and placeholders.
+      .filter(
+        img =>
+          !elementLooksLikeLoader(img.el)
+      )
+
+      .filter(
+        img =>
+          !img.src.includes("emoji")
+      )
+      .filter(
+        img =>
+          !img.src.includes("profile")
+      )
+      .filter(
+        img =>
+          !img.src.includes("static")
+      )
+
+      /*
+        Use the actual on-screen dimensions.
+
+        The old version relied heavily on naturalWidth/naturalHeight,
+        which can allow hidden or unrelated large Facebook assets.
+      */
+      .filter(
+        img =>
+          img.rect.width >= 220
+      )
+      .filter(
+        img =>
+          img.rect.height >= 180
+      )
+      .filter(
+        img =>
+          img.renderedArea >= 50000
+      )
+
+      /*
+        Limit candidates to the visible Marketplace media column.
+      */
+      .filter(
+        img =>
+          img.rect.top > -250
+      )
+      .filter(
+        img =>
+          img.rect.top <
+          window.innerHeight + 250
+      )
+      .filter(
+        img =>
+          img.rect.left > -50
+      )
+      .filter(
+        img =>
+          img.rect.left <
+          window.innerWidth * 0.72
+      )
+      .filter(
+        img =>
+          img.rect.right > 80
+      );
+
+    /*
+      Determine the dominant visible image, then reject images that
+      are much smaller.
+
+      This helps remove thumbnails, avatars, recommendation cards,
+      and interface graphics.
+    */
+    const largestRenderedArea = Math.max(
+      0,
+      ...listingImages.map(
+        img => img.renderedArea
+      )
+    );
+
+    if (largestRenderedArea > 0) {
+      listingImages =
+        listingImages.filter(
+          img =>
+            img.renderedArea >=
+            largestRenderedArea * 0.55
+        );
+    }
+
+    listingImages.sort((a, b) => {
+      if (
+        Math.abs(
+          b.renderedArea -
+          a.renderedArea
+        ) > 5000
+      ) {
+        return (
+          b.renderedArea -
+          a.renderedArea
         );
       }
 
+      return (
+        a.rect.left -
+        b.rect.left
+      );
+    });
 
-      const auth =
-        createGoogleOAuthClient();
+    for (const img of listingImages) {
+      seen.add(img.src);
+    }
 
-      auth.setCredentials({
-        refresh_token:
-          process.env
-            .GOOGLE_OAUTH_REFRESH_TOKEN
-      });
+    console.log(
+      "Visible listing image candidates after loader filtering:",
+      listingImages.map(
+        ({ el, ...candidate }) =>
+          candidate
+      )
+    );
+  }
+
+  function findNextPhotoButton() {
+    const buttons = Array.from(
+      document.querySelectorAll(
+        '[role="button"], button'
+      )
+    );
+
+    return buttons.find(button => {
+      const rect =
+        button.getBoundingClientRect();
+
+      const label = [
+        button.getAttribute("aria-label"),
+        button.innerText,
+        button.title
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      const isRightSide =
+        rect.left >
+          window.innerWidth * 0.5 &&
+        rect.top > 100 &&
+        rect.top <
+          window.innerHeight - 60;
+
+      const buttonText =
+        String(
+          button.innerText || ""
+        ).trim();
+
+      const looksLikeNext =
+        label.includes("next") ||
+        label.includes("see next") ||
+        label.includes("next photo") ||
+        buttonText === "›" ||
+        buttonText === ">";
+
+      return (
+        isRightSide &&
+        looksLikeNext
+      );
+    });
+  }
+
+  /*
+    Wait for Facebook to replace the purple loading graphic with the
+    actual listing photo before collecting anything.
+  */
+  await waitForMarketplacePhotoToSettle();
+
+  collectVisibleListingImages();
+
+  for (let i = 0; i < 8; i++) {
+    const beforeCount = seen.size;
+
+    const nextButton =
+      findNextPhotoButton();
+
+    if (!nextButton) {
+      console.log(
+        "No next photo button found."
+      );
+
+      break;
+    }
+
+    nextButton.click();
+
+    /*
+      Replace the old fixed sleep(700) with an actual wait for the
+      next image and loader state to stabilize.
+    */
+    await waitForMarketplacePhotoToSettle();
+
+    collectVisibleListingImages();
+
+    if (seen.size === beforeCount) {
+      console.log(
+        "No new image found after clicking next."
+      );
+
+      break;
+    }
+
+    if (seen.size >= 8) {
+      break;
+    }
+  }
+
+  const uniqueUrls = [...seen];
+
+  const carouselCount =
+    getMarketplaceCarouselThumbnailCount();
+
+  /*
+    Preserve your existing rule:
+
+    - Detected carousel: return up to its thumbnail count.
+    - No carousel: return only one image.
+  */
+  const finalLimit =
+    Number.isInteger(carouselCount) &&
+    carouselCount > 0
+      ? Math.min(carouselCount, 8)
+      : 1;
+
+  const finalUrls =
+    uniqueUrls.slice(0, finalLimit);
+
+  console.log(
+    "Detected carousel image count:",
+    carouselCount
+  );
+
+  console.log(
+    "Final listing image URLs after loader filtering and carousel trim:",
+    finalUrls
+  );
+
+  return finalUrls;
+}
+
+function normalizeConditionForEbay(condition) {
+  const c = String(condition || "").toLowerCase();
+
+  if (c.includes("open box")) return "1500";
+  if (c.includes("new")) return "1000";
+  if (c.includes("parts") || c.includes("repair")) return "7000";
+  if (c.includes("used")) return "3000";
+
+  return "3000";
+}
+
+function normalizeNegativeSearchTerms(terms) {
+  if (!Array.isArray(terms)) return [];
+
+  const blocked = new Set([
+    "",
+    "used",
+    "new",
+    "open box",
+    "broken",
+    "tested",
+    "working",
+    "bundle",
+    "lot",
+    "parts",
+    "repair",
+    "camera",
+    "lens",
+    "body",
+    "charger",
+    "case",
+    "strap",
+    "battery",
+    "manual",
+    "box"
+  ]);
+
+  const seen = new Set();
+
+  return terms
+    .map(term => String(term || "").trim())
+    .filter(Boolean)
+    .filter(term => term.length <= 40)
+    .filter(term => !blocked.has(term.toLowerCase()))
+    .filter(term => {
+      const key = term.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 10);
+}
+
+function formatEbayNegativeTerm(term) {
+  const clean = String(term || "").trim();
+
+  if (!clean) return "";
+
+  if (/\s/.test(clean)) {
+    return `-"${clean.replaceAll('"', "")}"`;
+  }
+
+  return `-${clean}`;
+}
+
+function buildEbayQueryWithNegativeTerms(query, negativeSearchTerms) {
+  const cleanQuery = String(query || "").trim();
+
+  const negatives = normalizeNegativeSearchTerms(negativeSearchTerms)
+    .map(formatEbayNegativeTerm)
+    .filter(Boolean);
+
+  return [cleanQuery, ...negatives].filter(Boolean).join(" ");
+}
+
+function buildEbaySoldSearchUrl(query, condition, negativeSearchTerms = []) {
+  const finalQuery = buildEbayQueryWithNegativeTerms(query, negativeSearchTerms);
+  const encodedQuery = encodeURIComponent(finalQuery);
+  const conditionCode = normalizeConditionForEbay(condition);
+
+  return (
+    `https://www.ebay.com/sch/i.html?_nkw=${encodedQuery}` +
+    `&LH_Sold=1&LH_Complete=1` +
+    `&LH_ItemCondition=${conditionCode}` +
+    `&_sop=13`
+  );
+}
+
+function openEbaySoldSearch(query, condition, negativeSearchTerms = []) {
+  const cleanQuery = String(query || "").trim();
+
+  if (!cleanQuery) {
+    console.warn(
+      "Blocked blank eBay search query. Skipping search without popup.",
+      {
+        query,
+        condition
+      }
+    );
+
+    return false;
+  }
+
+  const finalQuery = buildEbayQueryWithNegativeTerms(
+    cleanQuery,
+    negativeSearchTerms
+  );
+
+  const url = buildEbaySoldSearchUrl(
+    cleanQuery,
+    condition,
+    negativeSearchTerms
+  );
+
+  console.log("Opening eBay URL:", url);
+  console.log("Opening eBay query with negative terms:", {
+    baseQuery: cleanQuery,
+    negativeSearchTerms:
+      normalizeNegativeSearchTerms(negativeSearchTerms),
+    finalQuery
+  });
+
+  window.open(url, "_blank");
+
+  return true;
+}
+
+function getCurrentFacebookListingUrl() {
+  return window.location.href;
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function showDebugPreview({
+  title,
+  description,
+  imageUrls,
+  screenshotDataUrl = null,
+  referenceCollageDataUrl = null,
+  galleries = [],
+  aiResult = null
+}) {
+  const existing = document.getElementById("ebay-ai-debug-panel");
+  if (existing) existing.remove();
+
+  const panel = document.createElement("div");
+  panel.id = "ebay-ai-debug-panel";
+
+  const imageHtml = imageUrls.length
+    ? imageUrls
+        .map(
+          src => `
+            <div style="margin-bottom:8px;">
+              <img src="${escapeHtml(src)}" style="width:100%; max-height:140px; object-fit:cover; border-radius:8px; border:1px solid #ddd;" />
+              <div style="font-size:10px; color:#666; word-break:break-all; margin-top:3px;">${escapeHtml(src)}</div>
+            </div>
+          `
+        )
+        .join("")
+    : `<div style="color:#999;">No images detected.</div>`;
+
+const screenshotHtml = screenshotDataUrl
+  ? `
+    <hr style="margin:12px 0;" />
+    <div style="font-weight:700; margin-bottom:6px;">Page screenshot sent to AI</div>
+    <img src="${screenshotDataUrl}" style="width:100%; max-height:360px; object-fit:contain; border-radius:8px; border:1px solid #ddd; background:#fff;" />
+  `
+  : "";
+
+const listingImagesSentHtml = aiResult?.listingImagesSent != null
+  ? `
+    <hr style="margin:12px 0;" />
+    <div style="font-weight:700; margin-bottom:6px;">Listing images sent to AI</div>
+    <div style="font-size:12px;">${escapeHtml(aiResult.listingImagesSent)} separate listing image(s) sent.</div>
+  `
+  : "";
+
+  const referenceHtml = referenceCollageDataUrl
+  ? `
+    <hr style="margin:12px 0;" />
+    <div style="font-weight:700; margin-bottom:6px;">Reference images checked by AI</div>
+    <img src="${referenceCollageDataUrl}" style="width:100%; max-height:360px; object-fit:contain; border-radius:8px; border:1px solid #ddd; background:#fff;" />
+  `
+  : "";
+
+const galleriesHtml =
+  Array.isArray(galleries) &&
+  galleries.length
+    ? `
+      <hr style="margin:12px 0;" />
+
+      <div style="
+        font-weight:700;
+        margin-bottom:8px;
+      ">
+        Step 2 Gallery Collages
+      </div>
+
+      ${galleries
+        .map(
+          gallery => `
+            <div style="
+              margin-bottom:16px;
+            ">
+              <div style="
+                font-size:12px;
+                font-weight:700;
+                margin-bottom:5px;
+              ">
+                Gallery ${gallery.galleryIndex}
+                — Images ${gallery.startingImageIndex}
+                through ${gallery.endingImageIndex}
+              </div>
+
+              ${
+                gallery.debugCollageDataUrl
+                  ? `
+                    <img
+                      src="${gallery.debugCollageDataUrl}"
+                      style="
+                        width:100%;
+                        max-height:500px;
+                        object-fit:contain;
+                        border-radius:8px;
+                        border:1px solid #ddd;
+                        background:#fff;
+                      "
+                    />
+                  `
+                  : `
+                    <div style="
+                      font-size:11px;
+                      color:#999;
+                    ">
+                      No collage image available.
+                    </div>
+                  `
+              }
+
+              <pre style="
+                white-space:pre-wrap;
+                background:#f5f5f5;
+                padding:8px;
+                border-radius:6px;
+                font-size:10px;
+                max-height:220px;
+                overflow:auto;
+                margin-top:6px;
+              ">${escapeHtml(
+                JSON.stringify(
+                  gallery.galleryAnalysis,
+                  null,
+                  2
+                )
+              )}</pre>
+            </div>
+          `
+        )
+        .join("")}
+    `
+    : "";
+
+  const aiHtml = aiResult
+    ? `
+      <hr style="margin:12px 0;" />
+      <div style="font-weight:700; margin-bottom:6px;">AI Result</div>
+      <pre style="white-space:pre-wrap; background:#f5f5f5; padding:8px; border-radius:6px; font-size:11px;">${escapeHtml(JSON.stringify(aiResult, null, 2))}</pre>
+    `
+    : "";
+
+  panel.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+      <div style="font-weight:700; font-size:14px;">Data sent to AI</div>
+      <button id="ebay-ai-debug-close" style="border:none; background:#eee; padding:4px 8px; border-radius:6px; cursor:pointer;">Close</button>
+    </div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:12px; font-weight:700;">Title</div>
+    <div style="font-size:12px; margin-bottom:10px;">${escapeHtml(title || "No title detected")}</div>
+
+    <div style="font-size:12px; font-weight:700;">Description / Text</div>
+    <pre style="white-space:pre-wrap; background:#f5f5f5; padding:8px; border-radius:6px; font-size:11px; max-height:140px; overflow:auto;">${escapeHtml(description || "No description detected")}</pre>
+
+    <div style="font-size:12px; font-weight:700; margin-top:10px;">Images detected: ${imageUrls.length}</div>
+    <div style="max-height:360px; overflow:auto; margin-top:6px;">
+      ${imageHtml}
+    </div>
+
+${screenshotHtml}
+${listingImagesSentHtml}
+${referenceHtml}
+${galleriesHtml}
+${aiHtml}
+  `;
+
+  document.body.appendChild(panel);
+
+  document.getElementById("ebay-ai-debug-close").onclick = () => {
+    panel.remove();
+  };
+}
+
+async function skipAutoListingBecauseOverPriceLimit(price) {
+  const stored = await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
+  const state = stored[MARKETPLACE_AUTO_STATE_KEY];
+
+  if (!state?.running) {
+    return false;
+  }
+
+  const currentUrl = window.location.href.split("?")[0];
+
+  const currentListingId = getFacebookMarketplaceItemId(currentUrl);
+
+  const processedListingUrls = [
+    ...(state.processedListingUrls || []),
+    state.currentListingUrl || currentUrl
+  ];
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_AUTO_STATE_KEY]: {
+      ...state,
+      processedListingUrls: [...new Set(processedListingUrls)],
+      currentListingUrl: "",
+      waitingForAnalysis: false,
+      analysisDone: false,
+      lastResult: {
+        recommendation: "Skipped",
+        reason: `Skipped because Facebook asking price was $${price}, above the $${MAX_FACEBOOK_ASK_PRICE} limit.`
+      },
+      lastResultAt: Date.now()
+    }
+  });
+
+console.log(
+  `Skipping listing because Facebook asking price $${price} is above $${MAX_FACEBOOK_ASK_PRICE}. Closing listing tab.`
+);
+
+await sleep(
+  500
+);
+
+await closeCurrentMarketplaceListingTab();
+
+return true;
+}
+
+function getFacebookAskingPrice() {
+  function parsePrice(text) {
+    const clean =
+      String(text || "").trim();
+
+    if (
+      !/^\$[\d,]+(?:\.\d{2})?$/.test(clean)
+    ) {
+      return null;
+    }
+
+    const value =
+      Number(
+        clean
+          .replace("$", "")
+          .replace(/,/g, "")
+      );
+
+    return (
+      Number.isFinite(value) &&
+      value > 0 &&
+      value < 100000
+    )
+      ? value
+      : null;
+  }
 
 
-      const sheets =
-        google.sheets({
-          version: "v4",
-          auth
-        });
+  const elements =
+    Array.from(
+      document.querySelectorAll(
+        "span, div"
+      )
+    );
 
+
+  for (const element of elements) {
+    const price =
+      parsePrice(
+        element.innerText ||
+        element.textContent
+      );
+
+    if (price == null) {
+      continue;
+    }
+
+
+    /*
+      Facebook discounted listings can show:
+
+        $350   $450
+
+      where $450 is the old crossed-out price.
+
+      Never use a struck-through price as the
+      current Marketplace asking price.
+    */
+    const style =
+      window.getComputedStyle(
+        element
+      );
+
+    const textDecoration =
+      String(
+        style.textDecoration ||
+        style.textDecorationLine ||
+        ""
+      ).toLowerCase();
+
+
+    if (
+      textDecoration.includes(
+        "line-through"
+      )
+    ) {
+      continue;
+    }
+
+
+    /*
+      Also check parent styling because Facebook
+      may apply the line-through to a wrapper
+      instead of the text element itself.
+    */
+    const parent =
+      element.parentElement;
+
+    if (parent) {
+      const parentStyle =
+        window.getComputedStyle(
+          parent
+        );
+
+      const parentDecoration =
+        String(
+          parentStyle.textDecoration ||
+          parentStyle.textDecorationLine ||
+          ""
+        ).toLowerCase();
+
+      if (
+        parentDecoration.includes(
+          "line-through"
+        )
+      ) {
+        continue;
+      }
+    }
+
+
+    return price;
+  }
+
+
+  return null;
+}
+
+function captureVisibleTabScreenshot() {
+  return new Promise(resolve => {
+    if (
+      typeof chrome === "undefined" ||
+      !chrome.runtime ||
+      !chrome.runtime.sendMessage
+    ) {
+      console.warn("chrome.runtime.sendMessage is unavailable. Continuing without screenshot.");
+      resolve(null);
+      return;
+    }
+
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: "CAPTURE_VISIBLE_TAB"
+        },
+        response => {
+          if (chrome.runtime.lastError) {
+            console.warn("Screenshot capture failed:", chrome.runtime.lastError.message);
+            resolve(null);
+            return;
+          }
+
+          if (!response || !response.ok) {
+            console.warn("Screenshot capture failed:", response?.error);
+            resolve(null);
+            return;
+          }
+
+          resolve(response.screenshotDataUrl);
+        }
+      );
+    } catch (error) {
+      console.warn("Screenshot capture threw error:", error.message);
+      resolve(null);
+    }
+  });
+}
+
+function itemLooksLikeCameraOrLens(item) {
+  const text = [
+    item?.brand,
+    item?.model,
+    item?.productType,
+    item?.ebaySearchQuery,
+    item?.reason
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const cameraLensTerms = [
+    "camera",
+    "camera body",
+    "film camera",
+    "digital camera",
+    "dslr",
+    "mirrorless",
+    "point and shoot",
+    "point-and-shoot",
+    "bridge camera",
+    "lens",
+    "camera lens",
+    "zoom lens",
+    "prime lens"
+  ];
+
+  return cameraLensTerms.some(term => text.includes(term));
+}
+
+function listingLooksLikeCameraOrLens(data, primaryItems) {
+  const cameraAnalysis = data?.cameraAnalysis || {};
+
+  if (cameraAnalysis.isCameraListing === true) return true;
+  if (cameraAnalysis.cameraBodyVisible === true) return true;
+  if (cameraAnalysis.lensVisible === true) return true;
+
+  return primaryItems.some(itemLooksLikeCameraOrLens);
+}
+
+function parsePriceValue(value) {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value === "number") {
+    return value > 0 && value < 100000 ? value : null;
+  }
+
+  const text = String(value).replace(/,/g, "");
+  const match = text.match(/\$?\s*(\d+(\.\d{1,2})?)/);
+
+  if (!match) return null;
+
+  const price = Number(match[1]);
+
+  if (!price || Number.isNaN(price)) return null;
+  if (price <= 0 || price >= 100000) return null;
+
+  return price;
+}
+
+/*
+  ============================================================
+  OCR-BASED FACEBOOK ASKING PRICE
+
+  getFacebookAskingPrice() scans the WHOLE page's <span>/<div>
+  elements and returns the first plausible, non-struck-through
+  dollar amount it finds. That is not scoped to the open
+  listing at all, so on any page where another listing tile
+  (sidebar recommendations, "Today's picks", "Just listed",
+  session listings, etc.) renders its own price earlier in the
+  DOM than the actual listing panel, this silently returns a
+  completely unrelated price. It is also brittle against
+  Facebook's frequent DOM/class churn.
+
+  We already run Vision OCR on the full-tab screenshot for
+  listing text (STEP 1). Marketplace listing pages consistently
+  render the asking price as its own line immediately below the
+  title, e.g.:
+
+    Canon EOS T7 Camera
+    $300 $350
+    Listed 9 weeks ago in Ellsworth Air Force Base, SD
+
+  where a second, higher amount on the same line is the
+  crossed-out "was" price. Since OCR has no notion of
+  strikethrough styling, we rely on ORDER instead: the current
+  ask is always the first dollar amount on that line, and the
+  "was" price (if present) is always second.
+
+  This anchors on the title text itself (most reliable), and
+  falls back to anchoring on the "Listed ... ago" line that
+  follows it, since both are stable across every listing layout
+  we've seen. Only if OCR anchoring fails entirely do we fall
+  back to the old whole-page DOM scrape.
+  ============================================================
+*/
+/*
+  ============================================================
+  CANON POWERSHOT SKIP
+
+  Canon PowerShot point-and-shoots are not a category we buy.
+  Detected from the listing title (before any API spend) and
+  again from the resolved primary products (before the SerpApi
+  call and before pricing). Any detection skips the listing.
+  ============================================================
+*/
+function isCanonPowerShotText(text) {
+  return /power\s*-?\s*shot/i.test(
+    String(text || "")
+  );
+}
+
+function findCanonPowerShotPrimaryItems(items) {
+  return (
+    Array.isArray(items)
+      ? items
+      : []
+  ).filter(
+    item =>
+      isCanonPowerShotText(
+        `${item?.brand || ""} ${item?.model || ""} ${item?.nonLensIdentity?.modelName || ""}`
+      )
+  );
+}
+
+function buildCanonPowerShotPassResult({
+  facebookPrice,
+  items,
+  detectedFrom
+}) {
+  return {
+    recommendation:
+      "Pass",
+
+    reason:
+      `Immediate skip: Canon PowerShot detected (${detectedFrom}). PowerShot listings are not analyzed.`,
+
+    facebookPrice,
+
+    totalExpectedSalePrice:
+      null,
+
+    profitAtAsk:
+      null,
+
+    profitAt35:
+      null,
+
+    maxBuyPrice:
+      null,
+
+    validSoldCount:
+      0,
+
+    medianSoldPrice:
+      null,
+
+    items:
+      Array.isArray(items)
+        ? items
+        : [],
+
+    ignoredItems:
+      []
+  };
+}
+
+/*
+  ============================================================
+  STRIP EXTENSION HUD + MARKETPLACE SIDEBAR FROM SCREENSHOT OCR
+
+  Every listing screenshot OCR starts with the extension's own
+  status panel ("Auto Scan", "Search term", "Term switches", the
+  current search term and counters) followed by the Facebook
+  Marketplace sidebar (Buying / Selling / Location / Categories
+  ... Free Stuff). None of that is seller-written evidence, and
+  the search term in particular (e.g. "nikon") was being picked
+  up as a product brand.
+
+  Strategy:
+    1. If the text opens with the HUD header, drop everything up
+       to and including the sidebar's last item ("Free Stuff").
+       Fallbacks: the sidebar's first item ("Buying"), then the
+       "Term switches" label plus the value lines after it.
+    2. Drop known stray chrome lines that appear lower down.
+    3. If stripping would leave almost nothing, return the
+       original text unchanged.
+  ============================================================
+*/
+function stripMarketplaceHudFromOcr(rawText) {
+  const original = String(rawText || "");
+
+  if (!original.trim()) {
+    return original;
+  }
+
+  const lines = original.split(/\r?\n/);
+
+  const norm = line =>
+    String(line || "")
+      .trim()
+      .toLowerCase();
+
+  const head = lines
+    .slice(0, 12)
+    .map(norm);
+
+  const hasHudHeader =
+    head.includes("auto scan") ||
+    head.includes("analyzing listing") ||
+    head.includes("term switches") ||
+    head.includes("listings clicked");
+
+  let startIndex = 0;
+
+  if (hasHudHeader) {
+    const searchLimit =
+      Math.min(lines.length, 80);
+
+    const indexWithin =
+      pattern => {
+        for (let i = 0; i < searchLimit; i += 1) {
+          if (pattern.test(norm(lines[i]))) {
+            return i;
+          }
+        }
+
+        return -1;
+      };
+
+    const freeStuffIndex =
+      indexWithin(/^free stuff$/);
+
+    const buyingIndex =
+      indexWithin(/^buying$/);
+
+    const termSwitchesIndex =
+      indexWithin(/^term switches$/);
+
+    if (freeStuffIndex !== -1) {
+      startIndex = freeStuffIndex + 1;
+    } else if (buyingIndex !== -1) {
+      startIndex = buyingIndex + 1;
+    } else if (termSwitchesIndex !== -1) {
+      startIndex = termSwitchesIndex + 1;
 
       /*
-        B = Marketplace listing URL
-        J = Ongoing Conversation status
+        Skip the HUD value lines that follow the labels
+        (elapsed time, counters, remaining time, search term).
       */
-      const sheetResponse =
-        await sheets
-          .spreadsheets
-          .values
-          .get({
-            spreadsheetId,
+      let skipped = 0;
 
-            range:
-              `${tabName}!B:J`
-          });
+      while (
+        startIndex < lines.length &&
+        skipped < 7 &&
+        /^(live|\d+|\d+h \d+m \d+s|\d+m \d+s|[0-9o]+m \d+s?|[a-z0-9_-]{1,15})$/i
+          .test(
+            String(lines[startIndex] || "").trim()
+          ) &&
+        String(lines[startIndex] || "").trim().length <= 30
+      ) {
+        startIndex += 1;
+        skipped += 1;
+      }
+    }
+  }
 
+  const strayChrome =
+    new Set([
+      "auto scan",
+      "analyzing listing",
+      "session listings",
+      "scam listings",
+      "saved deals",
+      "library saving: on",
+      "library saving: off",
+      "stop scan",
+      "random keyword scan",
+      "collecting listing...",
+      "collecting listing",
+      "today's picks",
+      "just listed"
+    ]);
 
-      const rows =
-        sheetResponse
-          .data
-          .values ||
-        [];
+  const cleaned =
+    lines
+      .slice(startIndex)
+      .filter(
+        line => {
+          const value = norm(line);
 
+          if (!value) {
+            return true;
+          }
 
-      const targets =
-        [];
+          if (strayChrome.has(value)) {
+            return false;
+          }
 
+          /*
+            "Seattle 500 mi" location chip and
+            "Seattle, Washington. Within 500 mi" sidebar line.
+          */
+          if (
+            /^[a-z .,'-]+ \d+ mi$/.test(value) ||
+            /^[a-z .,'-]+\. within \d+ mi$/.test(value)
+          ) {
+            return false;
+          }
+
+          return true;
+        }
+      )
+      .join("\n")
+      .trim();
+
+  if (cleaned.length < 40) {
+    return original;
+  }
+
+  return cleaned;
+}
+
+function extractFacebookAskingPriceFromOcr(ocrText, title) {
+  const lines =
+    String(ocrText || "")
+      .split("\n")
+      .map(line => line.trim())
+      .filter(Boolean);
+
+  /*
+    A "price line" is a line whose ONLY content is one or two
+    dollar amounts, optionally followed by a short status tag
+    that Marketplace renders on the same line, e.g.:
+
+      $300
+      $185 $250          (second = crossed-out "was" price)
+      $250. In stock
+      $110 As Is
+
+    Lines like "Ships for $13.18" do not start with "$", so
+    shipping costs can never be mistaken for the ask.
+  */
+  const priceLinePattern =
+    /^\$\s?([\d,]+(?:\.\d{1,2})?)\.?(?:\s+\$\s?[\d,]+(?:\.\d{1,2})?)?\.?(?:\s+(?:in stock|as is|free shipping))?$/i;
+
+  /*
+    Lines that Marketplace renders directly AFTER the price in
+    the open-listing panel. Observed in real scans:
+    "Ships for $x", "Estimated arrival ...", "Message",
+    "Details", "Condition", "Listed ... ago", "In stock", "As Is".
+  */
+  const afterPriceMarkerPattern =
+    /^(ships for|estimated arrival|message\b|details\b|condition\b|listed\b|in stock|as is\b|free shipping|make an offer|buy now)|\bago\b/i;
+
+  function parseAmount(str) {
+    const value =
+      Number(String(str).replace(/,/g, ""));
+
+    return (
+      Number.isFinite(value) &&
+      value > 0 &&
+      value < 100000
+    )
+      ? value
+      : null;
+  }
+
+  function normalize(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  /*
+    PRIMARY: anchor on the listing title, but tolerate title
+    wrapping. The open-listing title is usually wrapped over
+    2-4 OCR lines (e.g. "Nikon D3200 DSLR Camera" / "w/ 18-55mm
+    Lens"), so an exact single-line equality test almost never
+    matched and the old code silently fell through to the
+    whole-page DOM scrape.
+  */
+  const titleNorm = normalize(title);
+  const titleTokens =
+    new Set(titleNorm.split(" ").filter(Boolean));
+
+  if (titleTokens.size >= 2) {
+    for (let i = 0; i < lines.length; i++) {
+      let acc = "";
 
       for (
-        let index = 0;
-        index < rows.length;
-        index++
+        let e = i;
+        e < Math.min(i + 4, lines.length);
+        e++
       ) {
-        const row =
-          rows[index] ||
-          [];
+        acc = (acc + " " + lines[e]).trim();
 
-        const listingUrl =
-          String(
-            row[0] ||
-            ""
-          ).trim();
+        const accTokens =
+          normalize(acc).split(" ").filter(Boolean);
 
-        const conversationStatus =
-          String(
-            row[8] ||
-            ""
-          )
-            .trim()
-            .toUpperCase();
+        if (accTokens.length > titleTokens.size + 2) {
+          break;
+        }
 
+        let overlap = 0;
+        for (const t of accTokens) {
+          if (titleTokens.has(t)) overlap++;
+        }
 
-        /*
-          Only P rows participate.
-        */
-        if (
-          conversationStatus !==
-          "P"
-        ) {
+        const coversTitle =
+          overlap / titleTokens.size >= 0.85;
+        const mostlyTitle =
+          accTokens.length > 0 &&
+          overlap / accTokens.length >= 0.85;
+
+        if (!coversTitle || !mostlyTitle) {
           continue;
         }
 
+        for (
+          let j = e + 1;
+          j < Math.min(e + 4, lines.length);
+          j++
+        ) {
+          const m = lines[j].match(priceLinePattern);
+          if (m) return parseAmount(m[1]);
+        }
+      }
+    }
+  }
+
+  /*
+    FALLBACK: first price line that is immediately followed by
+    a detail-panel marker line (Ships for / Message / Details /
+    Condition / Listed ... ago / In stock / As Is ...).
+    The old fallback only accepted "Listed ... ago", which does
+    not appear in the screenshots this scanner takes.
+  */
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(priceLinePattern);
+    if (!m) continue;
+
+    const next = lines.slice(i + 1, i + 5);
+
+    if (next.some(line => afterPriceMarkerPattern.test(line))) {
+      return parseAmount(m[1]);
+    }
+  }
+
+  return null;
+}
+
+/*
+  Every dollar amount that appears anywhere in the OCR text.
+  Used to sanity-check a DOM-scraped price: if the DOM price
+  is not visible anywhere in the listing screenshot, it came
+  from some other tile on the page and must not be trusted.
+*/
+function collectOcrDollarAmounts(ocrText) {
+  const amounts = new Set();
+  const re = /\$\s?([\d,]+(?:\.\d{1,2})?)/g;
+  const text = String(ocrText || "");
+  let m;
+
+  while ((m = re.exec(text)) !== null) {
+    const v = Number(m[1].replace(/,/g, ""));
+    if (Number.isFinite(v) && v > 0) amounts.add(v);
+  }
+
+  return amounts;
+}
+
+async function showSessionListingsLibrary() {
+  const stored = await chrome.storage.local.get(SESSION_LISTINGS_KEY);
+
+  const library = Array.isArray(stored[SESSION_LISTINGS_KEY])
+    ? stored[SESSION_LISTINGS_KEY]
+    : [];
+
+  const existing = document.getElementById("session-listings-panel");
+  if (existing) existing.remove();
+
+  const panel = document.createElement("div");
+  panel.id = "session-listings-panel";
+
+  function money(value) {
+    if (value === null || value === undefined) return "N/A";
+    const num = Number(value);
+    if (Number.isNaN(num)) return "N/A";
+    return "$" + num.toFixed(2).replace(/\.00$/, "");
+  }
+
+  const rows = library.map(entry => {
+    const recommendation = entry.recommendation || "Not analyzed yet";
+
+    return `
+      <div style="border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:10px; background:#fafafa;">
+        <div style="font-weight:800; font-size:13px;">
+          ${escapeHtml(entry.title || entry.sourceText || "Untitled Marketplace listing")}
+        </div>
+
+        <div style="font-size:11px; color:#555; margin-top:4px;">
+          <b>Recommendation:</b> ${escapeHtml(recommendation)}
+          &nbsp; <b>Ask:</b> ${money(entry.facebookPrice)}
+        </div>
+
+        <div style="font-size:11px; color:#555; margin-top:4px;">
+          <b>Estimated resale:</b> ${money(entry.estimatedResaleValue)}
+          &nbsp; <b>Profit at ask:</b> ${money(entry.profitAtAsk)}
+          &nbsp; <b>Profit at 35%:</b> ${money(entry.profitAt35)}
+        </div>
+
+        ${
+          entry.reason
+            ? `<div style="font-size:11px; color:#555; margin-top:4px;"><b>Reason:</b> ${escapeHtml(entry.reason)}</div>`
+            : ""
+        }
+
+        <div style="font-size:11px; color:#777; margin-top:4px;">
+          Clicked: ${escapeHtml(new Date(entry.clickedAt).toLocaleString())}
+          ${
+            entry.analyzedAt
+              ? ` · Analyzed: ${escapeHtml(new Date(entry.analyzedAt).toLocaleString())}`
+              : ""
+          }
+        </div>
+
+        ${
+          entry.facebookUrl
+            ? `<div style="margin-top:6px;"><a href="${escapeHtml(entry.facebookUrl)}" target="_blank" rel="noopener noreferrer">Open Facebook listing</a></div>`
+            : ""
+        }
+      </div>
+    `;
+  }).join("");
+
+  panel.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+      <div style="font-weight:800; font-size:14px;">Session Listings</div>
+
+      <div style="display:flex; gap:6px;">
+        <button id="session-listings-clear" style="border:none; background:#ffe5e5; color:#900; padding:4px 8px; border-radius:6px; cursor:pointer;">Clear</button>
+        <button id="session-listings-close" style="border:none; background:#eee; padding:4px 8px; border-radius:6px; cursor:pointer;">Close</button>
+      </div>
+    </div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:12px; margin-bottom:8px;">
+      Session listings clicked: ${library.length}
+    </div>
+
+    <div style="max-height:520px; overflow:auto;">
+      ${rows || `<div style="color:#777;">No session listings saved yet.</div>`}
+    </div>
+  `;
+
+  Object.assign(panel.style, {
+    position: "fixed",
+    top: "80px",
+    right: "20px",
+    width: "460px",
+    maxHeight: "700px",
+    overflow: "auto",
+    background: "#fff",
+    color: "#111",
+    zIndex: "999999",
+    padding: "14px",
+    borderRadius: "10px",
+    boxShadow: "0 4px 24px rgba(0,0,0,0.25)",
+    fontFamily: "Arial, sans-serif"
+  });
+
+  document.body.appendChild(panel);
+
+  document.getElementById("session-listings-clear").onclick = async () => {
+    await clearSessionListingsLibrary();
+  };
+
+  document.getElementById("session-listings-close").onclick = () => {
+    panel.remove();
+  };
+}
+
+async function showSavedDealLibrary() {
+  const stored = await chrome.storage.local.get("savedDealLibrary");
+  const library = Array.isArray(stored.savedDealLibrary)
+    ? stored.savedDealLibrary
+    : [];
+
+  const existing = document.getElementById("saved-deal-library-panel");
+  if (existing) existing.remove();
+
+  const panel = document.createElement("div");
+  panel.id = "saved-deal-library-panel";
+
+  function money(value) {
+    if (value === null || value === undefined) return "N/A";
+    const num = Number(value);
+    if (Number.isNaN(num)) return "N/A";
+    return "$" + num.toFixed(2).replace(/\.00$/, "");
+  }
+
+  const rows = library.map(entry => `
+    <div style="border-bottom:1px solid #eee; padding:10px 0;">
+      <div style="font-weight:800; font-size:13px;">
+        ${escapeHtml(entry.recommendation || "")}: ${escapeHtml(entry.title || "")}
+      </div>
+
+      <div style="font-size:12px; margin-top:4px;">
+        <b>Ask:</b> ${money(entry.facebookPrice)}
+        &nbsp; <b>Resale:</b> ${money(entry.estimatedResaleValue)}
+        &nbsp; <b>Profit ask:</b> ${money(entry.profitAtAsk)}
+        &nbsp; <b>Profit 35%:</b> ${money(entry.profitAt35)}
+        &nbsp; <b>Max buy:</b> ${money(entry.maxBuyPrice)}
+      </div>
+
+      <div style="font-size:11px; color:#555; margin-top:4px;">
+        ${escapeHtml(entry.reason || "")}
+      </div>
+
+      <div style="font-size:11px; color:#777; margin-top:4px;">
+        Saved: ${escapeHtml(new Date(entry.savedAt).toLocaleString())}
+      </div>
+
+      ${
+        entry.facebookUrl
+          ? `<div style="margin-top:6px;"><a href="${escapeHtml(entry.facebookUrl)}" target="_blank" rel="noopener noreferrer">Open Facebook listing</a></div>`
+          : ""
+      }
+    </div>
+  `).join("");
+
+panel.innerHTML = `
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+    <div style="font-weight:800; font-size:14px;">Saved Deal Library</div>
+
+    <div style="display:flex; gap:6px;">
+      <button id="saved-deal-library-clear" style="border:none; background:#ffe5e5; color:#900; padding:4px 8px; border-radius:6px; cursor:pointer;">Clear</button>
+      <button id="saved-deal-library-close" style="border:none; background:#eee; padding:4px 8px; border-radius:6px; cursor:pointer;">Close</button>
+    </div>
+  </div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:12px; margin-bottom:8px;">
+      Saved listings: ${library.length}
+    </div>
+
+    <div style="max-height:520px; overflow:auto;">
+      ${rows || `<div style="color:#777;">No saved Buy Now or Negotiate listings yet.</div>`}
+    </div>
+  `;
+
+  document.body.appendChild(panel);
+
+  document.getElementById("saved-deal-library-close").onclick = () => {
+    panel.remove();
+  };
+
+  document.getElementById("saved-deal-library-clear").onclick = async () => {
+    await clearSavedDealLibrary();
+  };
+}
+
+async function showScamListingsLibrary() {
+  const stored = await chrome.storage.local.get(
+    SCAM_LISTINGS_KEY
+  );
+
+  const library = Array.isArray(
+    stored[SCAM_LISTINGS_KEY]
+  )
+    ? stored[SCAM_LISTINGS_KEY]
+    : [];
+
+  const existing =
+    document.getElementById(
+      "scam-listings-panel"
+    );
+
+  if (existing) {
+    existing.remove();
+  }
+
+  const panel =
+    document.createElement("div");
+
+  panel.id = "scam-listings-panel";
+
+  function money(value) {
+    if (
+      value === null ||
+      value === undefined ||
+      value === ""
+    ) {
+      return "N/A";
+    }
+
+    const num = Number(value);
+
+    if (!Number.isFinite(num)) {
+      return "N/A";
+    }
+
+    return (
+      "$" +
+      num
+        .toFixed(2)
+        .replace(/\.00$/, "")
+    );
+  }
+
+  const rows = library
+    .map(entry => {
+      const ratio =
+        Number.isFinite(
+          Number(entry.resaleToAskRatio)
+        )
+          ? `${Number(
+              entry.resaleToAskRatio
+            ).toFixed(2)}x`
+          : "N/A";
+
+      const threshold =
+        Number.isFinite(
+          Number(entry.maxResaleToAskRatio)
+        )
+          ? `${Number(
+              entry.maxResaleToAskRatio
+            )}x`
+          : "2.5x";
+
+      const itemNames =
+        Array.isArray(entry.items)
+          ? entry.items
+              .filter(
+                item =>
+                  item?.isPrimarySellableItem !==
+                  false
+              )
+              .map(item => {
+                return (
+                  item.ebaySearchQuery ||
+                  `${item.brand || ""} ${
+                    item.model || ""
+                  } ${
+                    item.productType || ""
+                  }`
+                    .replace(/\s+/g, " ")
+                    .trim()
+                );
+              })
+              .filter(Boolean)
+          : [];
+
+      return `
+        <div style="
+          border-bottom:1px solid #ddd;
+          padding:12px 0;
+        ">
+          <div style="
+            font-weight:800;
+            font-size:13px;
+          ">
+            ${escapeHtml(
+              entry.title ||
+              "Untitled listing"
+            )}
+          </div>
+
+          <div style="
+            font-size:12px;
+            margin-top:5px;
+          ">
+            <b>Ask:</b>
+            ${money(entry.facebookPrice)}
+
+            &nbsp;
+
+            <b>Estimated resale:</b>
+            ${money(
+              entry.estimatedResaleValue
+            )}
+          </div>
+
+          <div style="
+            font-size:12px;
+            margin-top:4px;
+            color:#a00000;
+          ">
+            <b>Resale-to-ask ratio:</b>
+            ${escapeHtml(ratio)}
+
+            &nbsp;
+
+            <b>Threshold:</b>
+            ${escapeHtml(threshold)}
+          </div>
+
+          ${
+            itemNames.length
+              ? `
+                <div style="
+                  font-size:11px;
+                  color:#444;
+                  margin-top:5px;
+                ">
+                  <b>Products:</b>
+                  ${escapeHtml(
+                    itemNames.join(", ")
+                  )}
+                </div>
+              `
+              : ""
+          }
+
+          <div style="
+            font-size:11px;
+            color:#555;
+            margin-top:5px;
+          ">
+            <b>Reason:</b>
+            ${escapeHtml(
+              entry.reason || ""
+            )}
+          </div>
+
+          <div style="
+            font-size:11px;
+            color:#777;
+            margin-top:5px;
+          ">
+            Saved:
+            ${escapeHtml(
+              new Date(
+                entry.savedAt
+              ).toLocaleString()
+            )}
+          </div>
+
+          ${
+            entry.facebookUrl
+              ? `
+                <div style="margin-top:7px;">
+                  <a
+                    href="${escapeHtml(
+                      entry.facebookUrl
+                    )}"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open Facebook listing
+                  </a>
+                </div>
+              `
+              : ""
+          }
+        </div>
+      `;
+    })
+    .join("");
+
+  panel.innerHTML = `
+    <div style="
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:8px;
+    ">
+      <div style="
+        font-weight:800;
+        font-size:14px;
+      ">
+        Scam Listings
+      </div>
+
+      <div style="
+        display:flex;
+        gap:6px;
+      ">
+        <button
+          id="scam-listings-clear"
+          style="
+            border:none;
+            background:#ffe5e5;
+            color:#900;
+            padding:4px 8px;
+            border-radius:6px;
+            cursor:pointer;
+          "
+        >
+          Clear
+        </button>
+
+        <button
+          id="scam-listings-close"
+          style="
+            border:none;
+            background:#eee;
+            padding:4px 8px;
+            border-radius:6px;
+            cursor:pointer;
+          "
+        >
+          Close
+        </button>
+      </div>
+    </div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="
+      font-size:12px;
+      margin-bottom:8px;
+    ">
+      Scam listings: ${library.length}
+    </div>
+
+    <div style="
+      max-height:520px;
+      overflow:auto;
+    ">
+      ${
+        rows ||
+        `
+          <div style="color:#777;">
+            No scam listings yet.
+          </div>
+        `
+      }
+    </div>
+  `;
+
+  Object.assign(panel.style, {
+    position: "fixed",
+    top: "80px",
+    right: "20px",
+    width: "440px",
+    maxHeight: "700px",
+    overflow: "auto",
+    background: "#fff",
+    color: "#111",
+    zIndex: "999999",
+    padding: "14px",
+    borderRadius: "10px",
+    boxShadow:
+      "0 4px 24px rgba(0,0,0,0.25)",
+    fontFamily: "Arial, sans-serif"
+  });
+
+  document.body.appendChild(panel);
+
+  document.getElementById(
+    "scam-listings-clear"
+  ).onclick = async () => {
+    await clearScamListingsLibrary();
+  };
+
+  document.getElementById(
+    "scam-listings-close"
+  ).onclick = () => {
+    panel.remove();
+  };
+}
+
+async function clearScamListingsLibrary() {
+  const confirmed = confirm(
+    "Clear all scam listings?\n\n" +
+    "This cannot be undone."
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [SCAM_LISTINGS_KEY]: []
+  });
+
+  console.log(
+    "Scam listings cleared."
+  );
+
+  await showScamListingsLibrary();
+}
+
+async function clearSavedDealLibrary() {
+  const confirmed = confirm(
+    "Clear all saved Buy Now / Negotiate listings?\n\nThis cannot be undone."
+  );
+
+  if (!confirmed) return;
+
+  await chrome.storage.local.set({
+    savedDealLibrary: []
+  });
+
+  console.log("Saved deal library cleared.");
+
+  alert("Saved Buy Now / Negotiate listings cleared.");
+
+  await showSavedDealLibrary();
+}
+
+const LOCAL_SERVER_BASE_URL = "http://127.0.0.1:3000";
+
+async function isLocalServerRunning() {
+  const controller = new AbortController();
+
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, 2500);
+
+  try {
+    const response = await fetch(
+      `${LOCAL_SERVER_BASE_URL}/health`,
+      {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal
+      }
+    );
+
+    if (!response.ok) {
+      return false;
+    }
+
+    const data = await response.json();
+
+    return data?.ok === true;
+  } catch (error) {
+    console.warn(
+      "Local analysis server health check failed:",
+      error?.message || error
+    );
+
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchLocalServer(
+  path,
+  options = {},
+  settings = {}
+) {
+  const timeoutMs =
+    settings.timeoutMs ||
+    240000;
+
+  const retries =
+    settings.retries ?? 1;
+
+  let lastError = null;
+
+  /*
+    Preserve the existing per-listing
+    analysis log association.
+  */
+  const storedRun =
+    await chrome.storage.local.get(
+      MARKETPLACE_ANALYSIS_RUN_KEY
+    );
+
+  const analysisRunId =
+    storedRun[
+      MARKETPLACE_ANALYSIS_RUN_KEY
+    ]?.id || "";
+
+  const requestHeaders = {
+    ...(options.headers || {})
+  };
+
+  if (analysisRunId) {
+    requestHeaders[
+      "X-Analysis-Run-Id"
+    ] =
+      analysisRunId;
+  }
+
+  for (
+    let attempt = 0;
+    attempt <= retries;
+    attempt++
+  ) {
+    try {
+      /*
+        IMPORTANT:
+
+        Do not fetch localhost directly from
+        the Facebook/eBay content script.
+
+        Ask the extension service worker to
+        perform the request instead.
+      */
+      const proxyResult =
+        await new Promise(
+          (
+            resolve,
+            reject
+          ) => {
+            chrome.runtime.sendMessage(
+              {
+                type:
+                  "FETCH_LOCAL_SERVER",
+
+                url:
+                  `${LOCAL_SERVER_BASE_URL}${path}`,
+
+                timeoutMs,
+
+                options: {
+                  method:
+                    options.method ||
+                    "GET",
+
+                  headers:
+                    requestHeaders,
+
+                  body:
+                    options.body ??
+                    null
+                }
+              },
+
+              response => {
+                const runtimeError =
+                  chrome.runtime
+                    .lastError;
+
+                if (runtimeError) {
+                  reject(
+                    new Error(
+                      runtimeError.message
+                    )
+                  );
+
+                  return;
+                }
+
+                if (
+                  !response ||
+                  response.ok !== true
+                ) {
+                  reject(
+                    new Error(
+                      response?.error ||
+                      "Background local-server proxy failed."
+                    )
+                  );
+
+                  return;
+                }
+
+                resolve(
+                  response.response
+                );
+              }
+            );
+          }
+        );
+
+      /*
+        Recreate a normal Response object.
+
+        This means ALL of your existing code
+        can continue using:
+
+          response.ok
+          response.status
+          response.text()
+
+        without changing every endpoint call.
+      */
+      const response =
+        new Response(
+          proxyResult.body,
+          {
+            status:
+              proxyResult.status,
+
+            statusText:
+              proxyResult.statusText ||
+              "",
+
+            headers:
+              Array.isArray(
+                proxyResult.headers
+              )
+                ? proxyResult.headers
+                : []
+          }
+        );
+
+      return response;
+
+} catch (error) {
+  lastError =
+    error;
+
+  const errorMessage =
+    String(
+      error?.message ||
+      error ||
+      ""
+    );
+
+  /*
+    Reloading an extension invalidates all content
+    scripts already injected into open tabs.
+
+    Retrying cannot repair this. The page itself
+    must be refreshed.
+  */
+  if (
+    isExtensionContextInvalidated(
+      error
+    )
+  ) {
+    throw new Error(
+      "Extension context was invalidated. " +
+      "Refresh this Facebook/eBay tab after reloading the extension."
+    );
+  }
+
+  /*
+    This means the background service worker did
+    not keep/respond to the runtime message.
+
+    Retrying the Node server request is pointless
+    until the background messaging problem is fixed.
+  */
+  if (
+    /message port closed|receiving end does not exist/i.test(
+      errorMessage
+    )
+  ) {
+    throw new Error(
+      "Background service worker did not respond to FETCH_LOCAL_SERVER. " +
+      "Check that the FETCH_LOCAL_SERVER handler is in background.js " +
+      "and then reload the extension."
+    );
+  }
+
+  console.warn(
+    `Local server fetch failed on attempt ` +
+    `${attempt + 1}/${retries + 1}:`,
+    errorMessage
+  );
+
+  if (
+    attempt <
+    retries
+  ) {
+    await sleep(
+      1500 *
+      (attempt + 1)
+    );
+  }
+}
+  }
+
+  throw new Error(
+    `Local server fetch failed after ` +
+    `${retries + 1} attempt(s): ` +
+    `${lastError?.message || "unknown error"}. ` +
+    `Check that the server is running at ` +
+    `${LOCAL_SERVER_BASE_URL}.`
+  );
+}
+
+class LocalServerError extends Error {
+  constructor(data, fallbackMessage) {
+    super(
+      data?.error ||
+      data?.reason ||
+      fallbackMessage ||
+      "Local server request failed."
+    );
+
+    this.name = "LocalServerError";
+    this.code = data?.code || "SERVER_ERROR";
+    this.step = data?.step || "";
+    this.retryEntireListing =
+      data?.retryEntireListing === true;
+  }
+}
+
+async function readJsonSafely(response) {
+  const text = await response.text();
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    console.error("Server returned non-JSON or malformed JSON:", {
+      status: response.status,
+      statusText: response.statusText,
+      text: text.slice(0, 2000)
+    });
+
+   return {
+  error: "Server returned malformed JSON.",
+  code: "MALFORMED_SERVER_JSON",
+  retryEntireListing: true,
+  step: "Reading local server response",
+  rawResponse: text.slice(0, 2000)
+};
+  }
+}
+
+function getGalleryPrimaryProductCount(
+  galleries
+) {
+  const uniqueProductIds =
+    new Set();
+
+  let productsWithoutIds = 0;
+
+
+  for (
+    const gallery of galleries || []
+  ) {
+    const products =
+      Array.isArray(
+        gallery
+          ?.galleryAnalysis
+          ?.products
+      )
+        ? gallery.galleryAnalysis.products
+        : [];
+
+
+    for (
+      const product of products
+    ) {
+      const productId =
+        String(
+          product?.productId || ""
+        ).trim();
+
+
+      /*
+        Product IDs are global across galleries.
+
+        If camera_1 appears in Gallery 1 and
+        Gallery 2, it is still only ONE
+        physical primary product.
+      */
+      if (productId) {
+        uniqueProductIds.add(
+          productId
+        );
+      } else {
+        /*
+          Defensive fallback.
+
+          A product should normally always
+          have a productId, but don't let a
+          malformed result cause us to
+          undercount a large bundle.
+        */
+        productsWithoutIds += 1;
+      }
+    }
+  }
+
+
+  return (
+    uniqueProductIds.size +
+    productsWithoutIds
+  );
+}
+
+
+function isGalleryWithinPrimaryProductLimit(
+  galleries,
+  maximumProducts = 5
+) {
+  const primaryProductCount =
+    getGalleryPrimaryProductCount(
+      galleries
+    );
+
+  return {
+    primaryProductCount,
+
+    allowed:
+      primaryProductCount <=
+      maximumProducts
+  };
+}
+
+function pickBestGoogleTargets(
+  galleries,
+  imageUrls
+) {
+  /*
+    productId is GLOBAL across galleries.
+
+    camera_1 in Gallery 1 and camera_1 in Gallery 2
+    represent the same physical product.
+
+    Keep exactly ONE best OCR / image-search target
+    for each global productId.
+  */
+  const bestByProductId =
+    new Map();
+
+
+  for (
+    const gallery of galleries || []
+  ) {
+    const analysis =
+      gallery?.galleryAnalysis || {};
+
+    const products =
+      Array.isArray(
+        analysis.products
+      )
+        ? analysis.products
+        : [];
+
+    const images =
+      Array.isArray(
+        analysis.images
+      )
+        ? analysis.images
+        : [];
+
+
+    for (
+      const product of products
+    ) {
+      const productId =
+        String(
+          product?.productId || ""
+        ).trim();
+
+      if (!productId) {
+        continue;
+      }
+
+
+      for (
+        const imageEntry of images
+      ) {
+        const visibleProducts =
+          Array.isArray(
+            imageEntry.visibleProducts
+          )
+            ? imageEntry.visibleProducts
+            : [];
+
 
         const match =
-          listingUrl.match(
-            /\/marketplace\/item\/(\d+)/
+          visibleProducts.find(
+            item =>
+              String(
+                item?.productId || ""
+              ).trim() ===
+              productId
           );
 
 
@@ -20347,190 +9419,8164 @@ app.get(
         }
 
 
-        targets.push({
-          listingId:
-            match[1],
+        const imageIndex =
+          Number(
+            imageEntry.imageIndex
+          );
 
-          listingUrl:
-            `https://www.facebook.com/marketplace/item/${match[1]}/`,
+        const score =
+          Number(
+            match.modelReadabilityScore
+          );
 
-          sheetRow:
-            index + 1
-        });
-      }
-
-
-      /*
-        If there are no P conversations,
-        we're done immediately.
-      */
-      if (!targets.length) {
-        return res.json({
-          ok: true,
-          count: 0,
-          mappedCount: 0,
-          unmappedCount: 0,
-          targets: []
-        });
-      }
+        const imageUrl =
+          imageUrls[
+            imageIndex - 1
+          ];
 
 
-      const listingIds =
-        targets.map(
-          target =>
-            target.listingId
-        );
+        if (!imageUrl) {
+          continue;
+        }
 
 
-      /*
-        Find known Marketplace listing ->
-        Messenger conversation mappings.
-      */
-      const {
-        data: conversations,
-        error
-      } =
-        await supabaseAdmin
-          .from(
-            "marketplace_conversations"
-          )
-          .select(
-            `
-              listing_id,
-              conversation_id,
-              conversation_url,
-              seller_name
-            `
-          )
-          .in(
-            "listing_id",
-            listingIds
+        const sameTypeProductIds =
+          visibleProducts
+            .filter(
+              item =>
+                String(
+                  item?.productType || ""
+                )
+                  .trim()
+                  .toLowerCase() ===
+                String(
+                  product?.productType || ""
+                )
+                  .trim()
+                  .toLowerCase()
+            )
+            .map(
+              item =>
+                String(
+                  item?.productId || ""
+                ).trim()
+            )
+            .filter(Boolean);
+
+
+        const candidate = {
+          galleryIndex:
+            gallery.galleryIndex,
+
+          productId,
+
+          productType:
+            product.productType,
+
+          bestImageIndex:
+            imageIndex,
+
+          modelReadabilityScore:
+            score,
+
+          imageUrl,
+
+          sameTypeProductIds
+        };
+
+
+        const existing =
+          bestByProductId.get(
+            productId
           );
 
 
-      if (error) {
-        throw error;
-      }
+        /*
+          Pick the highest readability score
+          across ALL galleries.
 
-
-      const mappingByListingId =
-        new Map();
-
-
-      for (
-        const conversation of
-          conversations || []
-      ) {
-        const listingId =
-          String(
-            conversation
-              .listing_id ||
-            ""
-          ).trim();
-
+          On a tie, use the earlier Marketplace image.
+        */
         if (
-          listingId &&
-          !mappingByListingId.has(
-            listingId
+          !existing ||
+          score >
+            existing
+              .modelReadabilityScore ||
+          (
+            score ===
+              existing
+                .modelReadabilityScore &&
+            imageIndex <
+              existing
+                .bestImageIndex
           )
         ) {
-          mappingByListingId.set(
-            listingId,
-            conversation
+          bestByProductId.set(
+            productId,
+            candidate
           );
         }
       }
+    }
+  }
 
 
-      const enrichedTargets =
-        targets.map(
-          target => {
-            const mapping =
-              mappingByListingId.get(
-                target.listingId
-              );
+  return Array.from(
+    bestByProductId.values()
+  );
+}
+
+function buildEbaySearchQueryFromPrimaryProduct(
+  product
+) {
+  const brand =
+    String(
+      product?.brand || ""
+    ).trim();
+
+  const model =
+    String(
+      product?.model || ""
+    ).trim();
+
+  const productType =
+    String(
+      product?.productType || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  /*
+    Do not allow generic eBay searches for an
+    unresolved model.
+  */
+  if (!model) {
+    return "";
+  }
+
+  const identity =
+    [brand, model]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  if (!identity) {
+    return "";
+  }
+
+  if (productType === "camera body") {
+    return `${identity} body`;
+  }
+
+  if (productType === "camera lens") {
+    return `${identity} lens`;
+  }
+
+  if (productType === "camera") {
+    return `${identity} camera`;
+  }
+
+  if (productType === "flash") {
+    return `${identity} flash`;
+  }
+
+  return identity;
+}
 
 
-            const conversationId =
-              String(
-                mapping
-                  ?.conversation_id ||
-                ""
-              ).trim();
+function convertReconciledProductToCompItem(
+  product,
+  index,
+  condition = "Used"
+) {
+  const productId =
+    String(
+      product?.productId ||
+      `product_${index + 1}`
+    ).trim();
+
+  return {
+    itemId:
+      productId,
+
+    productId,
+
+    brand:
+      String(
+        product?.brand || ""
+      ).trim(),
+
+    model:
+      String(
+        product?.model || ""
+      ).trim(),
+
+    productType:
+      String(
+        product?.productType || ""
+      ).trim(),
+
+    condition:
+      condition || "Used",
+
+    confidence:
+      product?.model
+        ? 100
+        : 0,
+
+    isPrimarySellableItem:
+      true,
+
+    ebaySearchQuery:
+      buildEbaySearchQueryFromPrimaryProduct(
+        product
+      ),
+
+    negativeSearchTerms:
+      [],
+
+    reason:
+      "Identified by the gallery + Google Lens reconciliation pipeline."
+  };
+}
+
+async function getOrCreateMarketplaceAnalysisRun() {
+  const listingId =
+    getFacebookMarketplaceItemId() ||
+    "unknown_listing";
+
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_ANALYSIS_RUN_KEY
+    );
+
+  const existing =
+    stored[
+      MARKETPLACE_ANALYSIS_RUN_KEY
+    ];
+
+  /*
+    Reuse the existing run when the SAME listing
+    is being restarted/retried.
+
+    This allows malformed-JSON retries and other
+    full listing restarts to remain in one log.
+  */
+  if (
+    existing?.id &&
+    existing?.listingId === listingId &&
+    !existing?.completedAt &&
+    Date.now() -
+      Number(existing.startedAt || 0) <
+      2 * 60 * 60 * 1000
+  ) {
+    return existing;
+  }
+
+  const randomPart =
+    typeof crypto?.randomUUID === "function"
+      ? crypto.randomUUID()
+      : (
+          Date.now() +
+          "_" +
+          Math.random()
+            .toString(36)
+            .slice(2)
+        );
+
+  const run = {
+    id:
+      `${listingId}_${randomPart}`,
+
+    listingId,
+
+    startedAt:
+      Date.now(),
+
+    completedAt:
+      null
+  };
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_ANALYSIS_RUN_KEY]:
+      run
+  });
+
+  return run;
+}
 
 
-            return {
-              ...target,
+async function markMarketplaceAnalysisRunCompleted() {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_ANALYSIS_RUN_KEY
+    );
 
-              mapped:
-                Boolean(
-                  conversationId
-                ),
+  const existing =
+    stored[
+      MARKETPLACE_ANALYSIS_RUN_KEY
+    ];
 
-              conversationId,
+  if (!existing?.id) {
+    return;
+  }
 
-              conversationUrl:
-                conversationId
-                  ? `https://www.facebook.com/messages/t/${conversationId}`
-                  : "",
+  await chrome.storage.local.set({
+    [MARKETPLACE_ANALYSIS_RUN_KEY]: {
+      ...existing,
+      completedAt:
+        Date.now()
+    }
+  });
+}
 
-              sellerName:
-                mapping
-                  ?.seller_name ||
-                ""
-            };
-          }
+async function createRemoteEbayJob({
+  ebayUrl,
+  context
+}) {
+  const marketplaceListingId =
+    getFacebookMarketplaceItemId(
+      context.facebookUrl
+    );
+
+  const response =
+    await fetchLocalServer(
+      "/ebay-worker/jobs",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            ebayUrl,
+
+            marketplaceListingId,
+
+            marketplaceUrl:
+              context.facebookUrl
+          })
+      }
+    );
+
+  const data =
+    await readJsonSafely(
+      response
+    );
+
+  if (
+    !response.ok ||
+    data?.ok !== true ||
+    !data?.jobId
+  ) {
+    throw new Error(
+      data?.error ||
+      "Could not queue remote eBay search."
+    );
+  }
+
+  console.log(
+    "[REMOTE EBAY] Job queued:",
+    {
+      jobId:
+        data.jobId,
+      ebayUrl
+    }
+  );
+
+  return data;
+}
+
+async function waitForRemoteEbayJob(
+  jobId
+) {
+  const startedAt =
+    Date.now();
+
+  while (
+    Date.now() -
+      startedAt <
+    REMOTE_EBAY_JOB_TIMEOUT_MS
+  ) {
+    const response =
+      await fetchLocalServer(
+        `/ebay-worker/jobs/${encodeURIComponent(
+          jobId
+        )}`,
+        {
+          method:
+            "GET",
+
+          cache:
+            "no-store"
+        }
+      );
+
+    const data =
+      await readJsonSafely(
+        response
+      );
+
+    if (
+      !response.ok ||
+      data?.ok !== true
+    ) {
+      throw new Error(
+        data?.error ||
+        "Could not read remote eBay job."
+      );
+    }
+
+    if (
+      data.status ===
+      "completed"
+    ) {
+      const listings =
+        Array.isArray(
+          data.listings
+        )
+          ? data.listings
+          : [];
+
+      console.log(
+        "[REMOTE EBAY] Result received:",
+        {
+          jobId,
+          listings:
+            listings.length
+        }
+      );
+
+      return listings;
+    }
+
+    if (
+      data.status ===
+      "failed"
+    ) {
+      throw new Error(
+        data.error ||
+        "Remote eBay worker reported failure."
+      );
+    }
+
+    await sleep(
+      REMOTE_EBAY_JOB_POLL_INTERVAL_MS
+    );
+  }
+
+  throw new Error(
+    `Remote eBay worker timed out after ${
+      Math.round(
+        REMOTE_EBAY_JOB_TIMEOUT_MS /
+        60000
+      )
+    } minutes.`
+  );
+}
+
+async function runSingleRemoteEbaySearch({
+  item,
+  negativeSearchTerms,
+  context
+}) {
+  const ebayUrl =
+    buildEbaySoldSearchUrl(
+      item.ebaySearchQuery,
+      item.condition,
+      negativeSearchTerms
+    );
+
+  console.log(
+    "[REMOTE EBAY] Sending exact eBay URL to worker:",
+    ebayUrl
+  );
+
+  const job =
+    await createRemoteEbayJob({
+      ebayUrl,
+      context
+    });
+
+  showEbayCompLoading(
+    `Waiting for remote eBay worker: ${item.ebaySearchQuery}`
+  );
+
+  const listings =
+    await waitForRemoteEbayJob(
+      job.jobId
+    );
+
+  return {
+    jobId:
+      job.jobId,
+
+    ebayUrl,
+
+    listings
+  };
+}
+
+async function aiCheckListing() {
+  const analysisRun =
+    await getOrCreateMarketplaceAnalysisRun();
+
+  const analysisJobId =
+    getCurrentMarketplaceAnalysisJobId();
+
+  await upsertMarketplaceAnalysisJob({
+    status:
+      "analyzing",
+
+    stage:
+      "starting",
+
+    analysisRunId:
+      analysisRun.id,
+
+    startedAt:
+      Date.now()
+  });
+
+  console.log(
+    "[PIPELINE JOB] Started:",
+    {
+      analysisJobId,
+      analysisRunId:
+        analysisRun.id
+    }
+  );
+
+  console.log(
+    "[IDENTIFICATION] Starting new Marketplace identification pipeline.",
+    {
+      analysisRunId:
+        analysisRun.id
+    }
+  );
+
+  const button =
+    document.getElementById(
+      "ebay-comp-checker-btn"
+    );
+
+  if (!button) {
+    console.error(
+      "Could not find eBay comp checker button."
+    );
+    return;
+  }
+
+
+
+function getResolvedGoogleIdentity(
+  product,
+  googleLensResults = []
+) {
+  const productId =
+    String(
+      product?.productId || ""
+    ).trim();
+
+
+  if (
+    !productId ||
+    !Array.isArray(
+      googleLensResults
+    )
+  ) {
+    return "";
+  }
+
+
+  const match =
+    googleLensResults.find(
+      result => {
+        const identifiedModel =
+          String(
+            result?.identifiedModel ||
+            ""
+          ).trim();
+
+
+        if (!identifiedModel) {
+          return false;
+        }
+
+
+        /*
+          Group results contain multiple physical products.
+
+          Do not turn the whole group answer into the
+          identity of one product.
+        */
+        if (
+          result?.identificationMode ===
+          "group"
+        ) {
+          return false;
+        }
+
+
+        if (
+          result?.ambiguityResolved ===
+          false
+        ) {
+          return false;
+        }
+
+
+        if (
+          String(
+            result?.targetProductId ||
+            ""
+          ).trim() !==
+          productId
+        ) {
+          return false;
+        }
+
+
+        /*
+          NEW:
+
+          Only allow DataForSEO to bypass the final
+          reconciliation uncertainty when its own
+          intermediary cleaner was highly confident
+          AND strongly converged.
+
+          medium/mixed does NOT qualify.
+        */
+ const visualEvidenceSource =
+  String(
+    result
+      ?.visualEvidenceSource ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+
+/*
+  SerpApi Google AI Mode uses the legacy
+  Google Lens identification behavior.
+
+  It does not produce DataForSEO confidence
+  or consensus metadata.
+*/
+if (
+  visualEvidenceSource ===
+    "serpapi-google-ai-mode"
+) {
+  return true;
+}
+
+
+/*
+  DataForSEO keeps its strict confidence gate.
+*/
+const confidence =
+  String(
+    result
+      ?.dataForSeoEvidence
+      ?.confidence ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+
+const consensus =
+  String(
+    result
+      ?.dataForSeoEvidence
+      ?.consensus ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+
+return (
+  confidence === "high" &&
+  consensus === "strong"
+);
+      }
+    );
+
+
+  return String(
+    match?.identifiedModel ||
+    ""
+  ).trim();
+}
+
+  /*
+    ============================================================
+    LOCAL HELPER
+    Convert the final reconciled identity into the eBay query
+    format expected by the rest of the main extension.
+    ============================================================
+  */
+function buildEbaySearchQuery(
+  product,
+  fallbackGoogleIdentity = ""
+) {
+  const brand =
+    String(
+      product?.brand || ""
+    ).trim();
+
+  const model =
+    String(
+      product?.model || ""
+    ).trim();
+
+  const productType =
+    String(
+      product?.productType || ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  const exactGoogleIdentity =
+    String(
+      fallbackGoogleIdentity || ""
+    ).trim();
+
+
+  let identity = "";
+
+
+  /*
+    ============================================================
+    CAMERA LENS
+
+    A reconstructed/partial model such as:
+
+      Canon EF-S 18-55mm f/3.5-5.6 IS
+
+    is NOT automatically an exact identity.
+
+    For lenses we require either:
+
+      1. lensIdentity.canonicalModel from the dedicated resolver
+
+         OR
+
+      2. a high-confidence / strong-consensus DataForSEO identity
+         supplied through fallbackGoogleIdentity.
+
+    ============================================================
+  */
+
+  if (
+    productType ===
+    "camera lens"
+  ) {
+    const canonicalLensModel =
+      String(
+        product
+          ?.lensIdentity
+          ?.canonicalModel ||
+        ""
+      ).trim();
+
+
+    const exactLensIdentity =
+      canonicalLensModel ||
+      exactGoogleIdentity;
+
+
+    if (!exactLensIdentity) {
+      console.log(
+        "[EBAY QUERY] Skipping unresolved lens:",
+        {
+          productId:
+            product?.productId,
+
+          partialModel:
+            model,
+
+          canonicalModel:
+            canonicalLensModel,
+
+          dataForSeoIdentity:
+            exactGoogleIdentity
+        }
+      );
+
+      return "";
+    }
+
+
+    const identityAlreadyContainsBrand =
+      brand &&
+      exactLensIdentity
+        .toLowerCase()
+        .startsWith(
+          brand.toLowerCase()
         );
 
 
-      const mappedCount =
-        enrichedTargets
-          .filter(
-            target =>
-              target.mapped
-          )
-          .length;
+    identity =
+      identityAlreadyContainsBrand
+        ? exactLensIdentity
+        : [
+            brand,
+            exactLensIdentity
+          ]
+            .filter(Boolean)
+            .join(" ");
+  }
 
 
-      return res.json({
-        ok: true,
+  /*
+    ============================================================
+    NON-LENS PRODUCTS
+    ============================================================
+  */
 
-        count:
-          enrichedTargets.length,
+  else if (model) {
+    const modelAlreadyContainsBrand =
+      brand &&
+      model
+        .toLowerCase()
+        .startsWith(
+          brand.toLowerCase()
+        );
 
-        mappedCount,
 
-        unmappedCount:
-          enrichedTargets.length -
-          mappedCount,
+    identity =
+      modelAlreadyContainsBrand
+        ? model
+        : [
+            brand,
+            model
+          ]
+            .filter(Boolean)
+            .join(" ");
+  }
 
-        targets:
-          enrichedTargets
-      });
 
-    } catch (error) {
-      console.error(
-        "[CONVERSATION PARSER] Target lookup failed:",
-        error
+  /*
+    Strong DataForSEO fallback for a non-lens product.
+  */
+
+  else {
+    identity =
+      exactGoogleIdentity;
+  }
+
+
+  if (!identity) {
+    return "";
+  }
+
+
+  identity =
+    identity
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const lowerIdentity =
+    identity.toLowerCase();
+
+  if (
+    productType ===
+    "camera lens"
+  ) {
+    if (
+      !lowerIdentity.includes(
+        " lens"
+      )
+    ) {
+      identity +=
+        " lens";
+    }
+  }
+
+  else if (
+    productType ===
+    "camera body"
+  ) {
+    if (
+      !lowerIdentity.includes(
+        "body"
+      )
+    ) {
+      identity +=
+        " camera body";
+    }
+  }
+
+  else if (
+    productType ===
+    "camera"
+  ) {
+    if (
+      !lowerIdentity.includes(
+        "camera"
+      )
+    ) {
+      identity +=
+        " camera";
+    }
+  }
+
+  else if (
+    productType ===
+    "flash"
+  ) {
+    if (
+      !lowerIdentity.includes(
+        "flash"
+      ) &&
+      !lowerIdentity.includes(
+        "speedlite"
+      ) &&
+      !lowerIdentity.includes(
+        "speedlight"
+      )
+    ) {
+      identity +=
+        " flash";
+    }
+  }
+
+  return identity
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+  /*
+    ============================================================
+    LOCAL HELPER
+    Convert one reconciled product into the item structure
+    expected by the existing database/eBay pipeline.
+    ============================================================
+  */
+function convertPrimaryProductToCompItem(
+  product,
+  index,
+  condition,
+  googleLensResults = []
+) {
+  const productId =
+    String(
+      product?.productId ||
+      `product_${index + 1}`
+    ).trim();
+
+
+  const fallbackGoogleIdentity =
+    getResolvedGoogleIdentity(
+      product,
+      googleLensResults
+    );
+
+
+  const ebaySearchQuery =
+    buildEbaySearchQuery(
+      product,
+      fallbackGoogleIdentity
+    );
+
+
+  const exactIdentityResolved =
+    Boolean(
+      String(
+        ebaySearchQuery || ""
+      ).trim()
+    );
+
+
+  return {
+    itemId:
+      productId,
+
+    productId,
+
+    brand:
+      String(
+        product?.brand || ""
+      ).trim(),
+
+    model:
+      String(
+        product?.model || ""
+      ).trim(),
+
+    productType:
+      String(
+        product?.productType || ""
+      ).trim(),
+
+    condition:
+      condition || "Used",
+
+    confidence:
+      0,
+
+    isPrimarySellableItem:
+      true,
+
+    exactIdentityResolved,
+
+    ebaySearchQuery,
+
+    negativeSearchTerms:
+      [],
+
+    reason:
+      exactIdentityResolved
+        ? "Exact product identity resolved for valuation."
+        : "Physical product detected, but exact commercially distinct identity was not resolved."
+  };
+}
+
+
+  button.innerText =
+    "Collecting listing...";
+
+  try {
+    /*
+      ============================================================
+      BUY NOW GATE (shipping mode only)
+
+      With auto messaging off, only listings that show a "Buy now"
+      button can be acted on. Checked first, before any image,
+      OCR, OpenAI, SerpApi or eBay work.
+      ============================================================
+    */
+    if (!AUTO_MESSAGE_ENABLED) {
+      const buyNowDecision =
+        await waitForMarketplaceBuyNowDecision();
+
+      if (buyNowDecision === false) {
+        const noBuyNowPassResult = {
+          recommendation:
+            "Pass",
+
+          reason:
+            "Immediate skip: no Buy now button on this listing (shipping mode requires Buy now).",
+
+          facebookPrice:
+            null,
+
+          totalExpectedSalePrice:
+            null,
+
+          profitAtAsk:
+            null,
+
+          profitAt35:
+            null,
+
+          maxBuyPrice:
+            null,
+
+          validSoldCount:
+            0,
+
+          medianSoldPrice:
+            null,
+
+          items:
+            [],
+
+          ignoredItems:
+            []
+        };
+
+        console.log(
+          "[BUY NOW GATE] Skipping listing - no Buy now button detected."
+        );
+
+        showLotCompPanel(
+          noBuyNowPassResult
+        );
+
+        await markMarketplaceAutoAnalysisComplete(
+          noBuyNowPassResult
+        );
+
+        return;
+      }
+
+      if (buyNowDecision === null) {
+        console.warn(
+          "[BUY NOW GATE] Listing never finished rendering; could not check for Buy now. Continuing."
+        );
+      } else {
+        console.log(
+          "[BUY NOW GATE] Buy now button found. Continuing."
+        );
+      }
+    }
+
+    /*
+      ============================================================
+      BASE MARKETPLACE DATA
+      ============================================================
+    */
+
+    const imageUrls =
+      await getListingImageUrls();
+
+    if (
+      !Array.isArray(
+        imageUrls
+      ) ||
+      !imageUrls.length
+    ) {
+      throw new Error(
+        "No Marketplace listing images were found."
+      );
+    }
+
+    const screenshotDataUrl =
+      await captureVisibleTabScreenshot();
+
+    if (!screenshotDataUrl) {
+      throw new Error(
+        "Could not capture the Facebook listing screenshot."
+      );
+    }
+
+    /*
+      These DOM values are kept for the downstream deal/eBay
+      system.
+
+      They are NOT being used as the main product-identification
+      system.
+    */
+    const title =
+  String(
+    getListingTitle() || ""
+  ).trim();
+
+let description = "";
+
+/*
+  DOM-scraped price. Kept only as a last-resort fallback -
+  see extractFacebookAskingPriceFromOcr() below, which
+  overrides this once the listing screenshot OCR comes back.
+  getFacebookAskingPrice() scans the whole page and is not
+  scoped to this listing, so it can grab an unrelated price
+  from another tile on the page.
+*/
+let facebookPrice =
+  parsePriceValue(
+    getFacebookAskingPrice()
+  );
+
+    console.log(
+      "[IDENTIFICATION] Marketplace title:",
+      title
+    );
+
+    console.log(
+      "[IDENTIFICATION] Marketplace description:",
+      description
+    );
+
+    console.log(
+      "[IDENTIFICATION] Facebook price:",
+      facebookPrice
+    );
+
+    console.log(
+      "[IDENTIFICATION] Listing images:",
+      imageUrls
+    );
+
+    showDebugPreview({
+      title,
+      description,
+      imageUrls,
+      screenshotDataUrl
+    });
+
+
+    /*
+      ============================================================
+      STEP 1
+      EXPLICIT SELLER-WRITTEN FACTS
+      ============================================================
+    */
+
+button.innerText =
+  "Reading listing text with Vision OCR...";
+
+
+const listingOcrResponse =
+  await fetchLocalServer(
+    "/vision-ocr",
+    {
+      method:
+        "POST",
+
+      headers: {
+        "Content-Type":
+          "application/json"
+      },
+
+      body:
+        JSON.stringify({
+          items: [
+            {
+              key:
+                "listing_screenshot",
+
+              imageSource:
+                screenshotDataUrl
+            }
+          ]
+        })
+    }
+  );
+
+
+const listingOcrData =
+  await readJsonSafely(
+    listingOcrResponse
+  );
+
+
+if (
+  !listingOcrResponse.ok ||
+  listingOcrData.error
+) {
+  throw new LocalServerError(
+    listingOcrData,
+    "Google Vision listing OCR failed."
+  );
+}
+
+
+const listingScreenshotOcrRaw =
+  String(
+    listingOcrData
+      ?.results
+      ?.[0]
+      ?.text ||
+    ""
+  ).trim();
+
+
+console.log(
+  "[STEP 1A] Google Vision screenshot OCR:"
+);
+
+console.log(
+  listingScreenshotOcrRaw
+);
+
+/*
+  Prefer the OCR-anchored price over the whole-page DOM scrape.
+
+  getFacebookAskingPrice() has no idea which listing is
+  actually open, so it's kept only as the pre-OCR fallback set
+  above. This is the authoritative source once we have it.
+*/
+const ocrAnchoredPrice =
+  extractFacebookAskingPriceFromOcr(
+    listingScreenshotOcrRaw,
+    title
+  );
+
+console.log(
+  "[STEP 1A] OCR-anchored Facebook asking price:",
+  ocrAnchoredPrice
+);
+
+if (ocrAnchoredPrice != null) {
+  facebookPrice = ocrAnchoredPrice;
+} else if (facebookPrice != null) {
+  /*
+    OCR could not anchor the price. The DOM scrape is not
+    scoped to the open listing and can return a price from an
+    unrelated tile, so only keep it when that exact amount is
+    actually visible in the listing screenshot. If the
+    screenshot shows dollar amounts but NOT this one, discard
+    it rather than evaluate the deal against a wrong ask.
+  */
+  const ocrAmounts =
+    collectOcrDollarAmounts(listingScreenshotOcrRaw);
+
+  if (
+    ocrAmounts.size > 0 &&
+    !ocrAmounts.has(facebookPrice)
+  ) {
+    console.warn(
+      "[STEP 1A] Discarding DOM-scraped price $" +
+      facebookPrice +
+      " - not present in listing OCR. OCR amounts:",
+      Array.from(ocrAmounts)
+    );
+
+    facebookPrice = null;
+  } else {
+    console.warn(
+      "[STEP 1A] OCR price anchor failed; using DOM price $" +
+      facebookPrice +
+      " (confirmed present in OCR: " +
+      (ocrAmounts.size > 0) +
+      ")"
+    );
+  }
+}
+
+/*
+  Google Cloud Vision OCR is now the sole source
+  of listing description/text evidence.
+*/
+/*
+  The screenshot also captures the extension's own HUD panel
+  (Auto Scan / Search term: nikon / Listings clicked ...) and the
+  Facebook Marketplace sidebar. Strip that before the text is
+  treated as seller evidence, otherwise the scan's search term
+  (e.g. "nikon") leaks into brand identification. The RAW text
+  above is still used for price anchoring only.
+*/
+const listingScreenshotOcr =
+  stripMarketplaceHudFromOcr(
+    listingScreenshotOcrRaw
+  );
+
+console.log(
+  "[STEP 1A] OCR text after HUD/sidebar stripping:"
+);
+
+console.log(
+  listingScreenshotOcr
+);
+
+description =
+  listingScreenshotOcr;
+
+
+/*
+  Use Google Cloud Vision OCR exclusively
+  for listing textual evidence.
+*/
+const listingText =
+  listingScreenshotOcr;
+
+
+/*
+  Cheapest possible skip: the listing title already says
+  PowerShot, so don't spend the facts / gallery / OCR calls.
+*/
+if (isCanonPowerShotText(title)) {
+  const titlePowerShotPassResult =
+    buildCanonPowerShotPassResult({
+      facebookPrice,
+      items: [],
+      detectedFrom:
+        `title: "${title}"`
+    });
+
+  console.log(
+    "[POWERSHOT GATE] Skipping listing from title before any analysis:",
+    title
+  );
+
+  showLotCompPanel(
+    titlePowerShotPassResult
+  );
+
+  await markMarketplaceAutoAnalysisComplete(
+    titlePowerShotPassResult
+  );
+
+  return;
+}
+
+button.innerText =
+  "Analyzing listing facts...";
+
+
+const factsResponse =
+  await fetchLocalServer(
+    "/analyze-listing-facts",
+    {
+      method: "POST",
+
+      headers: {
+        "Content-Type":
+          "application/json"
+      },
+
+body:
+  JSON.stringify({
+    listingText
+  })
+    }
+  );
+
+
+const explicitFacts =
+  await readJsonSafely(
+    factsResponse
+  );
+
+if (!factsResponse.ok) {
+  throw new LocalServerError(
+    explicitFacts,
+    "Listing fact extraction failed."
+  );
+}
+
+    console.log(
+      "[STEP 1] Explicit listing facts:"
+    );
+
+    console.log(
+      explicitFacts
+    );
+
+
+    /*
+      ============================================================
+      DAMAGE GATE
+
+      The facts prompt decides whether the seller describes
+      SIGNIFICANT damage (broken, cracked, won't turn on, error,
+      AF/aperture/shutter fault, dead buttons, water damage ...)
+      versus minor cosmetic wear (small scratches, scuffs, paint
+      wear, dust, worn rubber), which is allowed. Skip before the
+      gallery / OCR / SerpApi / eBay spend.
+      ============================================================
+    */
+    if (explicitFacts?.skipDueToDamage === true) {
+      const damagePassResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          `Immediate skip: significant damage stated in listing${
+            explicitFacts?.damageReason
+              ? ` (${explicitFacts.damageReason})`
+              : ""
+          }.`,
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          null,
+
+        profitAtAsk:
+          null,
+
+        profitAt35:
+          null,
+
+        maxBuyPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        medianSoldPrice:
+          null,
+
+        items:
+          [],
+
+        ignoredItems:
+          []
+      };
+
+      console.log(
+        "[DAMAGE GATE] Skipping listing - significant damage:",
+        explicitFacts?.damageReason ||
+          "(no reason given)"
       );
 
-      return res
-        .status(500)
-        .json({
-          ok: false,
+      showLotCompPanel(
+        damagePassResult
+      );
 
-          error:
-            error?.message ||
-            "Could not build conversation target list."
-        });
+      await markMarketplaceAutoAnalysisComplete(
+        damagePassResult
+      );
+
+      return;
     }
+
+
+    /*
+      If you later add condition to the new
+      /analyze-listing-facts endpoint, this automatically uses it.
+
+      Current mini-extension output does not include condition,
+      so normal listings default to Used.
+    */
+    const allowedConditions =
+      new Set([
+        "New",
+        "Open Box",
+        "Used",
+        "For parts"
+      ]);
+
+    const listingCondition =
+      allowedConditions.has(
+        explicitFacts?.condition
+      )
+        ? explicitFacts.condition
+        : "Used";
+
+
+    /*
+      ============================================================
+      STEP 2
+      ANALYZE ALL MARKETPLACE PHOTOS AS GALLERIES
+      ============================================================
+    */
+
+    button.innerText =
+      `Analyzing ${imageUrls.length} image(s)...`;
+
+    const galleryResponse =
+      await fetchLocalServer(
+        "/analyze-listing-gallery",
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              imageUrls
+            })
+        }
+      );
+
+    const galleryData =
+      await readJsonSafely(
+        galleryResponse
+      );
+
+    if (
+      !galleryResponse.ok ||
+      galleryData.error
+    ) {
+      throw new LocalServerError(
+        galleryData,
+        "Marketplace gallery analysis failed."
+      );
+    }
+
+    const galleries =
+      Array.isArray(
+        galleryData.galleries
+      )
+        ? galleryData.galleries
+        : [];
+
+console.log(
+  "[STEP 2] Complete gallery result:"
+);
+
+console.log(
+  galleryData
+);
+
+
+/*
+  Quiet bundle-size check.
+
+  This is deliberately NOT part of any
+  AI prompt. It only inspects the physical
+  products already returned by Step 2.
+*/
+const galleryProductLimit =
+  isGalleryWithinPrimaryProductLimit(
+    galleries,
+    5
+  );
+
+
+if (
+  !galleryProductLimit.allowed
+) {
+  const passResult = {
+    recommendation:
+      "Pass",
+
+    reason:
+      `Listing contains ${galleryProductLimit.primaryProductCount} primary products. Maximum allowed is 5.`,
+
+    facebookPrice,
+
+    totalExpectedSalePrice:
+      null,
+
+    profitAtAsk:
+      null,
+
+    profitAt35:
+      null,
+
+    maxBuyPrice:
+      null,
+
+    validSoldCount:
+      0,
+
+    medianSoldPrice:
+      null,
+
+    items:
+      [],
+
+    ignoredItems:
+      []
+  };
+
+
+  console.log(
+    `[PRIMARY PRODUCT LIMIT] Skipping listing: ${galleryProductLimit.primaryProductCount} products detected.`
+  );
+
+
+  await markMarketplaceAutoAnalysisComplete(
+    passResult
+  );
+
+  return;
+}
+
+
+showDebugPreview({
+  title,
+  description,
+  imageUrls,
+  screenshotDataUrl,
+  galleries
+});
+
+    /*
+      ============================================================
+      STEP 3
+      CHOOSE BEST IMAGE FOR EACH PHYSICAL PRODUCT
+      ============================================================
+    */
+
+    const bestTargets =
+      pickBestGoogleTargets(
+        galleries,
+        imageUrls
+      );
+
+    console.log(
+      "[STEP 3] Best Google targets:"
+    );
+
+    console.log(
+      bestTargets
+    );
+
+    if (!bestTargets.length) {
+      /*
+        The tested mini-extension stops here too.
+
+        This prevents continuing to eBay using a product identity
+        that never went through the new Google identification
+        process.
+      */
+      const noTargetResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          "No primary camera product could be mapped to a usable Marketplace image for identification.",
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          null,
+
+        profitAtAsk:
+          null,
+
+        profitAt35:
+          null,
+
+        maxBuyPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        medianSoldPrice:
+          null,
+
+        items:
+          []
+      };
+
+      showLotCompPanel(
+        noTargetResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        noTargetResult
+      );
+
+      return;
+    }
+
+
+    /*
+  ============================================================
+  STEP 4A
+  GOOGLE CLOUD VISION OCR OF BEST PRODUCT IMAGES
+  ============================================================
+*/
+
+button.innerText =
+  `Reading model markings from ${bestTargets.length} product(s)...`;
+
+
+/*
+  Avoid paying to OCR the same physical image repeatedly.
+
+  Multiple products can use the same Marketplace image,
+  so OCR each unique image only once.
+*/
+const uniqueOcrImages =
+  [];
+
+const seenOcrImageUrls =
+  new Set();
+
+
+for (
+  const target of bestTargets
+) {
+  const imageUrl =
+    String(
+      target?.imageUrl ||
+      ""
+    ).trim();
+
+  if (
+    !imageUrl ||
+    seenOcrImageUrls.has(
+      imageUrl
+    )
+  ) {
+    continue;
+  }
+
+  seenOcrImageUrls.add(
+    imageUrl
+  );
+
+  uniqueOcrImages.push({
+    key:
+      `marketplace_image_${target.bestImageIndex}`,
+
+    imageSource:
+      imageUrl,
+
+    imageUrl,
+
+    imageIndex:
+      target.bestImageIndex
+  });
+}
+
+
+const productOcrResponse =
+  await fetchLocalServer(
+    "/vision-ocr",
+    {
+      method:
+        "POST",
+
+      headers: {
+        "Content-Type":
+          "application/json"
+      },
+
+      body:
+        JSON.stringify({
+          items:
+            uniqueOcrImages.map(
+              item => ({
+                key:
+                  item.key,
+
+                imageSource:
+                  item.imageSource
+              })
+            )
+        })
+    }
+  );
+
+
+const productOcrData =
+  await readJsonSafely(
+    productOcrResponse
+  );
+
+
+if (
+  !productOcrResponse.ok ||
+  productOcrData.error
+) {
+  throw new LocalServerError(
+    productOcrData,
+    "Product-image Vision OCR failed."
+  );
+}
+
+
+const ocrTextByKey =
+  new Map(
+    (
+      Array.isArray(
+        productOcrData.results
+      )
+        ? productOcrData.results
+        : []
+    ).map(
+      result => [
+        String(
+          result?.key ||
+          ""
+        ),
+        String(
+          result?.text ||
+          ""
+        ).trim()
+      ]
+    )
+  );
+
+
+const productOcrResults =
+  bestTargets.map(
+    target => {
+      const key =
+        `marketplace_image_${target.bestImageIndex}`;
+
+      return {
+        galleryIndex:
+          target.galleryIndex,
+
+        productId:
+          target.productId,
+
+        productType:
+          target.productType,
+
+        imageIndex:
+          target.bestImageIndex,
+
+        imageUrl:
+          target.imageUrl,
+
+        modelReadabilityScore:
+          target.modelReadabilityScore,
+
+        ocrText:
+          ocrTextByKey.get(
+            key
+          ) || ""
+      };
+    }
+  );
+
+
+console.log(
+  "[STEP 4A] Product OCR results:"
+);
+
+console.dir(
+  productOcrResults,
+  {
+    depth: null
   }
 );
 
-loadLensfunDatabase();
 
-app.listen(3000, () => {
-  console.log(
-    "AI comp server running at http://localhost:3000"
+    /*
+      ============================================================
+      STEP 5
+      FINAL PRODUCT RECONCILIATION
+      ============================================================
+    */
+
+    button.innerText =
+      "Reconciling products...";
+
+     console.log(
+  "[DEBUG STEP 4A->5A] OCR-first reconciliation payload:",
+  {
+    explicitFacts:
+      JSON.parse(
+        JSON.stringify(
+          explicitFacts
+        )
+      ),
+
+    galleryResults:
+      JSON.parse(
+        JSON.stringify(
+          galleries
+        )
+      ),
+
+    bestGoogleTargets:
+      JSON.parse(
+        JSON.stringify(
+          bestTargets
+        )
+      ),
+
+    productOcrResults:
+      JSON.parse(
+        JSON.stringify(
+          productOcrResults
+        )
+      )
+  }
+);
+
+const initialIdentificationResponse =
+  await fetchLocalServer(
+    "/reconcile-primary-products",
+    {
+      method:
+        "POST",
+
+      headers: {
+        "Content-Type":
+          "application/json"
+      },
+
+      body:
+        JSON.stringify({
+          listingTitle:
+            title,
+
+          listingDescription:
+            description,
+
+          listingScreenshotOcr,
+
+          explicitFacts,
+
+          galleryResults:
+            galleries,
+
+          bestGoogleTargets:
+            bestTargets,
+
+          productOcrResults,
+
+          googleLensResults:
+            []
+        })
+    }
   );
+
+
+const initialIdentificationData =
+  await readJsonSafely(
+    initialIdentificationResponse
+  );
+
+
+if (
+  !initialIdentificationResponse.ok ||
+  initialIdentificationData.error
+) {
+  throw new LocalServerError(
+    initialIdentificationData,
+    "OCR-first product reconciliation failed."
+  );
+}
+
+/*
+  ============================================================
+  STEP 5A
+  DETERMINE WHICH PRODUCTS STILL REQUIRE GOOGLE LENS
+  ============================================================
+*/
+
+const needsGoogleLens =
+  Array.isArray(
+    initialIdentificationData
+      ?.needsGoogleLens
+  )
+    ? initialIdentificationData
+        .needsGoogleLens
+    : [];
+
+
+const lensfunCandidateConstraints =
+  Array.isArray(
+    initialIdentificationData
+      ?.lensfunCandidateConstraints
+  )
+    ? initialIdentificationData
+        .lensfunCandidateConstraints
+    : [];
+
+
+const lensFallbackTargetCandidates =
+  bestTargets
+    .map(
+      target => {
+        const unresolved =
+          needsGoogleLens.find(
+            item =>
+              String(
+                item?.productId ||
+                ""
+              ) ===
+              String(
+                target?.productId ||
+                ""
+              )
+          );
+
+        if (!unresolved) {
+          return null;
+        }
+
+        const lensfunConstraint =
+          lensfunCandidateConstraints.find(
+            entry =>
+              String(
+                entry?.productId ||
+                ""
+              ) ===
+              String(
+                target?.productId ||
+                ""
+              )
+          );
+
+        return {
+          ...target,
+
+          /*
+            The server always sets visualFallbackMode explicitly
+            now (camera bodies/cameras included, not just lenses),
+            so the fallback below is defensive only. It matches
+            the only visual fallback provider currently in use.
+          */
+          visualFallbackMode:
+            String(
+              unresolved
+                ?.visualFallbackMode ||
+              "serpapi-ai-mode-uncropped"
+            ).trim(),
+
+          lensfunCandidates:
+            Array.isArray(
+              lensfunConstraint
+                ?.candidates
+            )
+              ? lensfunConstraint
+                  .candidates
+              : []
+        };
+      }
+    )
+    .filter(Boolean);
+
+
+/*
+  ============================================================
+  FINAL PAID-CALL GATE (see evaluateSerpApiPaidCallGate)
+  ============================================================
+  needsGoogleLens is a request, not a permission. Every target
+  must earn an affirmative reason before SerpApi is called.
+*/
+const gatePrimaryProducts =
+  Array.isArray(
+    initialIdentificationData
+      ?.primaryProducts
+  )
+    ? initialIdentificationData
+        .primaryProducts
+    : [];
+
+const gateSuppressedGalleryProducts =
+  Array.isArray(
+    initialIdentificationData
+      ?.suppressedGalleryProducts
+  )
+    ? initialIdentificationData
+        .suppressedGalleryProducts
+    : [];
+
+const gatePhantomSuppressedProducts =
+  [];
+
+const lensFallbackTargets =
+  lensFallbackTargetCandidates
+    .map(
+      target => {
+        const unresolvedEntry =
+          needsGoogleLens.find(
+            item =>
+              String(
+                item?.productId || ""
+              ) ===
+              String(
+                target?.productId || ""
+              )
+          );
+
+        const gateResult =
+          evaluateSerpApiPaidCallGate({
+            target,
+            unresolvedEntry,
+            primaryProducts:
+              gatePrimaryProducts,
+            needsGoogleLens,
+            suppressedGalleryProducts:
+              gateSuppressedGalleryProducts,
+            galleries,
+            lensfunCandidates:
+              target
+                ?.lensfunCandidates
+          });
+
+        if (!gateResult.allowed) {
+          if (
+            gateResult.suppressAsPhantom
+          ) {
+            gatePhantomSuppressedProducts
+              .push({
+                productId:
+                  String(
+                    target?.productId ||
+                    ""
+                  ).trim(),
+                productType:
+                  target?.productType ||
+                  null,
+                suppressedAsLikelyDuplicate:
+                  true,
+                reason:
+                  "No independent evidence of a distinct physical product (no identity fields, no unique OCR, never appears without an already-resolved lens) and the seller does not describe more lenses than are already resolved.",
+                possibleDuplicateOf:
+                  gateResult
+                    .resolvedProductsInSameImage
+                    .map(
+                      item =>
+                        item.productId
+                    ),
+                suppressedBy:
+                  "serpapi-gate"
+              });
+          }
+
+          return null;
+        }
+
+        return {
+          ...target,
+          serpApiReasonCode:
+            gateResult.reason,
+          ...buildVisualExclusionContext({
+            target,
+            gateResult
+          })
+        };
+      }
+    )
+    .filter(Boolean);
+
+/*
+  A likely-phantom detection rejected at the gate must not stay
+  in the product list (it would otherwise be priced as an
+  "Unknown Lens" default) and must not be resurrected by the
+  second reconcile pass's structural recovery.
+*/
+if (
+  gatePhantomSuppressedProducts.length
+) {
+  const gateSuppressedIds =
+    new Set(
+      gatePhantomSuppressedProducts.map(
+        item => item.productId
+      )
+    );
+
+  initialIdentificationData
+    .primaryProducts =
+      gatePrimaryProducts.filter(
+        product =>
+          !gateSuppressedIds.has(
+            String(
+              product?.productId ||
+              ""
+            ).trim()
+          )
+      );
+
+  initialIdentificationData
+    .suppressedGalleryProducts = [
+      ...gateSuppressedGalleryProducts,
+      ...gatePhantomSuppressedProducts
+    ];
+
+  console.warn(
+    "[SERPAPI GATE] Removed likely-phantom product(s) from the primary product list:",
+    gatePhantomSuppressedProducts
+  );
+}
+
+console.log(
+  "[STEP 5A] Products requiring Google Lens:",
+  lensFallbackTargets
+);
+
+
+/*
+  If everything was already resolved by seller text + OCR,
+  initialIdentificationData is already our final result.
+*/
+let googleLensResults =
+  [];
+
+let finalIdentificationData =
+  initialIdentificationData;
+
+
+/*
+  ============================================================
+  STEP 4B
+  GOOGLE LENS FALLBACK — ONLY UNRESOLVED PRODUCTS
+  ============================================================
+*/
+
+if (
+  lensFallbackTargets.length
+) {
+  /*
+    ============================================================
+    BRAND GATE: ALL-UNRESOLVED-BRAND SKIP
+
+    We are about to spend a SerpApi Google AI Mode call on visual
+    identification. If NOT ONE primary product in this listing
+    has a resolved brand yet, there's nothing telling us this is
+    even a Nikon/Canon listing worth that spend - skip the whole
+    listing now instead of calling SerpApi.
+    ============================================================
+  */
+  const primaryProductsBeforeSerpApi =
+    Array.isArray(
+      initialIdentificationData
+        ?.primaryProducts
+    )
+      ? initialIdentificationData
+          .primaryProducts
+      : [];
+
+  /*
+    ============================================================
+    BRAND GATE: ONLY NIKON / CANON (PRE-SERPAPI)
+
+    Gate 1 above only catches the case where NO primary product
+    has a brand yet. It does nothing if a product's brand was
+    already resolved to something off-brand (e.g. "Burke and
+    James") during Step 5's text/OCR reconciliation - that case
+    was previously falling through and spending a SerpApi Google
+    AI Mode call before the later Nikon/Canon gate (after Step 5B)
+    ever got to reject it.
+
+    If any primary product already has a RESOLVED brand that is
+    neither Nikon nor Canon, skip immediately, before spending
+    any SerpApi calls. A blank/unresolved brand does not trip
+    this check - that's what allPrimaryBrandsUnresolved below,
+    and the post-SerpApi gate, are for.
+    ============================================================
+  */
+  /*
+    UPDATED RULE: the listing only needs AT LEAST ONE primary
+    item resolved to Nikon or Canon. Other primary items may be
+    any brand (or unresolved) and are still priced.
+  */
+  const powerShotItemsBeforeSerpApi =
+    findCanonPowerShotPrimaryItems(
+      primaryProductsBeforeSerpApi
+    );
+
+  if (powerShotItemsBeforeSerpApi.length > 0) {
+    const powerShotPassResultBeforeSerpApi =
+      buildCanonPowerShotPassResult({
+        facebookPrice,
+        items:
+          primaryProductsBeforeSerpApi,
+        detectedFrom:
+          powerShotItemsBeforeSerpApi
+            .map(
+              item =>
+                `${item?.brand || ""} ${item?.model || ""}`.trim()
+            )
+            .join(", ")
+      });
+
+    console.log(
+      "[POWERSHOT GATE] Skipping listing before SerpApi call:",
+      powerShotItemsBeforeSerpApi.map(
+        item => ({
+          productId:
+            item?.productId,
+
+          brand:
+            item?.brand,
+
+          model:
+            item?.model
+        })
+      )
+    );
+
+    showLotCompPanel(
+      powerShotPassResultBeforeSerpApi
+    );
+
+    await markMarketplaceAutoAnalysisComplete(
+      powerShotPassResultBeforeSerpApi
+    );
+
+    return;
+  }
+
+  const hasNikonOrCanonBeforeSerpApi =
+    primaryProductsBeforeSerpApi.some(
+      product => {
+        const brand =
+          String(
+            product?.brand || ""
+          )
+            .trim()
+            .toLowerCase();
+
+        return (
+          brand === "nikon" ||
+          brand === "canon"
+        );
+      }
+    );
+
+  const offBrandPrimaryItemsBeforeSerpApi =
+    hasNikonOrCanonBeforeSerpApi
+      ? []
+      : primaryProductsBeforeSerpApi.filter(
+          product =>
+            String(
+              product?.brand || ""
+            ).trim()
+        );
+
+  if (offBrandPrimaryItemsBeforeSerpApi.length > 0) {
+    const offBrandPassResultBeforeSerpApi = {
+      recommendation:
+        "Pass",
+
+      reason:
+        `Immediate skip: no primary item is Nikon or Canon (found ${
+          offBrandPrimaryItemsBeforeSerpApi
+            .map(
+              product =>
+                product?.brand ||
+                "unknown"
+            )
+            .join(", ")
+        }). At least one Nikon or Canon primary item is required. Skipping before the SerpApi identification call.`,
+
+      facebookPrice,
+
+      totalExpectedSalePrice:
+        null,
+
+      profitAtAsk:
+        null,
+
+      profitAt35:
+        null,
+
+      maxBuyPrice:
+        null,
+
+      validSoldCount:
+        0,
+
+      medianSoldPrice:
+        null,
+
+      items:
+        primaryProductsBeforeSerpApi,
+
+      ignoredItems:
+        []
+    };
+
+    console.log(
+      "[BRAND GATE] Skipping listing before SerpApi call - off-brand primary item(s) already resolved:",
+      offBrandPrimaryItemsBeforeSerpApi.map(
+        product => ({
+          productId:
+            product?.productId,
+
+          brand:
+            product?.brand
+        })
+      )
+    );
+
+    showLotCompPanel(
+      offBrandPassResultBeforeSerpApi
+    );
+
+    await markMarketplaceAutoAnalysisComplete(
+      offBrandPassResultBeforeSerpApi
+    );
+
+    return;
+  }
+
+  const allPrimaryBrandsUnresolved =
+    primaryProductsBeforeSerpApi.length >
+      0 &&
+    primaryProductsBeforeSerpApi.every(
+      product =>
+        !String(
+          product?.brand || ""
+        ).trim()
+    );
+
+  if (allPrimaryBrandsUnresolved) {
+    const unresolvedBrandPassResult = {
+      recommendation:
+        "Pass",
+
+      reason:
+        "Immediate skip: no primary product in this listing has a resolved brand yet, right before the SerpApi identification call. Skipping instead of spending the SerpApi call.",
+
+      facebookPrice,
+
+      totalExpectedSalePrice:
+        null,
+
+      profitAtAsk:
+        null,
+
+      profitAt35:
+        null,
+
+      maxBuyPrice:
+        null,
+
+      validSoldCount:
+        0,
+
+      medianSoldPrice:
+        null,
+
+      items:
+        primaryProductsBeforeSerpApi,
+
+      ignoredItems:
+        []
+    };
+
+    console.log(
+      "[BRAND GATE] Skipping listing before SerpApi call - every primary product has an unresolved brand:",
+      primaryProductsBeforeSerpApi.map(
+        product => ({
+          productId:
+            product?.productId,
+
+          productType:
+            product?.productType
+        })
+      )
+    );
+
+    showLotCompPanel(
+      unresolvedBrandPassResult
+    );
+
+    await markMarketplaceAutoAnalysisComplete(
+      unresolvedBrandPassResult
+    );
+
+    return;
+  }
+
+  button.innerText =
+    `Identifying ${lensFallbackTargets.length} product(s) with Google Lens...`;
+
+  console.log(
+    "[GOOGLE LENS ROUTING]",
+    {
+      targetCount:
+        lensFallbackTargets.length,
+
+      targets:
+        lensFallbackTargets
+    }
+  );
+
+/*
+  ============================================================
+  SPLIT VISUAL FALLBACK PROVIDERS
+  ============================================================
+*/
+
+/*
+  IMPORTANT:
+
+  Route purely on visualFallbackMode, never on productType.
+
+  visualFallbackMode is computed server-side in
+  /reconcile-primary-products for EVERY needsGoogleLens entry
+  — camera bodies/cameras and camera lenses alike — and every
+  path there now sets it to "serpapi-ai-mode-uncropped".
+  DataForSEO cropping is kept below for future use but is not
+  currently assigned to anything, so dataForSeoCropTargets is
+  expected to stay empty.
+
+  Re-checking productType here against target.productType
+  (sourced from Step 2's gallery analysis instead) would be
+  redundant AND unsafe: Step 2's vision model is not guaranteed
+  to use the literal string "camera lens" (it has returned bare
+  "lens" here), so a second productType check could silently
+  drop a target into the DataForSEO-cropped bucket even though
+  the server explicitly asked for uncropped SerpApi AI Mode.
+*/
+const serpApiAiModeTargets =
+  lensFallbackTargets.filter(
+    target =>
+      target?.visualFallbackMode ===
+        "serpapi-ai-mode-uncropped"
+  );
+
+
+const dataForSeoCropTargets =
+  lensFallbackTargets.filter(
+    target =>
+      !serpApiAiModeTargets.some(
+        serpTarget =>
+          String(
+            serpTarget?.productId ||
+            ""
+          ) ===
+          String(
+            target?.productId ||
+            ""
+          )
+      )
+  );
+
+
+button.innerText =
+  dataForSeoCropTargets.length
+    ? `Cropping ${dataForSeoCropTargets.length} unresolved product(s)...`
+    : `Preparing ${serpApiAiModeTargets.length} AI Mode lens search(es)...`;
+
+
+/*
+  ONLY DataForSEO targets get cropped. Retained for future use;
+  not currently reachable since nothing sets visualFallbackMode
+  to a DataForSEO mode anymore.
+*/
+const croppedDataForSeoTargets =
+  dataForSeoCropTargets.length
+    ? await prepareDataForSeoCrops(
+        dataForSeoCropTargets,
+        initialIdentificationData,
+        productOcrResults
+      )
+    : [];
+
+
+/*
+  SerpApi targets keep the ORIGINAL best imageUrl.
+*/
+const visualFallbackTargets = [
+  ...serpApiAiModeTargets.map(
+    target => ({
+      ...target,
+
+      visualSearchProvider:
+        "serpapi-google-ai-mode",
+
+      cropPrepared:
+        false,
+
+      dataForSeoImageUrl:
+        "",
+
+      dataForSeoCropObjectPath:
+        "",
+
+      cropBoundingBox:
+        null,
+
+      cropError:
+        ""
+    })
+  ),
+
+  ...croppedDataForSeoTargets.map(
+    target => ({
+      ...target,
+
+      visualSearchProvider:
+        "dataforseo"
+    })
+  )
+];
+
+
+console.log(
+  "[VISUAL FALLBACK] Prepared targets:"
+);
+
+console.dir(
+  visualFallbackTargets,
+  {
+    depth:
+      null
+  }
+);
+
+
+button.innerText =
+  `Identifying ${visualFallbackTargets.length} unresolved product(s)...`;
+
+
+/*
+  ============================================================
+  PARK THIS LISTING WHILE DATAFORSEO WAITS
+  ============================================================
+
+  Its tab remains alive and its Promise remains pending.
+
+  We simply mark it as safe for the browse page to open one
+  additional Marketplace listing.
+*/
+await upsertMarketplaceAnalysisJob({
+  status:
+    "waiting-dataforseo",
+
+  stage:
+    "dataforseo",
+
+  parkedAt:
+    Date.now()
 });
+
+
+console.log(
+  "[PIPELINE JOB] Listing parked for DataForSEO:",
+  {
+    analysisJobId:
+      getCurrentMarketplaceAnalysisJobId(),
+
+    targetCount:
+      croppedDataForSeoTargets.length
+  }
+);
+
+
+/*
+  Release the browse controller.
+
+  currentListingUrl is currently a SINGLE-listing flag,
+  so clear it while this tab remains alive.
+
+  The job registry now becomes the source of truth for
+  this parked listing.
+*/
+{
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_AUTO_STATE_KEY
+    );
+
+  const state =
+    stored[
+      MARKETPLACE_AUTO_STATE_KEY
+    ];
+
+  if (state?.running) {
+    await chrome.storage.local.set({
+      [MARKETPLACE_AUTO_STATE_KEY]: {
+        ...state,
+
+        currentListingUrl:
+          "",
+
+        waitingForAnalysis:
+          false,
+
+        analysisDone:
+          false,
+
+        /*
+          Tell the browse page it may continue.
+        */
+        dataForSeoListingParked:
+          true,
+
+        dataForSeoListingParkedAt:
+          Date.now()
+      }
+    });
+  }
+}
+
+
+/*
+  THIS REQUEST STILL WAITS HERE.
+
+  But while it waits, the browse tab may open Listing B.
+*/
+googleLensResults =
+  await runLocalGoogleLensTargets(
+    visualFallbackTargets
+  );
+
+
+console.log(
+  "[PIPELINE JOB] DataForSEO returned:",
+  {
+    analysisJobId:
+      getCurrentMarketplaceAnalysisJobId()
+  }
+);
+
+
+await upsertMarketplaceAnalysisJob({
+  status:
+    "resume-ready",
+
+  stage:
+    "post-dataforseo",
+
+  dataForSeoReturnedAt:
+    Date.now()
+});
+
+  console.log(
+    "[STEP 4B] Google Lens fallback results:"
+  );
+
+  console.dir(
+    googleLensResults,
+    {
+      depth: null
+    }
+  );
+  
+
+
+  console.log(
+    "[STEP 4B] Google Lens fallback results:"
+  );
+
+  console.dir(
+    googleLensResults,
+    {
+      depth: null
+    }
+  );
+
+
+  /*
+    ============================================================
+    STEP 5B
+    FINAL RECONCILIATION WITH GOOGLE LENS EVIDENCE
+    ============================================================
+  */
+
+  button.innerText =
+    "Finalizing product identities...";
+
+
+  const secondPassResponse =
+    await fetchLocalServer(
+      "/reconcile-primary-products",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            listingTitle:
+              title,
+
+            listingDescription:
+              description,
+
+            listingScreenshotOcr,
+
+            explicitFacts,
+
+            galleryResults:
+              galleries,
+
+            bestGoogleTargets:
+              bestTargets,
+
+        productOcrResults,
+
+/*
+  Preserve the exact state established BEFORE
+  DataForSEO ran.
+
+  The server uses this as the baseline so weak
+  visual-search evidence cannot mutate known facts.
+*/
+preDataForSeoPrimaryProducts:
+  Array.isArray(
+    initialIdentificationData
+      ?.primaryProducts
+  )
+    ? initialIdentificationData
+        .primaryProducts
+    : [],
+/*
+  Products rejected as likely duplicates/phantoms must stay
+  rejected: the server's structural recovery would otherwise
+  restore them from the gallery registry on this pass.
+*/
+suppressedGalleryProducts:
+  Array.isArray(
+    initialIdentificationData
+      ?.suppressedGalleryProducts
+  )
+    ? initialIdentificationData
+        .suppressedGalleryProducts
+    : [],
+
+    preDataForSeoLensfunCandidates:
+  Array.isArray(
+    initialIdentificationData
+      ?.lensfunCandidateConstraints
+  )
+    ? initialIdentificationData
+        .lensfunCandidateConstraints
+    : [],
+
+googleLensResults
+          })
+      }
+    );
+
+
+  const secondPassData =
+    await readJsonSafely(
+      secondPassResponse
+    );
+
+
+  if (
+    !secondPassResponse.ok ||
+    secondPassData.error
+  ) {
+    throw new LocalServerError(
+      secondPassData,
+      "Final Lens-assisted reconciliation failed."
+    );
+  }
+
+
+  finalIdentificationData =
+    secondPassData;
+}
+
+/*
+  SERIALIZE THE FINAL PHASE FOR EVERY LISTING.
+
+  This protects the shared database/eBay state even when
+  this listing did not require DataForSEO.
+*/
+await acquireMarketplaceFinishLock();
+
+
+await upsertMarketplaceAnalysisJob({
+  status:
+    "finishing",
+
+  stage:
+    "final-database-ebay"
+});
+
+
+/*
+  ============================================================
+  FINAL PRIMARY PRODUCTS
+  ============================================================
+*/
+
+/*
+  ============================================================
+  FINAL PRIMARY PRODUCTS
+  ============================================================
+*/
+
+const reconciledProducts =
+  Array.isArray(
+    finalIdentificationData
+      ?.primaryProducts
+  )
+    ? finalIdentificationData
+        .primaryProducts
+    : [];
+
+    console.log(
+      "[STEP 5] FINAL PRIMARY PRODUCTS:"
+    );
+
+    console.table(
+      reconciledProducts
+    );
+
+    await chrome.storage.local.set({
+  marketplaceFinalPrimaryProducts:
+    reconciledProducts
+});
+
+
+    /*
+      ============================================================
+      CONVERT NEW IDENTIFICATION RESULT INTO THE EXISTING
+      DATABASE / EBAY ITEM FORMAT
+      ============================================================
+    */
+
+    const primaryItems =
+      reconciledProducts
+        .slice(
+          0,
+          10
+        )
+        .map(
+          (
+            product,
+            index
+          ) =>
+            convertPrimaryProductToCompItem(
+  product,
+  index,
+  listingCondition,
+  googleLensResults
+)
+        );
+
+        console.log(
+  "[DEBUG STEP 5B] Primary items after conversion:",
+  primaryItems.map(
+    item => ({
+      itemId:
+        item?.itemId,
+
+      productId:
+        item?.productId,
+
+      brand:
+        item?.brand,
+
+      model:
+        item?.model,
+
+      productType:
+        item?.productType,
+
+      ebaySearchQuery:
+        item?.ebaySearchQuery,
+
+      condition:
+        item?.condition
+    })
+  )
+);
+
+    /*
+      Compatibility object for downstream functions that still
+      expect the old "data" object.
+
+      This is NOT the old identification result.
+    */
+    const data = {
+      listingTitle:
+        title,
+
+      listingDescription:
+        description,
+
+      askingPrice:
+        facebookPrice,
+
+      items:
+        primaryItems,
+
+      listingType:
+        primaryItems.length > 1
+          ? "bundle"
+          : "single_item",
+
+      exceedsPrimaryItemLimit:
+        reconciledProducts.length > 5,
+
+      ignoredItems:
+        [],
+
+      cameraAnalysis: {
+        isCameraListing:
+          primaryItems.some(
+            item => {
+              const type =
+                String(
+                  item.productType || ""
+                )
+                  .toLowerCase();
+
+              return (
+                type.includes(
+                  "camera"
+                ) ||
+                type.includes(
+                  "lens"
+                )
+              );
+            }
+          )
+      }
+    };
+
+
+    showDebugPreview({
+      title,
+      description,
+      imageUrls,
+      screenshotDataUrl,
+
+      aiResult: {
+        explicitFacts,
+
+        galleryData,
+
+        bestGoogleTargets:
+          bestTargets,
+
+        googleLensResults,
+
+        primaryProducts:
+          reconciledProducts,
+
+        compItems:
+          primaryItems
+      }
+    });
+
+
+    /*
+      ============================================================
+      IMMEDIATE NON-CAMERA SKIP
+      ============================================================
+    */
+
+    if (
+      !listingLooksLikeCameraOrLens(
+        data,
+        primaryItems
+      )
+    ) {
+      const passResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          "Immediate skip: the new identification pipeline did not detect a camera or camera lens in this listing.",
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          null,
+
+        profitAtAsk:
+          null,
+
+        profitAt35:
+          null,
+
+        maxBuyPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        medianSoldPrice:
+          null,
+
+        items:
+          primaryItems,
+
+        ignoredItems:
+          [],
+
+        cameraAnalysis:
+          data.cameraAnalysis
+      };
+
+      console.log(
+        "Immediate skip because listing is not camera/lens:",
+        passResult
+      );
+
+      showLotCompPanel(
+        passResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        passResult
+      );
+
+      return;
+    }
+
+
+    /*
+      ============================================================
+      PRIMARY ITEM LIMIT
+      ============================================================
+    */
+
+    if (
+      reconciledProducts.length > 5 ||
+      primaryItems.length > 5
+    ) {
+      const passResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          `Immediate pass: listing has ${reconciledProducts.length} primary sellable items. Maximum allowed is 5.`,
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          null,
+
+        profitAtAsk:
+          null,
+
+        profitAt35:
+          null,
+
+        maxBuyPrice:
+          null,
+
+        items:
+          primaryItems.map(
+            item => ({
+              itemId:
+                item.itemId || "",
+
+              itemName:
+                item.ebaySearchQuery ||
+                `${item.brand || ""} ${item.model || ""} ${item.productType || ""}`
+                  .replace(
+                    /\s+/g,
+                    " "
+                  )
+                  .trim(),
+
+              brand:
+                item.brand || "",
+
+              model:
+                item.model || "",
+
+              productType:
+                item.productType || "",
+
+              condition:
+                item.condition || "",
+
+              validSoldCount:
+                0,
+
+              includedExpectedSalePrice:
+                null,
+
+              status:
+                "Excluded",
+
+              reason:
+                "Excluded because listing exceeded the 5-primary-item limit."
+            })
+          ),
+
+        ignoredItems:
+          []
+      };
+
+      showLotCompPanel(
+        passResult
+      );
+
+      const stored =
+        await chrome.storage.local.get(
+          MARKETPLACE_AUTO_STATE_KEY
+        );
+
+      await markMarketplaceAutoAnalysisComplete(
+  passResult
+);
+
+return;
+    }
+
+
+    /*
+      ============================================================
+      BRAND GATE: ONLY NIKON / CANON
+
+      Every primary item in this listing must be Nikon or Canon.
+      If even one primary item has a RESOLVED brand that is
+      neither Nikon nor Canon, skip this listing entirely rather
+      than continuing on to eBay/database pricing.
+
+      An item with an unresolved (blank) brand at this point does
+      NOT trip this check by itself - it just hasn't been
+      identified as "another brand" yet. That case is handled
+      separately, earlier in the pipeline, right before the
+      SerpApi call.
+      ============================================================
+    */
+
+    /*
+      UPDATED RULE: only ONE primary item needs to be Nikon or
+      Canon. Other items (any brand, or unresolved) continue on
+      to database / eBay pricing. Skip only when NO primary item
+      is Nikon or Canon.
+    */
+    const powerShotPrimaryItems =
+      findCanonPowerShotPrimaryItems(
+        primaryItems
+      );
+
+    if (powerShotPrimaryItems.length > 0) {
+      const powerShotPassResult =
+        buildCanonPowerShotPassResult({
+          facebookPrice,
+          items:
+            primaryItems,
+          detectedFrom:
+            powerShotPrimaryItems
+              .map(
+                item =>
+                  `${item?.brand || ""} ${item?.model || ""}`.trim()
+              )
+              .join(", ")
+        });
+
+      console.log(
+        "[POWERSHOT GATE] Skipping listing - Canon PowerShot primary item:",
+        powerShotPrimaryItems.map(
+          item => ({
+            productId:
+              item?.productId,
+
+            brand:
+              item?.brand,
+
+            model:
+              item?.model
+          })
+        )
+      );
+
+      showLotCompPanel(
+        powerShotPassResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        powerShotPassResult
+      );
+
+      return;
+    }
+
+    const hasNikonOrCanonPrimaryItem =
+      primaryItems.some(
+        item => {
+          const brand =
+            String(
+              item?.brand || ""
+            )
+              .trim()
+              .toLowerCase();
+
+          return (
+            brand === "nikon" ||
+            brand === "canon"
+          );
+        }
+      );
+
+    const offBrandPrimaryItems =
+      primaryItems.filter(
+        item =>
+          String(
+            item?.brand || ""
+          ).trim()
+      );
+
+    if (
+      primaryItems.length > 0 &&
+      !hasNikonOrCanonPrimaryItem
+    ) {
+      const offBrandPassResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          `Immediate skip: no primary item is Nikon or Canon (found ${
+            offBrandPrimaryItems.length
+              ? offBrandPrimaryItems
+                  .map(
+                    item =>
+                      item?.brand
+                  )
+                  .join(", ")
+              : "no resolved brand"
+          }). At least one Nikon or Canon primary item is required.`,
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          null,
+
+        profitAtAsk:
+          null,
+
+        profitAt35:
+          null,
+
+        maxBuyPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        medianSoldPrice:
+          null,
+
+        items:
+          primaryItems,
+
+        ignoredItems:
+          [],
+
+        cameraAnalysis:
+          data.cameraAnalysis
+      };
+
+      console.log(
+        "[BRAND GATE] Skipping listing - no Nikon/Canon primary item:",
+        offBrandPrimaryItems.map(
+          item => ({
+            productId:
+              item?.productId,
+
+            brand:
+              item?.brand
+          })
+        )
+      );
+
+      showLotCompPanel(
+        offBrandPassResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        offBrandPassResult
+      );
+
+      return;
+    }
+
+
+    if (!primaryItems.length) {
+      const noItemsResult = {
+        recommendation:
+          "Pass",
+
+        reason:
+          "The new identification pipeline did not identify any primary sellable camera products.",
+
+        facebookPrice,
+
+        items:
+          []
+      };
+
+      showLotCompPanel(
+        noItemsResult
+      );
+
+      await markMarketplaceAutoAnalysisComplete(
+        noItemsResult
+      );
+
+      return;
+    }
+
+
+    /*
+      ============================================================
+      PRODUCT DATABASE LOOKUP
+
+      The new identification pipeline is now COMPLETE.
+
+      From this point onward there is NO additional Google Lens
+      verification and NO SerpApi verification.
+      ============================================================
+    */
+
+    button.innerText =
+      "Checking product database...";
+
+   let databaseLookups = [];
+
+if (
+  !TESTING_MODE
+) {
+  button.innerText =
+    "Checking product database...";
+
+  const databaseResponse =
+    await fetchLocalServer(
+      "/lookup-product-values",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            items:
+              primaryItems
+          })
+      }
+    );
+
+  const databaseData =
+    await readJsonSafely(
+      databaseResponse
+    );
+
+  if (
+    !databaseResponse.ok ||
+    databaseData.error
+  ) {
+    throw new LocalServerError(
+      databaseData,
+      "Product database lookup failed."
+    );
+  }
+
+  databaseLookups =
+    Array.isArray(
+      databaseData.results
+    )
+      ? databaseData.results
+      : [];
+
+}else {
+  console.log(
+    "[TEST MODE] Global product resale database disabled. Every resolved product will be tested through eBay."
+  );
+}
+
+const databaseResults = [];
+const itemsNeedingEbay = [];
+
+for (
+  let index = 0;
+  index < primaryItems.length;
+  index += 1
+) {
+const item =
+  primaryItems[index];
+
+const initialLookup =
+  databaseLookups.find(
+    entry =>
+      Number(entry.index) ===
+      index
+  );
+
+console.log(
+  "[DEBUG EBAY QUEUE A] Evaluating primary item:",
+  {
+    index,
+
+    productId:
+      item?.productId,
+
+    brand:
+      item?.brand,
+
+    model:
+      item?.model,
+
+    productType:
+      item?.productType,
+
+    ebaySearchQuery:
+      item?.ebaySearchQuery,
+
+    databaseLookup:
+      initialLookup
+  }
+);
+
+  /*
+    LENSFUN MULTI-CANDIDATE RESALE CONSENSUS
+
+    The dedicated lens resolver already priced 2-3 remaining
+    Lensfun candidates individually (Supabase first, eBay comp
+    analysis for any not yet in Supabase) and found their resale
+    prices agreed within $20 of each other. Use that averaged
+    price directly for this primary item instead of a single
+    database/eBay lookup keyed to just one representative
+    candidate's name.
+  */
+  const resaleConsensusOverride =
+    Number(
+      item
+        ?.lensIdentity
+        ?.resaleValueOverride
+    );
+
+  if (
+    Number.isFinite(
+      resaleConsensusOverride
+    ) &&
+    resaleConsensusOverride > 0
+  ) {
+    console.log(
+      "[PRODUCT DATABASE] Using Lensfun multi-candidate resale consensus average:",
+      {
+        productId:
+          item?.productId,
+
+        candidateModels:
+          item
+            ?.lensIdentity
+            ?.resaleConsensusCandidateModels ||
+          [],
+
+        averagedResalePrice:
+          resaleConsensusOverride
+      }
+    );
+
+    databaseResults.push({
+      item,
+
+      result: {
+        source:
+          "lensfun-candidate-resale-consensus",
+
+        expectedSalePrice:
+          resaleConsensusOverride,
+
+        medianSoldPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        databaseCanonicalName:
+          null,
+
+        recommendation:
+          "Database Value",
+
+        reason:
+          `Averaged the estimated resale price across ${
+            Array.isArray(
+              item
+                ?.lensIdentity
+                ?.resaleConsensusCandidateModels
+            )
+              ? item.lensIdentity
+                  .resaleConsensusCandidateModels
+                  .length
+              : "2-3"
+          } Lensfun candidates that priced within $20 of each other, instead of routing to SerpApi.`
+      }
+    });
+
+    continue;
+  }
+
+  /*
+    DATABASE HIT
+
+    Rows saved before price_standard_deviation existed have a price
+    but no standard deviation. When REFRESH_DB_ROWS_MISSING_STD_DEV
+    is on, those rows fall through to the eBay path once; that run
+    saves the standard deviation, so every later hit has it.
+  */
+  const databaseRowMissingStdDev =
+    REFRESH_DB_ROWS_MISSING_STD_DEV &&
+    initialLookup?.found === true &&
+    (
+      initialLookup
+        .priceStandardDeviation == null ||
+      !Number.isFinite(
+        Number(
+          initialLookup
+            .priceStandardDeviation
+        )
+      )
+    );
+
+  if (
+    databaseRowMissingStdDev
+  ) {
+    console.log(
+      "[PRODUCT DATABASE] Cached row has no standard deviation. Refreshing from eBay:",
+      initialLookup.canonicalName
+    );
+  }
+
+  if (
+    initialLookup?.found === true &&
+    initialLookup
+      .estimatedResalePrice != null &&
+    !databaseRowMissingStdDev
+  ) {
+    const storedPrice =
+      Number(
+        initialLookup
+          .estimatedResalePrice
+      );
+
+    console.log(
+      "[PRODUCT DATABASE] HIT:",
+      initialLookup.canonicalName,
+      "$" + storedPrice
+    );
+
+    databaseResults.push({
+      item,
+
+      result: {
+        source:
+          "database",
+
+        expectedSalePrice:
+          storedPrice,
+
+        priceStandardDeviation:
+          initialLookup
+            .priceStandardDeviation ==
+          null
+            ? null
+            : Number(
+                initialLookup
+                  .priceStandardDeviation
+              ),
+
+        medianSoldPrice:
+          null,
+
+        validSoldCount:
+          0,
+
+        databaseCanonicalName:
+          initialLookup.canonicalName,
+
+        recommendation:
+          "Database Value",
+
+       reason:
+  "Estimated resale value loaded from global Supabase product database."
+      }
+    });
+
+    continue;
+  }
+
+  /*
+    DATABASE MISS
+
+    Product identity has ALREADY been through
+    the new Google/reconciliation pipeline.
+
+    No second verification.
+  */
+  console.log(
+    "[PRODUCT DATABASE] MISS:",
+    item.ebaySearchQuery ||
+    `${item.brand || ""} ${item.model || ""}`
+  );
+
+  itemsNeedingEbay.push(
+    item
+  );
+}
+
+    /*
+      ============================================================
+      REMOVE UNRESOLVED DB MISSES FROM EBAY QUEUE
+
+      We never open a generic eBay query if the final model
+      was unresolved.
+      ============================================================
+    */
+
+    const unresolvedDatabaseMissResults =
+      [];
+
+console.log(
+  "[DEBUG EBAY QUEUE B] Items needing eBay BEFORE filtering:",
+  itemsNeedingEbay.map(
+    item => ({
+      productId:
+        item?.productId,
+
+      brand:
+        item?.brand,
+
+      model:
+        item?.model,
+
+      productType:
+        item?.productType,
+
+      ebaySearchQuery:
+        item?.ebaySearchQuery
+    })
+  )
+);
+
+    const compableItemsNeedingEbay =
+      itemsNeedingEbay.filter(
+        item => {
+          const query =
+            String(
+              item
+                ?.ebaySearchQuery ||
+              ""
+            ).trim();
+
+          if (query) {
+            return true;
+          }
+
+          /*
+            UNRESOLVED CAMERA LENS
+
+            A lens that never resolved through Lensfun/SerpApi
+            still gets sold as part of the deal - don't drop it
+            into the dead-end "Unresolved"/Pass bucket. Give it a
+            conservative default resale value so the lot can still
+            be evaluated normally, and label it clearly so it's
+            obvious on review (and in Google Sheets) that this was
+            a default, not a real identification.
+          */
+          const isUnresolvedLens =
+            String(
+              item?.productType ||
+              ""
+            )
+              .trim()
+              .toLowerCase() ===
+            "camera lens";
+
+          if (isUnresolvedLens) {
+            console.log(
+              "[PRODUCT DATABASE] Lens never resolved an exact model. Assigning default $50 value as \"Unknown Lens\":",
+              item
+            );
+
+            item.model =
+              "Unknown Lens";
+
+            databaseResults.push({
+              item,
+
+              result: {
+                source:
+                  "database",
+
+                expectedSalePrice:
+                  UNKNOWN_LENS_DEFAULT_RESALE_VALUE,
+
+                medianSoldPrice:
+                  null,
+
+                validSoldCount:
+                  0,
+
+                databaseCanonicalName:
+                  "Unknown Lens",
+
+                recommendation:
+                  "Database Value",
+
+                reason:
+                  "Lens could not be identified after the Lensfun/SerpApi resolution pipeline. Assigned a default $50 resale value as \"Unknown Lens\" instead of dropping the item."
+              }
+            });
+
+            return false;
+          }
+
+          console.log(
+            "[PRODUCT DATABASE] DB miss has no resolved eBay query. Skipping:",
+            item
+          );
+
+          unresolvedDatabaseMissResults.push({
+            item,
+
+            result: {
+              source:
+                "unresolved",
+
+              expectedSalePrice:
+                null,
+
+              medianSoldPrice:
+                null,
+
+              validSoldCount:
+                0,
+
+              recommendation:
+                "Unresolved",
+
+              reason:
+                "Product was not found in the database and the new identification pipeline did not resolve an exact model for an eBay sold search."
+            }
+          });
+
+          return false;
+        }
+      );
+
+      console.log(
+  "[DEBUG EBAY QUEUE C] Final eBay-compable items:",
+  compableItemsNeedingEbay.map(
+    item => ({
+      productId:
+        item?.productId,
+
+      brand:
+        item?.brand,
+
+      model:
+        item?.model,
+
+      productType:
+        item?.productType,
+
+      ebaySearchQuery:
+        item?.ebaySearchQuery
+    })
+  )
+);
+
+console.log(
+  "[DEBUG EBAY QUEUE D] Removed unresolved items:",
+  unresolvedDatabaseMissResults.map(
+    entry => ({
+      productId:
+        entry?.item?.productId,
+
+      brand:
+        entry?.item?.brand,
+
+      model:
+        entry?.item?.model,
+
+      ebaySearchQuery:
+        entry?.item
+          ?.ebaySearchQuery,
+
+      reason:
+        entry?.result?.reason
+    })
+  )
+);
+
+
+    /*
+      ============================================================
+      CREATE NORMAL EBAY COMP CONTEXT
+      ============================================================
+    */
+
+    const facebookUrl =
+      getCurrentFacebookListingUrl()
+        .split("?")[0];
+
+const ebayExecutionMode =
+  !TESTING_MODE
+    ? "api-active"
+    : shouldUseRemoteEbayForListing()
+      ? "remote"
+      : "local";
+      
+
+console.log(
+  "[EBAY ROUTING] Marketplace listing assigned:",
+  {
+    facebookUrl,
+    ebayExecutionMode,
+    ebayItems:
+      compableItemsNeedingEbay
+        .length
+  }
+);
+
+await chrome.storage.local.set({
+  ebayCompContext: {
+    mode:
+      primaryItems.length > 1
+        ? "bundle"
+        : "single",
+
+    /*
+      This is the important new field.
+
+      It stays fixed for the entire Marketplace listing.
+    */
+    ebayExecutionMode,
+
+      testingMode:
+      TESTING_MODE,
+
+    originalFacebookTitle:
+      title,
+
+    facebookDescription:
+      description,
+
+    facebookPrice,
+
+    facebookUrl,
+
+    imageUrls:
+      Array.isArray(
+        imageUrls
+      )
+        ? imageUrls
+        : [],
+
+    ignoredItems:
+      [],
+
+    items:
+      compableItemsNeedingEbay,
+
+    currentItemIndex:
+      0,
+
+    results: [
+      ...databaseResults,
+      ...unresolvedDatabaseMissResults
+    ],
+
+    createdAt:
+      Date.now()
+  }
+});
+
+    const firstItem =
+      compableItemsNeedingEbay[0];
+
+      console.log(
+  "[DEBUG EBAY QUEUE E] firstItem selected for eBay:",
+  firstItem || null
+);
+
+console.log(
+  "[DEBUG EBAY QUEUE F] Queue summary:",
+  {
+    primaryItems:
+      primaryItems.length,
+
+    databaseResults:
+      databaseResults.length,
+
+    itemsNeedingEbay:
+      itemsNeedingEbay.length,
+
+    compableItemsNeedingEbay:
+      compableItemsNeedingEbay.length,
+
+    unresolvedDatabaseMissResults:
+      unresolvedDatabaseMissResults.length,
+
+    firstItemExists:
+      Boolean(
+        firstItem
+      )
+  }
+);
+
+    const allPrimaryItemsFoundInDatabase =
+      primaryItems.length > 0 &&
+      databaseResults.length ===
+        primaryItems.length;
+
+
+    /*
+      ============================================================
+      ALL PRODUCTS FOUND IN DATABASE
+      ============================================================
+    */
+
+    if (
+      allPrimaryItemsFoundInDatabase
+    ) {
+      console.log(
+        "[PRODUCT DATABASE] All primary products found. Skipping eBay completely."
+      );
+
+      const storedContext =
+        await chrome.storage.local.get(
+          "ebayCompContext"
+        );
+
+      const completeContext =
+        storedContext
+          .ebayCompContext;
+
+      const finalResponse =
+        await fetchLocalServer(
+          "/evaluate-lot",
+          {
+            method:
+              "POST",
+
+            headers: {
+              "Content-Type":
+                "application/json"
+            },
+
+            body:
+              JSON.stringify({
+                context:
+                  completeContext
+              })
+          }
+        );
+
+      const finalResult =
+        await readJsonSafely(
+          finalResponse
+        );
+
+      if (
+        !finalResponse.ok ||
+        finalResult.error
+      ) {
+        throw new LocalServerError(
+          finalResult,
+          "Database-only lot evaluation failed."
+        );
+      }
+
+      const databaseFinalResult = {
+        ...finalResult,
+
+        databaseOnly:
+          true,
+
+        reason:
+          `All primary products were found in the local product database. ` +
+          `${finalResult.reason || ""}`
+      };
+
+      console.log(
+        "[PRODUCT DATABASE] Database-only final result:",
+        databaseFinalResult
+      );
+
+      /*
+        No finalLensVerificationDone flag anymore.
+
+        The new identification pipeline already performed
+        identification before the database lookup.
+      */
+
+      if (
+        String(
+          databaseFinalResult
+            .recommendation ||
+          ""
+        )
+          .trim()
+          .toLowerCase() ===
+        "scam"
+      ) {
+        await saveScamListing({
+          context:
+            completeContext,
+
+          result:
+            databaseFinalResult
+        });
+      }
+
+      await saveDealToLibrary({
+        context:
+          completeContext,
+
+        result:
+          databaseFinalResult
+      });
+
+      await markMarketplaceAutoAnalysisComplete(
+        databaseFinalResult
+      );
+
+      showLotCompPanel(
+        databaseFinalResult
+      );
+
+      return;
+    }
+
+
+    /*
+      ============================================================
+      NO EBAY-SEARCHABLE ITEMS REMAIN
+
+      This happens when one or more models could not be resolved
+      and were also absent from the product database.
+      ============================================================
+    */
+
+    if (!firstItem) {
+      console.warn(
+        "[PRODUCT DATABASE] No eBay-compable items remain, and not all primary products have database values.",
+        {
+          primaryItemCount:
+            primaryItems.length,
+
+          databaseResultCount:
+            databaseResults.length,
+
+          unresolvedResultCount:
+            unresolvedDatabaseMissResults
+              .length,
+
+          itemsNeedingEbayCount:
+            itemsNeedingEbay.length,
+
+          compableItemsNeedingEbayCount:
+            compableItemsNeedingEbay
+              .length
+        }
+      );
+
+      const unresolvedResult = {
+        recommendation:
+          "Pass",
+
+        facebookPrice,
+
+        totalExpectedSalePrice:
+          databaseResults.reduce(
+            (
+              sum,
+              entry
+            ) =>
+              sum +
+              Number(
+                entry
+                  ?.result
+                  ?.expectedSalePrice ||
+                0
+              ),
+            0
+          ),
+
+        reason:
+          "One or more primary products were not found in the local product database and the new identification pipeline did not produce a usable exact-model eBay query.",
+
+        items: [
+          ...databaseResults,
+          ...unresolvedDatabaseMissResults
+        ]
+      };
+
+      await markMarketplaceAutoAnalysisComplete(
+        unresolvedResult
+      );
+
+      showLotCompPanel(
+        unresolvedResult
+      );
+
+      return;
+    }
+
+
+/*
+  ============================================================
+  NORMAL MODE — ACTIVE EBAY API ONLY
+  ============================================================
+*/
+if (
+  !TESTING_MODE
+) {
+  console.log(
+    "[EBAY MODE] Normal scanner: active listings only."
+  );
+
+  button.innerText =
+    "Checking active eBay listings...";
+
+  await runActiveEbayApiWorkflow(
+    button
+  );
+
+  return;
+}
+    /*
+      ============================================================
+      START EXISTING EBAY SOLD-COMP WORKFLOW
+
+      Notice there is NO:
+        needsVisualSearch check
+        force-lens-verification
+        SerpApi
+        second identification pass
+
+      The product identity is considered final at this point.
+      ============================================================
+    */
+
+    /*
+  ============================================================
+  START EBAY SOLD-COMP WORKFLOW
+  ============================================================
+*/
+
+const storedEbayContext =
+  await chrome.storage.local.get(
+    "ebayCompContext"
+  );
+
+const activeEbayContext =
+  storedEbayContext
+    .ebayCompContext;
+
+/*
+  ------------------------------------------------------------
+  REMOTE LISTING
+  ------------------------------------------------------------
+*/
+
+if (
+  activeEbayContext
+    ?.ebayExecutionMode ===
+  "remote"
+) {
+  console.log(
+    "[EBAY ROUTING] This Marketplace listing is using the remote eBay worker."
+  );
+
+  button.innerText =
+    "Waiting for remote eBay worker...";
+
+  await runRemoteEbayCompWorkflow();
+
+  return;
+}
+
+/*
+  ------------------------------------------------------------
+  NORMAL LOCAL LISTING
+  ------------------------------------------------------------
+*/
+
+console.log(
+  "[EBAY ROUTING] This Marketplace listing is using normal local eBay tabs."
+);
+
+button.innerText =
+  "Opening eBay comps...";
+
+const opened =
+  openEbaySoldSearch(
+    firstItem
+      .ebaySearchQuery,
+
+    firstItem.condition,
+
+    firstItem
+      .negativeSearchTerms
+  );
+
+if (!opened) {
+  const unresolvedResult = {
+    recommendation:
+      "Pass",
+
+    facebookPrice,
+
+    reason:
+      "The identified product did not have a usable eBay search query.",
+
+    item:
+      firstItem
+  };
+
+  await markMarketplaceAutoAnalysisComplete(
+    unresolvedResult
+  );
+
+  showLotCompPanel(
+    unresolvedResult
+  );
+
+  return;
+}
+
+    if (!opened) {
+      const unresolvedResult = {
+        recommendation:
+          "Pass",
+
+        facebookPrice,
+
+        reason:
+          "The identified product did not have a usable eBay search query.",
+
+        item:
+          firstItem
+      };
+
+      await markMarketplaceAutoAnalysisComplete(
+        unresolvedResult
+      );
+
+      showLotCompPanel(
+        unresolvedResult
+      );
+
+      return;
+    }
+
+  } catch (error) {
+    console.error(
+      error
+    );
+
+    const shouldRestartForJson =
+      error
+        ?.retryEntireListing ===
+        true ||
+      error?.code ===
+        "MALFORMED_AI_JSON" ||
+      error?.code ===
+        "MALFORMED_SERVER_JSON";
+
+    if (
+      shouldRestartForJson
+    ) {
+      await restartEntireFacebookListingScanBecauseMalformedJson({
+        step:
+          error.step ||
+          "Product identification",
+
+        errorMessage:
+          error.message ||
+          ""
+      });
+
+      return;
+    }
+
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_AUTO_STATE_KEY
+      );
+
+    const state =
+      stored[
+        MARKETPLACE_AUTO_STATE_KEY
+      ];
+
+if (state?.running) {
+  const errorResult = {
+    recommendation:
+      "Error",
+
+    reason:
+      error.message ||
+      "Could not complete listing analysis."
+  };
+
+  await markMarketplaceAutoAnalysisComplete(
+    errorResult
+  );
+
+  return;
+}
+
+    alert(
+      error.message ||
+      "Could not reach local AI server. Make sure npm.cmd run dev is running."
+    );
+
+  } finally {
+    button.innerText =
+      "AI Check eBay Sold";
+  }
+}
+
+function parseEbayPrice(text) {
+  if (!text) return null;
+
+  // Skip price ranges for now.
+  if (text.includes("to")) return null;
+
+  const match = text.match(/\$[\d,]+(\.\d{2})?/);
+  if (!match) return null;
+
+  return Number(match[0].replace("$", "").replace(/,/g, ""));
+}
+
+function parseEbaySoldDate(text) {
+  if (!text) return null;
+
+  const cleaned = text.replace(/\s+/g, " ");
+
+  const match = cleaned.match(/Sold\s+([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})?/i);
+
+  if (!match) return null;
+
+  const month = match[1];
+  const day = match[2];
+  const year = match[3] || new Date().getFullYear();
+
+  const date = new Date(`${month} ${day}, ${year}`);
+
+  if (Number.isNaN(date.getTime())) return null;
+
+  if (!match[3] && date > new Date()) {
+    date.setFullYear(date.getFullYear() - 1);
+  }
+
+  return date.toISOString();
+}
+
+function formatSessionDuration(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes <= 0) {
+    return `${seconds}s`;
+  }
+
+  return `${minutes}m ${seconds}s`;
+}
+
+const MARKETPLACE_AUTO_STATS_PANEL_ID = "marketplace-auto-stats-panel";
+let marketplaceAutoStatsIntervalId = null;
+
+function formatAutoStatsClock(ms) {
+  const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+  }
+
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+function getAutoStatsPanelStatusText(state) {
+  if (!state?.running) return "Stopped";
+  if (state.waitingForAnalysis) return "Analyzing listing";
+  if (state.currentListingUrl) return "Opening listing";
+  return "Scanning";
+}
+
+function ensureMarketplaceAutoStatsPanel() {
+  let panel = document.getElementById(MARKETPLACE_AUTO_STATS_PANEL_ID);
+
+  if (panel) return panel;
+
+  panel = document.createElement("div");
+  panel.id = MARKETPLACE_AUTO_STATS_PANEL_ID;
+
+  panel.style.position = "fixed";
+  panel.style.left = "18px";
+  panel.style.top = "120px";
+  panel.style.width = "215px";
+  panel.style.zIndex = "999999";
+  panel.style.background = "#111";
+  panel.style.color = "#fff";
+  panel.style.border = "1px solid rgba(255,255,255,0.18)";
+  panel.style.borderRadius = "12px";
+  panel.style.padding = "12px";
+  panel.style.fontFamily = "Arial, sans-serif";
+  panel.style.fontSize = "12px";
+  panel.style.boxShadow = "0 8px 24px rgba(0,0,0,0.35)";
+
+  document.body.appendChild(panel);
+  return panel;
+}
+
+function removeMarketplaceAutoStatsPanel() {
+  const panel = document.getElementById(MARKETPLACE_AUTO_STATS_PANEL_ID);
+  if (panel) panel.remove();
+}
+
+function renderMarketplaceAutoStatsPanel(state) {
+  if (!state?.running) {
+    removeMarketplaceAutoStatsPanel();
+    return;
+  }
+
+  const panel = ensureMarketplaceAutoStatsPanel();
+
+  const sessionLog = state.sessionLog || {};
+  const startedAt = sessionLog.startedAt || state.createdAt || Date.now();
+
+  const elapsedMs = Date.now() - startedAt;
+  const clickedListings =
+  Number(
+    sessionLog.clickedListings || 0
+  );
+
+const hitsFound =
+  Number(
+    sessionLog.hitsFound || 0
+  );
+
+const outreachQueued =
+  Number(
+    sessionLog.outreachQueued || 0
+  );
+
+  const currentSearchTerm =
+  state.currentSearchTerm ||
+  getMarketplaceSearchTermFromUrl(
+    state.listUrl ||
+    window.location.href
+  ) ||
+  "Not detected";
+
+const isRandomKeywordScan =
+  state.scanMode ===
+  MARKETPLACE_RANDOM_KEYWORD_MODE;
+
+  const remainingText = state.stopAt
+    ? formatAutoStatsClock(Math.max(0, state.stopAt - Date.now()))
+    : "No timer";
+
+  panel.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px;">
+      <div style="font-weight:800; font-size:14px;">Auto Scan</div>
+      <div style="font-size:10px; color:#9ee493; font-weight:700;">LIVE</div>
+    </div>
+
+    <div style="font-size:11px; color:#bbb; margin-bottom:10px;">
+      ${escapeHtml(getAutoStatsPanelStatusText(state))}
+    </div>
+
+    <div style="display:grid; gap:8px;">
+      <div style="display:flex; justify-content:space-between; gap:8px;">
+        <span style="color:#bbb;">Elapsed</span>
+        <b>${escapeHtml(formatAutoStatsClock(elapsedMs))}</b>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; gap:8px;">
+        <span style="color:#bbb;">Listings clicked</span>
+        <b>${clickedListings}</b>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; gap:8px;">
+        <span style="color:#bbb;">Hits found</span>
+        <b>${hitsFound}</b>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; gap:8px;">
+  <span style="color:#bbb;">Outreach queued</span>
+  <b>${outreachQueued}</b>
+</div>
+
+      <div style="display:flex; justify-content:space-between; gap:8px;">
+        <span style="color:#bbb;">Remaining</span>
+        <b>${escapeHtml(remainingText)}</b>
+      </div>
+
+      ${
+  isRandomKeywordScan
+    ? `
+      <div style="display:flex; justify-content:space-between; gap:8px;">
+        <span style="color:#bbb;">Search term</span>
+        <b style="max-width:120px; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+          ${escapeHtml(currentSearchTerm)}
+        </b>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; gap:8px;">
+        <span style="color:#bbb;">Term switches</span>
+        <b>${Number(state.searchSwitchCount || 0)}</b>
+      </div>
+    `
+    : ""
+}
+    </div>
+  `;
+}
+
+async function refreshMarketplaceAutoStatsPanel() {
+  if (
+    typeof chrome === "undefined" ||
+    !chrome.storage?.local
+  ) {
+    return false;
+  }
+
+  try {
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_AUTO_STATE_KEY
+      );
+
+    const state =
+      stored[
+        MARKETPLACE_AUTO_STATE_KEY
+      ];
+
+    renderMarketplaceAutoStatsPanel(
+      state
+    );
+
+    return true;
+
+  } catch (error) {
+    if (
+      isExtensionContextInvalidated(
+        error
+      )
+    ) {
+      /*
+        The extension was reloaded.
+
+        The old content script cannot be repaired;
+        the tab must be refreshed.
+      */
+      if (
+        marketplaceAutoStatsIntervalId
+      ) {
+        clearInterval(
+          marketplaceAutoStatsIntervalId
+        );
+
+        marketplaceAutoStatsIntervalId =
+          null;
+      }
+
+      console.warn(
+        "Marketplace stats loop stopped because the extension was reloaded. Refresh this tab."
+      );
+
+      return false;
+    }
+
+    console.warn(
+      "Could not refresh Marketplace stats:",
+      error
+    );
+
+    return false;
+  }
+}
+
+function startMarketplaceAutoStatsPanelLoop() {
+  if (marketplaceAutoStatsIntervalId) return;
+
+  refreshMarketplaceAutoStatsPanel();
+
+ void refreshMarketplaceAutoStatsPanel();
+
+marketplaceAutoStatsIntervalId =
+  setInterval(
+    () => {
+      void refreshMarketplaceAutoStatsPanel();
+    },
+    1000
+  );
+
+  if (chrome.storage?.onChanged) {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== "local") return;
+      if (!changes[MARKETPLACE_AUTO_STATE_KEY]) return;
+
+      renderMarketplaceAutoStatsPanel(changes[MARKETPLACE_AUTO_STATE_KEY].newValue);
+    });
+  }
+}
+
+function extractEbaySoldListings() {
+  const itemLinks = Array.from(document.querySelectorAll("a[href*='/itm/']"));
+
+  console.log("eBay item links found:", itemLinks.length);
+
+  function findListingContainer(link) {
+    let node = link;
+
+    for (let i = 0; i < 8; i++) {
+      if (!node) return null;
+
+      const text = node.innerText || "";
+
+      const hasSold = /Sold\s+[A-Za-z]{3,9}\s+\d{1,2}/i.test(text);
+      const hasPrice = /\$[\d,]+(\.\d{2})?/.test(text);
+      const textLongEnough = text.length > 40;
+
+      if (hasSold && hasPrice && textLongEnough) {
+        return node;
+      }
+
+      node = node.parentElement;
+    }
+
+    return null;
+  }
+
+  const containers = itemLinks
+    .map(link => findListingContainer(link))
+    .filter(Boolean);
+
+  const uniqueContainers = [...new Set(containers)];
+
+  console.log("eBay listing containers found:", uniqueContainers.length);
+
+  const listings = uniqueContainers.map(container => {
+    const allText = container.innerText || "";
+
+    const linkEl =
+      container.querySelector("a[href*='/itm/']") ||
+      null;
+
+    let title =
+      linkEl?.innerText?.trim() ||
+      linkEl?.getAttribute("aria-label")?.trim() ||
+      "";
+
+    title = title
+      .replace(/\s+/g, " ")
+      .replace(/^Opens in a new window or tab\s*/i, "")
+      .trim();
+
+    const priceMatch = allText.match(/\$[\d,]+(\.\d{2})?/);
+    const priceText = priceMatch ? priceMatch[0] : "";
+    const price = parseEbayPrice(priceText);
+
+    const soldDate = parseEbaySoldDate(allText);
+
+ let condition = "";
+
+const conditionMatch = allText.match(
+  /\b(Open Box|Used|Pre-Owned|Parts Only|For parts or not working|For parts|Not Working|Brand New|New other|New with defects)\b/i
+);
+
+if (conditionMatch) {
+  condition = conditionMatch[0];
+
+  // eBay "New Listing" is not item condition.
+  if (/^new$/i.test(condition) && /new listing/i.test(allText)) {
+    condition = "";
+  }
+}
+
+    const imageUrl =
+      container.querySelector("img")?.src ||
+      "";
+
+    const link =
+      linkEl?.href ||
+      "";
+
+    const bestOfferAccepted = /best offer accepted/i.test(allText);
+
+return {
+  title,
+  price,
+  priceText,
+  condition,
+  soldDate,
+  link,
+  imageUrl,
+  bestOfferAccepted,
+  rawText: allText.slice(0, 800)
+};
+  });
+
+  console.log("Raw extracted listings before cleanup:", listings);
+  console.table(listings.map(item => ({
+    title: item.title,
+    price: item.price,
+    condition: item.condition,
+    soldDate: item.soldDate
+  })));
+
+  const cleanedListings = listings
+    .filter(item => item.title)
+    .filter(item => item.price)
+    .filter(item => item.soldDate)
+    .filter(item => !item.title.toLowerCase().includes("shop on ebay"))
+    .filter(item => !item.title.toLowerCase().includes("results matching fewer words"))
+    .slice(0, 60);
+
+  console.log("Cleaned eBay listings:", cleanedListings);
+  console.table(cleanedListings.map(item => ({
+    title: item.title,
+    price: item.price,
+    condition: item.condition,
+    soldDate: item.soldDate
+  })));
+
+  return cleanedListings;
+}
+
+function showEbayCompPanel(result) {
+  const existing = document.getElementById("ebay-comp-result-panel");
+  if (existing) existing.remove();
+
+  const panel = document.createElement("div");
+  panel.id = "ebay-comp-result-panel";
+
+  const recommendation = result.recommendation || "Unknown";
+  const debug = result.debugCounts || {};
+
+  function money(value) {
+    if (value === null || value === undefined) return "N/A";
+
+    const num = Number(value);
+    if (Number.isNaN(num)) return "N/A";
+
+    return "$" + num.toFixed(2).replace(/\.00$/, "");
+  }
+
+  const medianEligibleCount =
+    result.medianEligibleCount ??
+    debug.medianEligibleCount ??
+    null;
+
+  const bestOfferExcludedCount =
+    result.bestOfferExcludedCount ??
+    debug.bestOfferExcludedCount ??
+    0;
+
+  const removedByAiFilter =
+    result.removedByAiFilter ??
+    debug.removedByAiFilter ??
+    null;
+
+  const priceLow =
+    result.lowPrice ??
+    debug.priceLow ??
+    null;
+
+  const priceHigh =
+    result.highPrice ??
+    debug.priceHigh ??
+    null;
+
+  const hasDebug =
+    result.debugCounts ||
+    priceLow !== null ||
+    priceHigh !== null ||
+    bestOfferExcludedCount !== null;
+
+  panel.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+      <div style="font-weight:700; font-size:14px;">eBay Comp Analysis</div>
+      <button id="ebay-comp-result-close" style="border:none; background:#eee; padding:4px 8px; border-radius:6px; cursor:pointer;">Close</button>
+    </div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:13px; font-weight:700;">Status</div>
+    <div style="font-size:20px; font-weight:800; margin-bottom:10px;">${escapeHtml(recommendation)}</div>
+
+    <div><b>Target:</b> ${escapeHtml(result.targetProduct || "")}</div>
+    <div><b>Condition:</b> ${escapeHtml(result.condition || "N/A")}</div>
+
+    <hr style="margin:10px 0;" />
+
+    <div><b>Valid sold comps last 90 days:</b> ${result.validSoldCount ?? "N/A"}</div>
+    <div><b>Median sold price:</b> ${money(result.medianSoldPrice)}</div>
+    ${result.expectedSalePrice != null ? `<div><b>Estimated resale value:</b> ${money(result.expectedSalePrice)}</div>` : ""}
+
+    ${hasDebug ? `
+      <hr style="margin:10px 0;" />
+      <div style="font-size:12px; font-weight:700;">Debug</div>
+      <div>Scraped from eBay: ${debug.scrapedListings ?? "N/A"}</div>
+      <div>Within 90 days: ${debug.recentListings ?? "N/A"}</div>
+      <div>Sent to AI cleanup: ${debug.sentToAiCleanup ?? "N/A"}</div>
+      <div>Removed by AI cleanup: ${removedByAiFilter ?? "N/A"}</div>
+      <div>Comps used for median: ${medianEligibleCount ?? "N/A"}</div>
+      <div>Best Offer excluded from median: ${bestOfferExcludedCount ?? 0}</div>
+      <div>Comp price range: ${
+        priceLow !== null && priceHigh !== null
+          ? `${money(priceLow)} – ${money(priceHigh)}`
+          : "N/A"
+      }</div>
+    ` : ""}
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:12px; font-weight:700;">Reason</div>
+    <div style="font-size:12px; margin-bottom:10px;">${escapeHtml(result.reason || "")}</div>
+
+    <details>
+      <summary style="cursor:pointer;">Show valid comps</summary>
+      <div style="margin-top:8px; max-height:260px; overflow:auto;">
+        ${(result.validComps || []).map(comp => `
+          <div style="border-bottom:1px solid #eee; padding:6px 0;">
+            <div style="font-size:12px;">${escapeHtml(comp.title)}</div>
+            <div style="font-size:12px;">
+              <b>${money(comp.price)}</b> ${escapeHtml(comp.soldDate || "")}
+              ${comp.bestOfferAccepted ? `<span style="color:#b45309;"> Best Offer - excluded from median</span>` : ""}
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    </details>
+  `;
+
+  document.body.appendChild(panel);
+
+  document.getElementById("ebay-comp-result-close").onclick = () => {
+    panel.remove();
+  };
+}
+
+function showLotCompPanel(result) {
+  const existing = document.getElementById("ebay-comp-result-panel");
+  if (existing) existing.remove();
+
+  const panel = document.createElement("div");
+  panel.id = "ebay-comp-result-panel";
+
+  const itemRows = (result.items || []).map((entry, index) => `
+    <div style="border-bottom:1px solid #eee; padding:8px 0;">
+      <div style="font-weight:700;">${index + 1}. ${escapeHtml(entry.itemName || "")}</div>
+      <div><b>Condition:</b> ${escapeHtml(entry.condition || "")}</div>
+     <div><b>Estimated resale value:</b> ${entry.includedExpectedSalePrice != null ? "$" + entry.includedExpectedSalePrice : "Excluded"}</div>
+     <div>
+  <b>Comp count:</b>
+  ${
+    entry.validActiveCount ||
+    entry.validSoldCount ||
+    0
+  }
+</div>
+      <div><b>Status:</b> ${escapeHtml(entry.status || "")}</div>
+      <div style="font-size:11px; color:#555;">${escapeHtml(entry.reason || "")}</div>
+    </div>
+
+    <div><b>Standard deviation:</b> ${
+  entry.priceStandardDeviation != null
+    ? "$" + Number(entry.priceStandardDeviation).toFixed(2).replace(/\.00$/, "")
+    : "N/A"
+}</div>
+  `).join("");
+
+  
+
+  const ignoredRows = (result.ignoredItems || []).map(item => `
+    <div style="font-size:11px; color:#555;">
+      ${escapeHtml(item.name || "")}: ${escapeHtml(item.reason || "")}
+    </div>
+  `).join("");
+
+  panel.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+      <div style="font-weight:700; font-size:14px;">Lot Comp Analysis</div>
+      <button id="ebay-comp-result-close" style="border:none; background:#eee; padding:4px 8px; border-radius:6px; cursor:pointer;">Close</button>
+    </div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:13px; font-weight:700;">Recommendation</div>
+    <div style="font-size:20px; font-weight:800; margin-bottom:10px;">${escapeHtml(result.recommendation || "Unknown")}</div>
+
+    <div><b>Facebook ask:</b> ${result.facebookPrice ? "$" + result.facebookPrice : "Not detected"}</div>
+<div><b>35% negotiated price:</b> ${result.negotiatedPrice35 ? "$" + result.negotiatedPrice35 : "N/A"}</div>
+<div><b>Estimated resale value:</b> ${result.totalExpectedSalePrice != null ? "$" + result.totalExpectedSalePrice : "N/A"}</div>
+<div><b>Profit at ask:</b> ${result.profitAtAsk != null ? "$" + result.profitAtAsk : "N/A"}</div>
+<div><b>Profit at 35% off:</b> ${result.profitAt35 != null ? "$" + result.profitAt35 : "N/A"}</div>
+<div><b>Max buy price:</b> ${result.maxBuyPrice != null ? "$" + result.maxBuyPrice : "N/A"}</div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:12px; font-weight:700;">Reason</div>
+    <div style="font-size:12px; margin-bottom:10px;">${escapeHtml(result.reason || "")}</div>
+
+    <hr style="margin:10px 0;" />
+
+    <div style="font-size:12px; font-weight:700;">Primary items</div>
+    ${itemRows || "<div>No item results.</div>"}
+
+    ${ignoredRows ? `
+      <hr style="margin:10px 0;" />
+      <div style="font-size:12px; font-weight:700;">Ignored items</div>
+      ${ignoredRows}
+    ` : ""}
+  `;
+
+  document.body.appendChild(panel);
+
+  document.getElementById("ebay-comp-result-close").onclick = () => {
+    panel.remove();
+  };
+}
+
+function showEbayCompLoading(message) {
+  showEbayCompPanel({
+    recommendation: "Analyzing...",
+    targetProduct: message,
+    validSoldCount: 0,
+    reason: "Scraping visible eBay sold results and sending them to the local server."
+  });
+}
+
+function waitForEbayListings(timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+
+    const interval = setInterval(() => {
+      const pageText = document.body.innerText || "";
+      const hasSoldText = pageText.includes("Sold ");
+      const hasPrices = /\$[\d,]+(\.\d{2})?/.test(pageText);
+      const hasItemLinks = document.querySelectorAll("a[href*='/itm/']").length > 0;
+
+      if ((hasSoldText && hasPrices) || hasItemLinks) {
+        clearInterval(interval);
+        resolve(true);
+      }
+
+      if (Date.now() - start > timeoutMs) {
+        clearInterval(interval);
+        resolve(false);
+      }
+    }, 500);
+  });
+}
+
+function shouldAutoSaveDeal(result) {
+  return isHitRecommendation(result);
+}
+
+async function saveDealToGoogleSheet(savedDeal) {
+  try {
+    const response = await fetchLocalServer("/save-deal-to-sheet", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        deal: savedDeal
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.ok) {
+      console.warn("Google Sheets save failed:", data.error || "Unknown error");
+      return false;
+    }
+
+    console.log(
+  "Saved deal to Google Sheet:",
+  savedDeal.facebookUrl
+);
+
+if (data.analysisLogUrl) {
+  console.log(
+    "Permanent analysis log:",
+    data.analysisLogUrl
+  );
+}
+
+
+if (data.checklistUrl) {
+  console.log(
+    "Purchase checklist:",
+    data.checklistUrl
+  );
+}
+
+
+await markMarketplaceAnalysisRunCompleted();
+
+return true;
+  } catch (error) {
+    console.warn("Could not save deal to Google Sheet:", error.message);
+    return false;
+  }
+}
+
+async function saveDealToLibrary({ context, result }) {
+  if (!shouldAutoSaveDeal(result)) {
+    return;
+  }
+
+  const stored = await chrome.storage.local.get("savedDealLibrary");
+  const existingLibrary = Array.isArray(stored.savedDealLibrary)
+    ? stored.savedDealLibrary
+    : [];
+
+  const facebookUrl = context.facebookUrl || "";
+  const savedAt = new Date().toISOString();
+
+const primaryItemsWithStd = Array.isArray(result.items)
+  ? result.items.filter(item =>
+      item?.isPrimarySellableItem !== false &&
+      item?.priceStandardDeviation != null
+    )
+  : [];
+
+const topLevelPriceStandardDeviation =
+  result.priceStandardDeviation ??
+  (
+    primaryItemsWithStd.length === 1
+      ? primaryItemsWithStd[0].priceStandardDeviation
+      : null
+  );
+
+const storedAnalysisRun =
+  await chrome.storage.local.get(
+    MARKETPLACE_ANALYSIS_RUN_KEY
+  );
+
+const analysisRunId =
+  storedAnalysisRun[
+    MARKETPLACE_ANALYSIS_RUN_KEY
+  ]?.id || "";
+
+const savedDeal = {
+  id:
+    `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+
+  savedAt,
+
+  analysisRunId,
+
+  recommendation:
+    result.recommendation || "",
+
+  title:
+    context.originalFacebookTitle || "",
+
+  facebookUrl,
+  facebookPrice: result.facebookPrice ?? context.facebookPrice ?? null,
+  negotiatedPrice35: result.negotiatedPrice35 ?? null,
+  estimatedResaleValue: result.totalExpectedSalePrice ?? result.expectedSalePrice ?? null,
+  priceStandardDeviation: topLevelPriceStandardDeviation,
+  profitAtAsk: result.profitAtAsk ?? null,
+  profitAt35: result.profitAt35 ?? null,
+  maxBuyPrice: result.maxBuyPrice ?? null,
+  reason: result.reason || "",
+  items: result.items || [],
+  ignoredItems: result.ignoredItems || context.ignoredItems || [],
+  rawResult: result
+};
+
+const recommendation = String(result.recommendation || "").toLowerCase();
+
+const isHit =
+  recommendation.includes("buy") ||
+  recommendation.includes("negotiate");
+
+   const librarySavingEnabled =
+    await isLibrarySavingEnabled();
+
+  if (librarySavingEnabled) {
+    // Prevent duplicate saves for the same Facebook URL.
+    const withoutDuplicate = facebookUrl
+      ? existingLibrary.filter(
+          entry => entry.facebookUrl !== facebookUrl
+        )
+      : existingLibrary;
+
+    const updatedLibrary = [
+      savedDeal,
+      ...withoutDuplicate
+    ].slice(0, 250);
+
+    await chrome.storage.local.set({
+      savedDealLibrary: updatedLibrary
+    });
+
+    console.log(
+      "Saved deal to library:",
+      savedDeal
+    );
+  }
+
+  // Always save hits to Google Sheets,
+  // regardless of library setting.
+  await saveDealToGoogleSheet(savedDeal);
+
+  if (isHit) {
+  const storedAuto = await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
+  const state = storedAuto[MARKETPLACE_AUTO_STATE_KEY];
+
+  if (state?.running) {
+    const currentLog = state.sessionLog || {
+      startedAt: Date.now(),
+      clickedListings: 0,
+      hitsFound: 0
+    };
+
+    await updateMarketplaceSessionLog({
+      hitsFound: currentLog.hitsFound + 1
+    });
+
+    console.log("Session hit found from final result. Total hits:", currentLog.hitsFound + 1);
+  }
+}
+
+}
+
+async function markMarketplaceAutoAnalysisComplete(
+  finalResult,
+  options = {}
+) {
+  const stored = await chrome.storage.local.get(
+    MARKETPLACE_AUTO_STATE_KEY
+  );
+
+  const state = stored[MARKETPLACE_AUTO_STATE_KEY];
+
+  if (options.preserveMalformedJsonRetryCount !== true) {
+    const facebookUrl =
+  String(
+    window.location.href ||
+    ""
+  ).split("?")[0];
+
+    const listingId =
+      getFacebookMarketplaceItemId(facebookUrl);
+
+    if (listingId) {
+      await clearMalformedJsonRetryCount(listingId);
+    }
+  }
+
+if (!state?.running) return;
+
+const completedFacebookUrl =
+  String(
+    window.location.href ||
+    ""
+  ).split("?")[0];
+
+const completedListingId =
+  getFacebookMarketplaceItemId(
+    completedFacebookUrl
+  );
+
+if (completedListingId) {
+  await clearListingAnalysisRetryCount(
+    completedListingId
+  );
+}
+
+await updateSessionListingResult(finalResult);
+
+await upsertMarketplaceAnalysisJob({
+  status:
+    "complete",
+
+  stage:
+    "complete",
+
+  finalResult,
+
+  completedAt:
+    Date.now()
+});
+
+/*
+  If this listing owns the serialized finishing
+  lock, its finishing work is now complete.
+*/
+await releaseMarketplaceFinishLock();
+
+
+const latestStoredBeforeCompletionWrite =
+  await chrome.storage.local.get(
+    MARKETPLACE_AUTO_STATE_KEY
+  );
+
+const latestStateBeforeCompletionWrite =
+  latestStoredBeforeCompletionWrite[
+    MARKETPLACE_AUTO_STATE_KEY
+  ] || state;
+
+
+await chrome.storage.local.set({
+  [MARKETPLACE_AUTO_STATE_KEY]: {
+    ...latestStateBeforeCompletionWrite,
+
+    lastResult:
+      finalResult,
+
+    lastResultAt:
+      Date.now()
+  }
+});
+
+  console.log("Marked Marketplace auto analysis complete:", finalResult?.recommendation);
+}
+
+async function isMarketplaceAutoAnalyzerRunning() {
+  const stored = await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
+  const state = stored[MARKETPLACE_AUTO_STATE_KEY];
+
+  if (!state?.running) return false;
+
+  if (state.stopAt && Date.now() >= state.stopAt) {
+    console.log("Auto analyzer timer expired. Stopping scan.");
+
+    await stopMarketplaceAutoAnalyzer({
+      reason: "Timer expired"
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
+function getSearchPollutionRerunGate(
+  itemResult
+) {
+  const MINIMUM_VALID_COMPS = 7;
+  const MINIMUM_RELATED_WRONG_MODEL_COMPS =
+    8;
+
+  const searchPollution =
+    itemResult?.searchPollution || {};
+
+  const validExactModelCount =
+    Math.max(
+      0,
+      Number(
+        searchPollution
+          .validExactModelCount ??
+        itemResult?.validExactModelCount ??
+        itemResult?.validSoldCount ??
+        0
+      )
+    );
+
+  const relatedWrongModelCount =
+    Math.max(
+      0,
+      Number(
+        searchPollution
+          .relatedWrongModelCount ??
+        itemResult
+          ?.relatedWrongModelCount ??
+        0
+      )
+    );
+
+  const belowMinimumCompThreshold =
+    validExactModelCount <
+    MINIMUM_VALID_COMPS;
+
+  const enoughRelatedWrongModels =
+    relatedWrongModelCount >=
+    MINIMUM_RELATED_WRONG_MODEL_COMPS;
+
+  /*
+    The browser independently enforces the same
+    rule as the server.
+
+    A high number of removed listings alone does
+    not trigger a rerun.
+  */
+  const allowed =
+    belowMinimumCompThreshold &&
+    enoughRelatedWrongModels &&
+    searchPollution
+      .pollutedByRelatedModels === true &&
+    itemResult.rerunRecommended === true;
+
+  return {
+    allowed,
+
+    validExactModelCount,
+    relatedWrongModelCount,
+
+    belowMinimumCompThreshold,
+    enoughRelatedWrongModels,
+
+    pollutedByRelatedModels:
+      searchPollution
+        .pollutedByRelatedModels === true,
+
+    minimumValidComps:
+      MINIMUM_VALID_COMPS,
+
+    minimumRelatedWrongModelComps:
+      MINIMUM_RELATED_WRONG_MODEL_COMPS
+  };
+}
+
+async function runRemoteEbayCompWorkflow() {
+  const stored =
+    await chrome.storage.local.get(
+      "ebayCompContext"
+    );
+
+  let context =
+    stored.ebayCompContext;
+
+  if (!context) {
+    throw new Error(
+      "Remote eBay workflow started without ebayCompContext."
+    );
+  }
+
+  if (
+    context.ebayExecutionMode !==
+    "remote"
+  ) {
+    throw new Error(
+      "Remote eBay workflow called for a locally-routed listing."
+    );
+  }
+
+  const items =
+    Array.isArray(
+      context.items
+    )
+      ? context.items
+      : [];
+
+  console.log(
+    "[REMOTE EBAY] Starting listing-level remote workflow:",
+    {
+      facebookUrl:
+        context.facebookUrl,
+      itemCount:
+        items.length
+    }
+  );
+
+  /*
+    Process every eBay-compable product belonging
+    to this Marketplace listing.
+  */
+  while (
+    Number(
+      context.currentItemIndex ||
+      0
+    ) <
+    items.length
+  ) {
+    const currentItemIndex =
+      Number(
+        context.currentItemIndex ||
+        0
+      );
+
+    let currentItem =
+      context.items[
+        currentItemIndex
+      ];
+
+    /*
+      Same skip behavior as normal workflow.
+    */
+    if (
+      !String(
+        currentItem
+          ?.ebaySearchQuery ||
+        ""
+      ).trim()
+    ) {
+      context = {
+        ...context,
+
+        results: [
+          ...(context.results || []),
+
+          {
+            item:
+              currentItem,
+
+            result: {
+              recommendation:
+                "Skipped",
+
+              validSoldCount:
+                0,
+
+              medianSoldPrice:
+                null,
+
+              expectedSalePrice:
+                null,
+
+              reason:
+                "Skipped because this item did not have a resolved eBay search query."
+            }
+          }
+        ],
+
+        currentItemIndex:
+          currentItemIndex + 1
+      };
+
+      await chrome.storage.local.set({
+        ebayCompContext:
+          context
+      });
+
+      continue;
+    }
+
+    /*
+      ------------------------------------------------------------
+      FIRST EBAY SEARCH
+      ------------------------------------------------------------
+    */
+
+    const remoteSearch =
+      await runSingleRemoteEbaySearch({
+        item:
+          currentItem,
+
+        negativeSearchTerms:
+          currentItem
+            .negativeSearchTerms,
+
+        context
+      });
+
+    console.log(
+      "[REMOTE EBAY] Raw listings returned:",
+      {
+        jobId:
+          remoteSearch.jobId,
+
+        ebayUrl:
+          remoteSearch.ebayUrl,
+
+        count:
+          remoteSearch
+            .listings
+            .length
+      }
+    );
+
+    let evaluationResponse =
+      await fetchLocalServer(
+        "/evaluate-comps",
+        {
+          method:
+            "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              target: {
+                ...currentItem,
+
+                facebookPrice:
+                  context.facebookPrice,
+
+                originalFacebookTitle:
+                  context
+                    .originalFacebookTitle,
+
+                facebookDescription:
+                  context
+                    .facebookDescription,
+
+                ebaySearchQuery:
+                  currentItem
+                    .ebaySearchQuery
+              },
+
+              listings:
+                remoteSearch.listings
+            })
+        }
+      );
+
+    let itemResult =
+      await readJsonSafely(
+        evaluationResponse
+      );
+
+    if (
+      !evaluationResponse.ok ||
+      itemResult.error
+    ) {
+      throw new LocalServerError(
+        itemResult,
+        "Remote comp evaluation failed."
+      );
+    }
+
+    /*
+      ------------------------------------------------------------
+      SEARCH-POLLUTION RERUN
+
+      Preserve the same one-rerun maximum as your
+      existing local eBay workflow.
+      ------------------------------------------------------------
+    */
+
+    const rerunTerms =
+      Array.isArray(
+        itemResult
+          .rerunNegativeSearchTerms
+      )
+        ? itemResult
+            .rerunNegativeSearchTerms
+
+        : Array.isArray(
+            itemResult
+              .searchPollution
+              ?.negativeSearchTerms
+          )
+          ? itemResult
+              .searchPollution
+              .negativeSearchTerms
+
+          : [];
+
+    const pollutionGate =
+      getSearchPollutionRerunGate(
+        itemResult
+      );
+
+    const alreadyReran =
+      currentItem
+        .searchPollutionRerunDone ===
+      true;
+
+    if (
+      pollutionGate.allowed &&
+      rerunTerms.length > 0 &&
+      !alreadyReran
+    ) {
+      console.log(
+        "[REMOTE EBAY] Pollution rerun required:",
+        {
+          target:
+            currentItem
+              .ebaySearchQuery,
+
+          rerunTerms
+        }
+      );
+
+      currentItem = {
+        ...currentItem,
+
+        negativeSearchTerms: [
+          ...(
+            Array.isArray(
+              currentItem
+                .negativeSearchTerms
+            )
+              ? currentItem
+                  .negativeSearchTerms
+              : []
+          ),
+
+          ...rerunTerms
+        ],
+
+        searchPollutionRerunDone:
+          true,
+
+        searchPollutionRerunReason:
+          itemResult.rerunReason ||
+          "",
+
+        searchPollutionFirstPass:
+          itemResult
+            .searchPollution ||
+          null
+      };
+
+      context = {
+        ...context,
+
+        items:
+          context.items.map(
+            (item, index) =>
+              index ===
+              currentItemIndex
+                ? currentItem
+                : item
+          )
+      };
+
+      await chrome.storage.local.set({
+        ebayCompContext:
+          context
+      });
+
+      /*
+        IMPORTANT:
+
+        This still goes through the SAME remote worker,
+        because the entire Marketplace listing was assigned
+        remote mode.
+      */
+
+      const rerunSearch =
+        await runSingleRemoteEbaySearch({
+          item:
+            currentItem,
+
+          negativeSearchTerms:
+            currentItem
+              .negativeSearchTerms,
+
+          context
+        });
+
+      evaluationResponse =
+        await fetchLocalServer(
+          "/evaluate-comps",
+          {
+            method:
+              "POST",
+
+            headers: {
+              "Content-Type":
+                "application/json"
+            },
+
+            body:
+              JSON.stringify({
+                target: {
+                  ...currentItem,
+
+                  facebookPrice:
+                    context
+                      .facebookPrice,
+
+                  originalFacebookTitle:
+                    context
+                      .originalFacebookTitle,
+
+                  facebookDescription:
+                    context
+                      .facebookDescription,
+
+                  ebaySearchQuery:
+                    currentItem
+                      .ebaySearchQuery
+                },
+
+                listings:
+                  rerunSearch.listings
+              })
+          }
+        );
+
+      itemResult =
+        await readJsonSafely(
+          evaluationResponse
+        );
+
+      if (
+        !evaluationResponse.ok ||
+        itemResult.error
+      ) {
+        throw new LocalServerError(
+          itemResult,
+          "Remote pollution-rerun evaluation failed."
+        );
+      }
+    }
+
+    /*
+      ------------------------------------------------------------
+      ITEM COMPLETE
+      ------------------------------------------------------------
+    */
+
+    context = {
+      ...context,
+
+      results: [
+        ...(context.results || []),
+
+        {
+          item:
+            currentItem,
+
+          result:
+            itemResult
+        }
+      ],
+
+      currentItemIndex:
+        currentItemIndex + 1
+    };
+
+    await chrome.storage.local.set({
+      ebayCompContext:
+        context
+    });
+
+    console.log(
+      "[REMOTE EBAY] Item complete:",
+      {
+        item:
+          currentItem
+            .ebaySearchQuery,
+
+        itemNumber:
+          currentItemIndex + 1,
+
+        totalItems:
+          items.length
+      }
+    );
+  }
+
+  /*
+    ============================================================
+    ALL ITEMS COMPLETE
+    ============================================================
+  */
+
+  console.log(
+    "[REMOTE EBAY] Entire Marketplace listing finished. Evaluating lot."
+  );
+
+  const finalResponse =
+    await fetchLocalServer(
+      "/evaluate-lot",
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            context
+          })
+      }
+    );
+
+  const finalResult =
+    await readJsonSafely(
+      finalResponse
+    );
+
+  if (
+    !finalResponse.ok ||
+    finalResult.error
+  ) {
+    throw new LocalServerError(
+      finalResult,
+      "Remote final lot evaluation failed."
+    );
+  }
+
+  console.log(
+    "[REMOTE EBAY] Final lot evaluation:",
+    finalResult
+  );
+
+  if (
+    String(
+      finalResult
+        .recommendation ||
+      ""
+    )
+      .trim()
+      .toLowerCase() ===
+    "scam"
+  ) {
+    await saveScamListing({
+      context,
+      result:
+        finalResult
+    });
+  }
+
+  await saveDealToLibrary({
+    context,
+    result:
+      finalResult
+  });
+
+  if (
+    !isHitRecommendation(
+      finalResult
+    )
+  ) {
+    await markMarketplaceAnalysisRunCompleted();
+  }
+
+  await markMarketplaceAutoAnalysisComplete(
+    finalResult
+  );
+
+  showLotCompPanel(
+    finalResult
+  );
+
+  return finalResult;
+}
+
+async function runEbayCompAnalyzer() {
+  const stored = await chrome.storage.local.get("ebayCompContext");
+  const context = stored.ebayCompContext;
+
+  if (!context) {
+    console.log("No eBay comp context found.");
+    return;
+  }
+
+  const ageMinutes = (Date.now() - context.createdAt) / 60000;
+
+  if (ageMinutes > 30) {
+    console.log("eBay comp context is stale.");
+    return;
+  }
+
+  const items = context.items || [];
+
+  if (!items.length) {
+    console.log("No items found in comp context.");
+    return;
+  }
+
+  const currentItemIndex = context.currentItemIndex || 0;
+  const currentItem = items[currentItemIndex];
+
+  if (!currentItem) {
+    console.log("No current item found.");
+    return;
+  }
+
+  showEbayCompLoading(
+    context.mode === "bundle"
+      ? `Bundle item ${currentItemIndex + 1} of ${items.length}: ${currentItem.ebaySearchQuery}`
+      : currentItem.ebaySearchQuery
+  );
+
+  try {
+    const foundListings = await waitForEbayListings(10000);
+
+    console.log("eBay listings found:", foundListings);
+    console.log("Raw li.s-item count:", document.querySelectorAll("li.s-item").length);
+
+    const listings = extractEbaySoldListings();
+
+    console.log("Extracted eBay listings:", listings);
+    console.table(listings.map(item => ({
+      title: item.title,
+      price: item.price,
+      condition: item.condition,
+      soldDate: item.soldDate
+    })));
+
+  const response = await fetchLocalServer("/evaluate-comps", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    target: {
+      ...currentItem,
+      facebookPrice: context.facebookPrice,
+      originalFacebookTitle: context.originalFacebookTitle,
+      facebookDescription: context.facebookDescription,
+      ebaySearchQuery: currentItem.ebaySearchQuery
+    },
+    listings
+  })
+});
+
+const itemResult = await readJsonSafely(response);
+
+if (!response.ok || itemResult.error) {
+  throw new LocalServerError(
+    itemResult,
+    "Comp evaluation failed."
+  );
+}
+    console.log("Comp evaluation result for current item:", itemResult);
+    
+const rerunTerms =
+  Array.isArray(
+    itemResult.rerunNegativeSearchTerms
+  )
+    ? itemResult.rerunNegativeSearchTerms
+    : Array.isArray(
+        itemResult.searchPollution
+          ?.negativeSearchTerms
+      )
+      ? itemResult.searchPollution
+          .negativeSearchTerms
+      : [];
+
+const alreadyReranForPollution =
+  currentItem.searchPollutionRerunDone === true;
+
+const pollutionGate = getSearchPollutionRerunGate(itemResult);
+
+if (
+  pollutionGate.allowed &&
+  rerunTerms.length > 0 &&
+  !alreadyReranForPollution
+) {
+  const updatedItems = items.map((item, index) => {
+    if (index !== currentItemIndex) return item;
+
+    return {
+      ...item,
+      negativeSearchTerms: [
+        ...(Array.isArray(item.negativeSearchTerms) ? item.negativeSearchTerms : []),
+        ...rerunTerms
+      ],
+      searchPollutionRerunDone: true,
+      searchPollutionRerunReason: itemResult.rerunReason || "",
+      searchPollutionFirstPass: itemResult.searchPollution || null
+    };
+  });
+
+  await chrome.storage.local.set({
+    ebayCompContext: {
+      ...context,
+      items: updatedItems,
+      currentItemIndex
+    }
+  });
+
+  console.log("Rerunning eBay search due to related-model pollution:", {
+    target: currentItem.ebaySearchQuery,
+    rerunTerms,
+    reason: itemResult.rerunReason
+  });
+
+  showEbayCompPanel({
+    recommendation: "Rerunning search",
+    targetProduct: `${currentItem.brand || ""} ${currentItem.model || ""} ${currentItem.productType || ""}`.trim(),
+    condition: currentItem.condition,
+    validSoldCount: itemResult.validSoldCount || 0,
+    medianEligibleCount: itemResult.medianEligibleCount ?? null,
+    medianSoldPrice: itemResult.medianSoldPrice || null,
+    expectedSalePrice: itemResult.expectedSalePrice || null,
+    reason: `Search was polluted by related models. Rerunning with exclusions: ${rerunTerms.join(", ")}`,
+    validComps: itemResult.validComps || [],
+    debugCounts: itemResult.debugCounts
+  });
+
+ setTimeout(
+  async () => {
+    const opened =
+      openEbaySoldSearch(
+        currentItem.ebaySearchQuery,
+        currentItem.condition,
+        rerunTerms
+      );
+
+    if (!opened) {
+      const unresolvedResult = {
+        recommendation:
+          "Unresolved",
+
+        reason:
+          "Search-pollution rerun was skipped because the item had no resolved eBay query.",
+
+        item:
+          currentItem
+      };
+
+      await markMarketplaceAutoAnalysisComplete(
+        unresolvedResult
+      );
+
+      return;
+    }
+  },
+  1200
+);
+
+return;
+}
+
+const updatedResults = [
+      ...(context.results || []),
+      {
+        item: currentItem,
+        result: itemResult
+      }
+    ];
+
+    const updatedContext = {
+      ...context,
+      results: updatedResults,
+      currentItemIndex: currentItemIndex + 1
+    };
+
+    let nextIndex = currentItemIndex + 1;
+const skippedResults = [];
+
+while (nextIndex < items.length && !String(items[nextIndex].ebaySearchQuery || "").trim()) {
+  const skippedItem = items[nextIndex];
+
+  skippedResults.push({
+    item: skippedItem,
+    result: {
+      recommendation: "Skipped",
+      validSoldCount: 0,
+      medianSoldPrice: null,
+      expectedSalePrice: null,
+      reason: "Skipped because this item did not have a resolved eBay search query."
+    }
+  });
+
+  nextIndex += 1;
+}
+
+const contextAfterSkips = {
+  ...updatedContext,
+  results: [
+    ...(updatedContext.results || []),
+    ...skippedResults
+  ],
+  currentItemIndex: nextIndex
+};
+
+const hasNextItem =
+  nextIndex < items.length;
+
+if (hasNextItem) {
+  /*
+    Saving is required here because the NEXT eBay tab
+    has to resume from this context.
+  */
+  await chrome.storage.local.set({
+    ebayCompContext:
+      contextAfterSkips
+  });
+  const nextItem = items[nextIndex];
+
+  showEbayCompPanel({
+    recommendation: "Analyzing bundle...",
+    targetProduct: `Completed item ${currentItemIndex + 1} of ${items.length}. Opening next item: ${nextItem.ebaySearchQuery}`,
+    condition: currentItem.condition,
+    validSoldCount: itemResult.validSoldCount || 0,
+    medianEligibleCount: itemResult.medianEligibleCount ?? null,
+    medianSoldPrice: itemResult.medianSoldPrice || null,
+    expectedSalePrice: itemResult.expectedSalePrice || null,
+    lowPrice: itemResult.lowPrice || null,
+    highPrice: itemResult.highPrice || null,
+    bestOfferExcludedCount: itemResult.bestOfferExcludedCount || 0,
+    removedByAiFilter: itemResult.removedByAiFilter ?? null,
+    reason: skippedResults.length
+      ? `Finished this item. Skipped ${skippedResults.length} unresolved item(s). Opening the next searchable bundle item.`
+      : "Finished this item. Opening the next bundle item.",
+    validComps: itemResult.validComps || [],
+    debugCounts: itemResult.debugCounts
+  });
+
+setTimeout(async () => {
+  openEbaySoldSearch(
+  nextItem.ebaySearchQuery,
+  nextItem.condition,
+  nextItem.negativeSearchTerms
+);
+
+  const autoRunning = await isMarketplaceAutoAnalyzerRunning();
+
+  if (autoRunning) {
+    setTimeout(() => {
+      window.close();
+    }, 800);
+  }
+}, 1200);
+
+return;
+}
+
+console.log(
+  "[EBAY FLOW] All eBay items complete. Starting final lot evaluation.",
+  {
+    resultCount:
+      contextAfterSkips
+        .results
+        ?.length || 0,
+
+    facebookPrice:
+      contextAfterSkips
+        .facebookPrice
+  }
+);
+
+    // No more items. Evaluate the whole bundle or single item.
+ const finalResponse = await fetchLocalServer("/evaluate-lot", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    context: contextAfterSkips
+  })
+});
+
+const finalResult = await readJsonSafely(finalResponse);
+
+if (!finalResponse.ok || finalResult.error) {
+  throw new LocalServerError(
+    finalResult,
+    "Final lot evaluation failed."
+  );
+}
+
+console.log("Final lot evaluation:", finalResult);
+
+if (
+  String(
+    finalResult.recommendation || ""
+  )
+    .trim()
+    .toLowerCase() === "scam"
+) {
+  await saveScamListing({
+    context: contextAfterSkips,
+    result: finalResult
+  });
+}
+
+await saveDealToLibrary({
+  context: contextAfterSkips,
+  result: finalResult
+});
+
+/*
+  Hits already mark themselves completed after
+  successful Supabase + Sheets saving.
+
+  Pass/Scam/etc. also need to close their run so
+  a later manual scan of the same listing gets
+  a fresh log.
+*/
+if (
+  !isHitRecommendation(
+    finalResult
+  )
+) {
+  await markMarketplaceAnalysisRunCompleted();
+}
+
+await markMarketplaceAutoAnalysisComplete(
+  finalResult
+);
+
+showLotCompPanel(
+  finalResult
+);
+
+const autoRunning = await isMarketplaceAutoAnalyzerRunning();
+
+if (autoRunning) {
+  setTimeout(() => {
+    window.close();
+  }, 1200);
+}
+} catch (error) {
+  console.error(error);
+
+  const shouldRestartForJson =
+    error?.retryEntireListing === true ||
+    error?.code === "MALFORMED_AI_JSON" ||
+    error?.code === "MALFORMED_SERVER_JSON";
+
+  if (shouldRestartForJson) {
+    await restartEntireFacebookListingScanBecauseMalformedJson({
+      step: error.step || "eBay analysis",
+      errorMessage: error.message || ""
+    });
+
+    return;
+  }
+
+  await markMarketplaceAutoAnalysisComplete({
+    recommendation: "Error",
+    reason:
+      error.message ||
+      "eBay analysis failed."
+  });
+
+  showEbayCompPanel({
+    recommendation: "Error",
+    reason:
+      error.message ||
+      "eBay analysis failed.",
+    validSoldCount: 0,
+    medianSoldPrice: null,
+    validComps: []
+  });
+
+  const autoRunning =
+    await isMarketplaceAutoAnalyzerRunning();
+
+  if (autoRunning) {
+    setTimeout(() => {
+      window.close();
+    }, 1200);
+  }
+}
+
+/*
+  Close runEbayCompAnalyzer()
+*/
+}
+
+function addAutoAnalyzerButtons() {
+  const existingStandardButton =
+    document.getElementById(
+      "marketplace-auto-analyzer-start-btn"
+    );
+
+  const existingRandomButton =
+    document.getElementById(
+      "marketplace-random-keyword-scan-btn"
+    );
+
+  const existingStopButton =
+    document.getElementById(
+      "marketplace-auto-analyzer-stop-btn"
+    );
+
+if (
+  existingRandomButton &&
+  existingStopButton
+) {
+  return;
+}
+
+  if (!existingRandomButton) {
+    const randomKeywordButton =
+      document.createElement("button");
+
+    randomKeywordButton.id =
+      "marketplace-random-keyword-scan-btn";
+
+    randomKeywordButton.innerText =
+      "Random Keyword Scan";
+
+    randomKeywordButton.title =
+      "Run the normal auto scanner and switch to a random Marketplace keyword after 30 seconds without a fresh listing.";
+
+    randomKeywordButton.onclick =
+      async () => {
+        const input = prompt(
+          "How many minutes should Random Keyword Scan run?\n\nLeave blank for no timer.",
+          "60"
+        );
+
+        if (input === null) return;
+
+        const trimmed =
+          input.trim();
+
+        if (!trimmed) {
+          await startMarketplaceAutoAnalyzer(
+            null,
+            {
+              scanMode:
+                MARKETPLACE_RANDOM_KEYWORD_MODE
+            }
+          );
+
+          return;
+        }
+
+        const minutes =
+          Number(trimmed);
+
+        if (
+          !Number.isFinite(minutes) ||
+          minutes <= 0
+        ) {
+          alert(
+            "Please enter a valid number of minutes."
+          );
+
+          return;
+        }
+
+        await startMarketplaceAutoAnalyzer(
+          minutes,
+          {
+            scanMode:
+              MARKETPLACE_RANDOM_KEYWORD_MODE
+          }
+        );
+      };
+
+    document.body.appendChild(
+      randomKeywordButton
+    );
+  }
+
+  if (!existingStopButton) {
+    const stopButton =
+      document.createElement("button");
+
+    stopButton.id =
+      "marketplace-auto-analyzer-stop-btn";
+
+    stopButton.innerText =
+      "Stop Scan";
+
+    stopButton.onclick =
+      stopMarketplaceAutoAnalyzer;
+
+    document.body.appendChild(
+      stopButton
+    );
+  }
+}
+
+function addButton() {
+  if (document.getElementById("ebay-comp-checker-btn")) return;
+
+  const button = document.createElement("button");
+  button.id = "ebay-comp-checker-btn";
+  button.innerText = "AI Check eBay Sold";
+button.onclick =
+  async () => {
+    try {
+      await aiCheckListing();
+
+    } catch (error) {
+      console.error(
+        "[PIPELINE JOB] Unhandled listing-analysis failure:",
+        error
+      );
+
+      try {
+        await upsertMarketplaceAnalysisJob({
+          status:
+            "failed",
+
+          stage:
+            "unhandled-error",
+
+          failureReason:
+            error?.message ||
+            String(error),
+
+          failedAt:
+            Date.now()
+        });
+
+        await releaseMarketplaceFinishLock();
+
+      } catch (cleanupError) {
+        console.error(
+          "[PIPELINE JOB] Could not record failed job:",
+          cleanupError
+        );
+      }
+    }
+  };
+
+  document.body.appendChild(button);
+}
+
+async function addLibrarySavingToggleButton() {
+  if (
+    document.getElementById(
+      "library-saving-toggle-btn"
+    )
+  ) {
+    return;
+  }
+
+  const button =
+    document.createElement("button");
+
+  button.id =
+    "library-saving-toggle-btn";
+
+ async function refreshButton() {
+  const enabled =
+    await isLibrarySavingEnabled();
+
+  button.innerText =
+    enabled
+      ? "Library Saving: ON"
+      : "Library Saving: OFF";
+
+  button.dataset.enabled =
+    enabled ? "true" : "false";
+
+  button.title =
+    enabled
+      ? "Listings are currently being saved to the local libraries."
+      : "Local library saving is disabled. Scanner state and statistics are still saved.";
+
+  const sessionListingsButton =
+    document.getElementById(
+      "session-listings-btn"
+    );
+
+  const scamListingsButton =
+    document.getElementById(
+      "scam-listings-btn"
+    );
+
+  const savedDealsButton =
+    document.getElementById(
+      "saved-deals-btn"
+    );
+
+  if (sessionListingsButton) {
+    sessionListingsButton.style.display =
+      enabled ? "" : "none";
+  }
+
+  if (scamListingsButton) {
+    scamListingsButton.style.display =
+      enabled ? "" : "none";
+  }
+
+  if (savedDealsButton) {
+    savedDealsButton.style.display =
+      enabled ? "" : "none";
+  }
+}
+
+  button.onclick = async () => {
+    const currentlyEnabled =
+      await isLibrarySavingEnabled();
+
+    await setLibrarySavingEnabled(
+      !currentlyEnabled
+    );
+
+    await refreshButton();
+  };
+
+  await refreshButton();
+
+  document.body.appendChild(button);
+}
+
+async function addSessionListingsButton() {
+  if (document.getElementById("session-listings-btn")) return;
+
+  const button = document.createElement("button");
+  button.id = "session-listings-btn";
+  button.innerText = "Session Listings";
+  button.title = "View every Marketplace listing clicked during Auto Scan";
+  button.onclick = showSessionListingsLibrary;
+
+  const enabled =
+  await isLibrarySavingEnabled();
+
+button.style.display =
+  enabled ? "" : "none";
+
+  document.body.appendChild(button);
+}
+
+async function addSavedDealsButton() {
+  if (document.getElementById("saved-deals-btn")) return;
+
+  const button = document.createElement("button");
+  button.id = "saved-deals-btn";
+  button.innerText = "Saved Deals";
+  button.onclick = showSavedDealLibrary;
+
+  const enabled =
+    await isLibrarySavingEnabled();
+
+  button.style.display =
+    enabled ? "" : "none";
+
+  document.body.appendChild(button);
+}
+
+async function addScamListingsButton() {
+  if (
+    document.getElementById(
+      "scam-listings-btn"
+    )
+  ) {
+    return;
+  }
+
+  const button =
+    document.createElement("button");
+
+  button.id = "scam-listings-btn";
+  button.innerText = "Scam Listings";
+  button.title =
+    "View listings that exceeded the 2.5x resale-to-ask threshold";
+
+  button.onclick =
+    showScamListingsLibrary;
+
+  document.body.appendChild(button);
+}
+
+/*
+  ============================================================
+  FACEBOOK MARKETPLACE / MESSENGER CONVERSATION TRACKER
+  ============================================================
+*/
+
+const MARKETPLACE_TRACKER_ACCOUNT_KEY =
+  "marketplaceConversationTrackerAccountId";
+
+const MARKETPLACE_TRACKER_FINGERPRINT_KEY =
+  "marketplaceConversationTrackerFingerprints";
+
+
+function getMessengerConversationIdFromUrl(
+  value
+) {
+  const text =
+    String(
+      value || ""
+    );
+
+  const match =
+    text.match(
+      /\/messages\/t\/(\d+)/
+    );
+
+  return match?.[1] || "";
+}
+
+
+function getCurrentMessengerConversationId() {
+  return getMessengerConversationIdFromUrl(
+    window.location.href
+  );
+}
+
+
+function getMarketplaceListingFromCurrentMessengerThread() {
+  const links =
+    Array.from(
+      document.querySelectorAll(
+        'a[href*="/marketplace/item/"]'
+      )
+    );
+
+  for (const link of links) {
+    const href =
+      String(
+        link.href || ""
+      );
+
+    const match =
+      href.match(
+        /\/marketplace\/item\/(\d+)/
+      );
+
+    if (!match) {
+      continue;
+    }
+
+    const listingId =
+      match[1];
+
+    return {
+      listingId,
+
+      listingUrl:
+        `https://www.facebook.com/marketplace/item/${listingId}/`
+    };
+  }
+
+  return {
+    listingId: "",
+    listingUrl: ""
+  };
+}
+
+
+/*
+  Each Chrome profile receives its own tracker ID.
+
+  This lets different Facebook/Chrome profiles feed
+  conversations into the same Supabase database without
+  being treated as the exact same account source.
+*/
+async function getMarketplaceTrackerAccountId() {
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_TRACKER_ACCOUNT_KEY
+    );
+
+  const existing =
+    String(
+      stored[
+        MARKETPLACE_TRACKER_ACCOUNT_KEY
+      ] || ""
+    ).trim();
+
+  if (existing) {
+    return existing;
+  }
+
+
+  const randomPart =
+    typeof crypto?.randomUUID ===
+      "function"
+      ? crypto.randomUUID()
+      : (
+          Date.now() +
+          "_" +
+          Math.random()
+            .toString(36)
+            .slice(2)
+        );
+
+
+  const accountId =
+    `facebook_${randomPart}`;
+
+
+  await chrome.storage.local.set({
+    [MARKETPLACE_TRACKER_ACCOUNT_KEY]:
+      accountId
+  });
+
+
+  return accountId;
+}
+
+
+/*
+  Convert Facebook timestamps such as:
+
+      11 minutes ago
+      5 hours ago
+      2 days ago
+      yesterday
+
+  into an ISO timestamp.
+*/
+function parseFacebookRelativeTimestamp(
+  label
+) {
+  const text =
+    String(label || "")
+      .trim()
+      .toLowerCase();
+
+  if (!text) {
+    return null;
+  }
+
+  const now =
+    Date.now();
+
+
+  if (
+    text === "now" ||
+    text === "just now"
+  ) {
+    return new Date(
+      now
+    ).toISOString();
+  }
+
+
+  if (
+    text === "yesterday" ||
+    text === "a day ago" ||
+    text === "1 day ago"
+  ) {
+    return new Date(
+      now -
+      24 *
+      60 *
+      60 *
+      1000
+    ).toISOString();
+  }
+
+
+  /*
+    Facebook can use:
+
+    a minute ago
+    an hour ago
+    a day ago
+    a week ago
+  */
+  const singularMatch =
+    text.match(
+      /^(?:a|an)\s+(minute|hour|day|week)\s+ago$/
+    );
+
+  if (singularMatch) {
+    const unit =
+      singularMatch[1];
+
+    const multipliers = {
+      minute:
+        60 * 1000,
+
+      hour:
+        60 *
+        60 *
+        1000,
+
+      day:
+        24 *
+        60 *
+        60 *
+        1000,
+
+      week:
+        7 *
+        24 *
+        60 *
+        60 *
+        1000
+    };
+
+    const multiplier =
+      multipliers[unit];
+
+    if (multiplier) {
+      return new Date(
+        now - multiplier
+      ).toISOString();
+    }
+  }
+
+
+  /*
+    Numeric forms:
+
+    11 minutes ago
+    5 hours ago
+    2 days ago
+    3 weeks ago
+  */
+  const numericMatch =
+    text.match(
+      /^(\d+)\s+(minute|minutes|hour|hours|day|days|week|weeks)\s+ago$/
+    );
+
+  if (!numericMatch) {
+    return null;
+  }
+
+
+  const amount =
+    Number(
+      numericMatch[1]
+    );
+
+  const unit =
+    numericMatch[2];
+
+
+  const multipliers = {
+    minute:
+      60 * 1000,
+
+    minutes:
+      60 * 1000,
+
+    hour:
+      60 *
+      60 *
+      1000,
+
+    hours:
+      60 *
+      60 *
+      1000,
+
+    day:
+      24 *
+      60 *
+      60 *
+      1000,
+
+    days:
+      24 *
+      60 *
+      60 *
+      1000,
+
+    week:
+      7 *
+      24 *
+      60 *
+      60 *
+      1000,
+
+    weeks:
+      7 *
+      24 *
+      60 *
+      60 *
+      1000
+  };
+
+
+  const multiplier =
+    multipliers[unit];
+
+  if (
+    !Number.isFinite(amount) ||
+    !multiplier
+  ) {
+    return null;
+  }
+
+
+  return new Date(
+    now -
+    amount *
+    multiplier
+  ).toISOString();
+}
+
+function getMarketplaceConversationRow(
+  anchor
+) {
+  if (!anchor) {
+    return null;
+  }
+
+
+  let element =
+    anchor;
+
+
+  /*
+    Walk upward through Facebook's wrappers.
+
+    We want the smallest ancestor that contains:
+    - the Messenger thread link
+    - a timestamp
+  */
+  for (
+    let depth = 0;
+    depth < 10 &&
+    element;
+    depth++
+  ) {
+    const hasConversationLink =
+      element.querySelector?.(
+        'a[href*="/messages/t/"]'
+      );
+
+    const hasTimestamp =
+      element.querySelector?.(
+        "abbr[aria-label]"
+      );
+
+
+    if (
+      hasConversationLink &&
+      hasTimestamp
+    ) {
+      return element;
+    }
+
+
+    element =
+      element.parentElement;
+  }
+
+
+  /*
+    Fall back to the anchor itself.
+  */
+  return anchor;
+}
+
+/*
+  Parse:
+
+      Faith · Canon eos 630 film camera...
+
+  into:
+
+      sellerName = Faith
+      listingTitle = Canon eos 630...
+*/
+function parseMarketplaceConversationTitle(
+  lines
+) {
+  const candidates =
+    Array.isArray(lines)
+      ? lines
+      : [];
+
+
+  for (const line of candidates) {
+    const text =
+      String(
+        line || ""
+      ).trim();
+
+    if (
+      !text ||
+      !text.includes(" · ")
+    ) {
+      continue;
+    }
+
+
+    if (
+      text
+        .toLowerCase()
+        .includes(
+          "waiting for your response"
+        )
+    ) {
+      continue;
+    }
+
+
+    const separatorIndex =
+      text.indexOf(
+        " · "
+      );
+
+
+    if (
+      separatorIndex <= 0
+    ) {
+      continue;
+    }
+
+
+    const sellerName =
+      text
+        .slice(
+          0,
+          separatorIndex
+        )
+        .trim();
+
+
+    const listingTitle =
+      text
+        .slice(
+          separatorIndex + 3
+        )
+        .trim();
+
+
+    if (
+      sellerName &&
+      listingTitle
+    ) {
+      return {
+        sellerName,
+        listingTitle,
+        fullTitle:
+          text
+      };
+    }
+  }
+
+
+  return {
+    sellerName: "",
+    listingTitle: "",
+    fullTitle: ""
+  };
+}
+
+
+/*
+  Determine who sent the latest message from Facebook's
+  sidebar preview.
+
+  Examples:
+
+      Faith is waiting for your response about...
+          -> seller
+
+      Faith: Yeah I'm okay shipping...
+          -> seller
+
+      You: Sounds good...
+          -> me
+*/
+function determineMarketplaceLastMessage({
+  lines,
+  sellerName
+}) {
+  const cleanLines =
+    (Array.isArray(lines)
+      ? lines
+      : []
+    )
+      .map(
+        line =>
+          String(
+            line || ""
+          ).trim()
+      )
+      .filter(Boolean);
+
+
+  /*
+    Facebook's strongest explicit signal.
+  */
+  const waitingLine =
+    cleanLines.find(
+      line =>
+        line
+          .toLowerCase()
+          .includes(
+            " is waiting for your response about "
+          )
+    );
+
+
+  if (waitingLine) {
+    return {
+      sender:
+        "seller",
+
+      text:
+        waitingLine
+    };
+  }
+
+
+  const myLine =
+    cleanLines.find(
+      line =>
+        /^you\s*:/i.test(
+          line
+        )
+    );
+
+
+  if (myLine) {
+    return {
+      sender:
+        "me",
+
+      text:
+        myLine
+          .replace(
+            /^you\s*:\s*/i,
+            ""
+          )
+          .trim()
+    };
+  }
+
+
+  if (sellerName) {
+    const escapedName =
+      String(
+        sellerName
+      )
+        .replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        );
+
+
+    const sellerRegex =
+      new RegExp(
+        `^${escapedName}\\s*:`,
+        "i"
+      );
+
+
+    const sellerLine =
+      cleanLines.find(
+        line =>
+          sellerRegex.test(
+            line
+          )
+      );
+
+
+    if (sellerLine) {
+      return {
+        sender:
+          "seller",
+
+        text:
+          sellerLine
+            .replace(
+              sellerRegex,
+              ""
+            )
+            .trim()
+      };
+    }
+  }
+
+
+  return {
+    sender:
+      "unknown",
+
+    text:
+      ""
+  };
+}
+
+
+/*
+  Read the Marketplace/Messenger conversation list.
+
+  Facebook can render more than one anchor for the same
+  thread, so conversations are deduplicated by thread ID.
+*/
+function scrapeVisibleMarketplaceConversations() {
+  const anchors =
+    Array.from(
+      document.querySelectorAll(
+        'a[href*="/messages/t/"]'
+      )
+    );
+
+
+  const conversations =
+    new Map();
+
+
+  const currentConversationId =
+    getCurrentMessengerConversationId();
+
+
+  const currentListing =
+    getMarketplaceListingFromCurrentMessengerThread();
+
+
+  for (const anchor of anchors) {
+    const conversationId =
+      getMessengerConversationIdFromUrl(
+        anchor.href
+      );
+
+
+    if (!conversationId) {
+      continue;
+    }
+
+
+    if (
+      conversations.has(
+        conversationId
+      )
+    ) {
+      continue;
+    }
+
+
+   const row =
+  getMarketplaceConversationRow(
+    anchor
+  );
+
+
+const rowText =
+  String(
+    row?.innerText ||
+    row?.textContent ||
+    anchor.innerText ||
+    anchor.textContent ||
+    ""
+  ).trim();
+
+
+    if (!rowText) {
+      continue;
+    }
+
+
+    const lines =
+      rowText
+        .split(/\n+/)
+        .map(
+          line =>
+            line.trim()
+        )
+        .filter(Boolean);
+
+
+    const title =
+      parseMarketplaceConversationTitle(
+        lines
+      );
+
+
+    /*
+      Ignore anchors that don't look like
+      Marketplace seller conversations.
+    */
+    if (
+      !title.sellerName ||
+      !title.listingTitle
+    ) {
+      continue;
+    }
+
+
+    const lastMessage =
+      determineMarketplaceLastMessage({
+        lines,
+        sellerName:
+          title.sellerName
+      });
+
+
+const timeElement =
+  row?.querySelector(
+    "abbr[aria-label]"
+  ) ||
+  anchor.querySelector(
+    "abbr[aria-label]"
+  );
+
+
+    const timeLabel =
+      String(
+        timeElement
+          ?.getAttribute(
+            "aria-label"
+          ) || ""
+      ).trim();
+
+
+    const lastMessageAt =
+      parseFacebookRelativeTimestamp(
+        timeLabel
+      );
+
+
+    const unread =
+      rowText
+        .toLowerCase()
+        .includes(
+          "unread message:"
+        );
+
+
+    /*
+      We only know the Marketplace listing ID from
+      the currently opened Messenger thread.
+
+      Once the server learns this mapping it keeps it.
+    */
+    const isCurrentConversation =
+      currentConversationId &&
+      currentConversationId ===
+        conversationId;
+
+
+    const listingId =
+      isCurrentConversation
+        ? currentListing.listingId
+        : "";
+
+
+    const listingUrl =
+      isCurrentConversation
+        ? currentListing.listingUrl
+        : "";
+
+
+    conversations.set(
+      conversationId,
+      {
+        conversationId,
+
+        conversationUrl:
+          `https://www.facebook.com/messages/t/${conversationId}`,
+
+        listingId,
+        listingUrl,
+
+        sellerName:
+          title.sellerName,
+
+        listingTitle:
+          title.listingTitle,
+
+        lastMessageText:
+          lastMessage.text,
+
+        lastMessageSender:
+          lastMessage.sender,
+
+        lastMessageAt,
+
+        unread,
+
+        timeLabel
+      }
+    );
+  }
+
+
+  return [
+    ...conversations.values()
+  ];
+}
+
+
+async function parseCurrentMarketplaceConversationForSession() {
+  const conversationId =
+    getCurrentMessengerConversationId();
+
+
+  if (!conversationId) {
+    return {
+      ok: false,
+      reason:
+        "Current page is not a Messenger conversation."
+    };
+  }
+
+
+  const listing =
+    getMarketplaceListingFromCurrentMessengerThread();
+
+
+  if (!listing.listingId) {
+    return {
+      ok: false,
+
+      conversationId,
+
+      reason:
+        "Could not find Marketplace listing ID in Messenger thread."
+    };
+  }
+
+
+  /*
+    Give Messenger a moment to finish rendering
+    the actual conversation body.
+  */
+  await sleep(
+    1000
+  );
+
+
+  const threadTimestamp =
+    getLatestMessengerThreadTimestamp();
+
+
+  /*
+    Find message-like presentation elements.
+
+    Facebook currently renders message bubbles inside
+    role="presentation" wrappers.
+  */
+  const candidates =
+    Array.from(
+      document.querySelectorAll(
+        '[role="presentation"]'
+      )
+    )
+      .map(
+        element => {
+          const text =
+            String(
+              element.innerText ||
+              element.textContent ||
+              ""
+            )
+              .replace(/\s+/g, " ")
+              .trim();
+
+          const rect =
+            element.getBoundingClientRect();
+
+          return {
+            element,
+            text,
+            rect
+          };
+        }
+      )
+      .filter(
+        entry =>
+          entry.text &&
+          entry.text.length <=
+            3000 &&
+          entry.rect.width > 0 &&
+          entry.rect.height > 0
+      );
+
+
+  /*
+    Prefer leaf-ish elements so a giant Messenger
+    container isn't mistaken for one message.
+  */
+  const messageCandidates =
+    candidates.filter(
+      entry => {
+        const childPresentations =
+          entry.element.querySelectorAll(
+            '[role="presentation"]'
+          );
+
+        return (
+          childPresentations.length <=
+          2
+        );
+      }
+    );
+
+
+  if (
+    !messageCandidates.length
+  ) {
+    return {
+      ok: false,
+
+      conversationId,
+
+      listingId:
+        listing.listingId,
+
+      reason:
+        "Could not find rendered Messenger messages."
+    };
+  }
+
+
+  /*
+    DOM order normally follows message order,
+    so use the final rendered message candidate.
+  */
+  const latest =
+    messageCandidates[
+      messageCandidates.length -
+      1
+    ];
+
+
+  /*
+    Own messages are rendered on the right side,
+    seller messages on the left.
+
+    Compare the message center against the viewport.
+  */
+  const messageCenter =
+    latest.rect.left +
+    latest.rect.width / 2;
+
+
+  const lastMessageSender =
+    messageCenter >
+      window.innerWidth *
+      0.55
+      ? "me"
+      : "seller";
+
+
+  const conversation = {
+    conversationId,
+
+    conversationUrl:
+      `https://www.facebook.com/messages/t/${conversationId}`,
+
+    listingId:
+      listing.listingId,
+
+    listingUrl:
+      listing.listingUrl,
+
+    sellerName:
+      "",
+
+    lastMessageText:
+      latest.text,
+
+    lastMessageSender,
+
+    lastMessageAt:
+      threadTimestamp.iso,
+
+    unread:
+      false,
+
+    timeLabel:
+      threadTimestamp.text
+  };
+
+
+  console.log(
+    "[CONVERSATION PARSER] Direct thread parsed:",
+    conversation
+  );
+
+
+  const result =
+    await sendMarketplaceConversationToServer(
+      conversation
+    );
+
+
+  return {
+    ok: true,
+
+    conversationId,
+
+    listingId:
+      listing.listingId,
+
+    lastMessageSender,
+
+    lastMessageAt:
+      threadTimestamp.iso,
+
+    lastMessageText:
+      latest.text,
+
+    tracked:
+      result?.tracked ===
+      true,
+
+    status:
+      result
+        ?.conversation
+        ?.status ||
+      ""
+  };
+}
+
+chrome.runtime.onMessage.addListener(
+  (
+    message,
+    sender,
+    sendResponse
+  ) => {
+    if (
+      message?.type !==
+      "PARSE_MARKETPLACE_CONVERSATION_NOW"
+    ) {
+      return;
+    }
+
+    (
+      async () => {
+        try {
+          const result =
+            await parseCurrentMarketplaceConversationForSession();
+
+          sendResponse(
+            result
+          );
+
+        } catch (error) {
+          console.error(
+            "[CONVERSATION PARSER] Current-thread parse failed:",
+            error
+          );
+
+          sendResponse({
+            ok: false,
+
+            error:
+              error?.message ||
+              String(error)
+          });
+        }
+      }
+    )();
+
+    return true;
+  }
+);
+
+/*
+  Avoid POSTing unchanged conversations every 15 seconds.
+*/
+function buildMarketplaceConversationFingerprint(
+  conversation
+) {
+  return JSON.stringify({
+    conversationId:
+      conversation.conversationId,
+
+    listingId:
+      conversation.listingId,
+
+    sellerName:
+      conversation.sellerName,
+
+    lastMessageText:
+      conversation.lastMessageText,
+
+    lastMessageSender:
+      conversation.lastMessageSender,
+
+    /*
+      Do NOT use lastMessageAt here.
+
+      It is recalculated from Date.now() every scan,
+      which would make an unchanged message look new.
+    */
+    timeLabel:
+      conversation.timeLabel,
+
+    unread:
+      conversation.unread
+  });
+}
+
+
+async function sendMarketplaceConversationToServer(
+  conversation
+) {
+  const accountId =
+    await getMarketplaceTrackerAccountId();
+
+
+  const response =
+    await fetch(
+      `${LOCAL_SERVER_BASE_URL}/marketplace-conversation`,
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify({
+            conversation: {
+              ...conversation,
+              accountId
+            }
+          })
+      }
+    );
+
+
+  const text =
+    await response.text();
+
+
+  let data;
+
+  try {
+    data =
+      JSON.parse(
+        text
+      );
+  } catch (error) {
+    throw new Error(
+      `Conversation tracker server returned invalid JSON: ${text.slice(0, 500)}`
+    );
+  }
+
+
+  if (
+    !response.ok ||
+    data?.ok !== true
+  ) {
+    throw new Error(
+      data?.error ||
+      `Conversation tracker failed with HTTP ${response.status}.`
+    );
+  }
+
+
+  return data;
+}
+
+
+async function syncMarketplaceConversations() {
+  /*
+    Only run the inbox tracker on Facebook.
+  */
+  if (
+    !window.location.hostname
+      .includes(
+        "facebook.com"
+      )
+  ) {
+    return;
+  }
+
+
+  /*
+    We need Messenger conversation links to actually
+    exist on the current Facebook page.
+  */
+  if (
+    !document.querySelector(
+      'a[href*="/messages/t/"]'
+    )
+  ) {
+    return;
+  }
+
+
+  const conversations =
+    scrapeVisibleMarketplaceConversations();
+
+    const mappedConversationIds =
+  await getMappedMarketplaceConversationIds();
+
+
+  if (!conversations.length) {
+    return;
+  }
+
+
+  const stored =
+    await chrome.storage.local.get(
+      MARKETPLACE_TRACKER_FINGERPRINT_KEY
+    );
+
+
+  const fingerprints = {
+    ...(
+      stored[
+        MARKETPLACE_TRACKER_FINGERPRINT_KEY
+      ] || {}
+    )
+  };
+
+
+  let changed =
+    false;
+
+
+  for (
+    const conversation of
+      conversations
+  ) {
+
+    /*
+  If the currently opened thread reveals a
+  Marketplace listing ID, permanently remember
+  the Messenger -> Marketplace mapping locally.
+*/
+if (
+  conversation.listingId
+) {
+  await rememberMappedMarketplaceConversation(
+    conversation.conversationId
+  );
+
+  mappedConversationIds.add(
+    conversation.conversationId
+  );
+}
+
+
+/*
+  Ignore random historical Messenger conversations
+  that have never been mapped to one of our
+  Marketplace listings.
+
+  This prevents the tracker from POSTing the
+  entire inbox every scan.
+*/
+if (
+  !mappedConversationIds.has(
+    conversation.conversationId
+  )
+) {
+  continue;
+}
+    const conversationId =
+      conversation
+        .conversationId;
+
+
+    const fingerprint =
+      buildMarketplaceConversationFingerprint(
+        conversation
+      );
+
+
+    if (
+      fingerprints[
+        conversationId
+      ] === fingerprint
+    ) {
+      continue;
+    }
+
+
+    try {
+const result =
+  await sendMarketplaceConversationToServer(
+    conversation
+  );
+
+
+/*
+  ONLY cache the fingerprint when this
+  conversation is actually eligible.
+
+  This is important.
+
+  If J is currently blank/N, we keep checking it.
+
+  Therefore if you later change J to P,
+  the tracker can begin tracking it without
+  requiring another Messenger message.
+*/
+/*
+  Cache the Messenger state regardless of whether
+  the spreadsheet currently says P or N.
+
+  Otherwise an N conversation would be POSTed
+  again every 15 seconds forever.
+*/
+fingerprints[
+  conversationId
+] =
+  fingerprint;
+
+changed =
+  true;
+
+
+if (
+  result?.tracked === true
+) {
+  console.log(
+    "[CONVERSATION TRACKER] Active P conversation synced:",
+    conversation
+  );
+
+} else {
+  console.log(
+    "[CONVERSATION TRACKER] Ignored by spreadsheet:",
+    {
+      conversationId,
+
+      listingId:
+        conversation.listingId,
+
+      reason:
+        result?.reason ||
+        "Sheet J is not P."
+    }
+  );
+}
+
+    } catch (error) {
+      console.warn(
+        "[CONVERSATION TRACKER] Sync failed:",
+        {
+          conversationId,
+          error:
+            error?.message ||
+            error
+        }
+      );
+    }
+  }
+
+
+  if (changed) {
+    await chrome.storage.local.set({
+      [MARKETPLACE_TRACKER_FINGERPRINT_KEY]:
+        fingerprints
+    });
+  }
+}
+
+
+function startMarketplaceConversationTracker() {
+  if (
+    window
+      .__marketplaceConversationTrackerStarted
+  ) {
+    return;
+  }
+
+
+  window
+    .__marketplaceConversationTrackerStarted =
+      true;
+
+
+  console.log(
+    "[CONVERSATION TRACKER] Started."
+  );
+
+
+  /*
+    Initial scan shortly after the Facebook page
+    finishes rendering.
+  */
+  setTimeout(
+    () => {
+      syncMarketplaceConversations()
+        .catch(
+          error => {
+            console.warn(
+              "[CONVERSATION TRACKER] Initial sync failed:",
+              error
+            );
+          }
+        );
+    },
+    2500
+  );
+
+
+  /*
+    Facebook is a SPA, so the content script normally
+    survives navigation between inbox threads.
+
+    Re-scan periodically rather than relying on a
+    traditional page-load event.
+  */
+ /* setInterval(
+    () => {
+      syncMarketplaceConversations()
+        .catch(
+          error => {
+            console.warn(
+              "[CONVERSATION TRACKER] Periodic sync failed:",
+              error
+            );
+          }
+        );
+    },
+    MARKETPLACE_CONVERSATION_TRACKER_INTERVAL_MS
+  );*/
+}
+
+if (window.location.hostname.includes("facebook.com")) {
+  addButton();
+  addAutoAnalyzerButtons();
+  addSavedDealsButton();
+  addScamListingsButton();
+  addSessionListingsButton();
+  addLibrarySavingToggleButton();
+  startMarketplaceAutoStatsPanelLoop();
+  startMarketplaceConversationTracker();
+
+  setInterval(() => {
+    addButton();
+    addAutoAnalyzerButtons();
+    addSavedDealsButton();
+    addScamListingsButton();
+    addSessionListingsButton();
+    addLibrarySavingToggleButton();
+  }, 1000);
+
+ (async () => {
+  try {
+    const malformedJsonRestartHandled =
+      await resumeMalformedJsonListingRestartIfNeeded();
+
+    if (!malformedJsonRestartHandled) {
+      await resumeMarketplaceAutoAnalyzerIfNeeded();
+    }
+  } catch (error) {
+    console.error(
+      "Facebook Marketplace startup/resume failed:",
+      error
+    );
+  }
+})();
+}
+
+if (
+  window.location.hostname.includes("ebay.com") &&
+  window.location.pathname.includes("/sch/")
+) {
+  runEbayCompAnalyzer();
+}
