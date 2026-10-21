@@ -30,6 +30,12 @@ import {
   fileURLToPath
 } from "url";
 
+import {
+  loadExifToolLensDatabase,
+  findExifToolLensCandidates,
+  mergeLensCandidateSources
+} from "./exiftoolLensDb.js";
+
 /*
   ============================================================
   DATAFORSEO
@@ -2330,6 +2336,11 @@ generation:
     lensfunSourceFile:
       candidate.sourceFile,
 
+    lensCandidateSources:
+      Array.isArray(candidate.sources)
+        ? candidate.sources
+        : ["lensfun"],
+
     resolutionMode:
       "lensfun"
   };
@@ -2835,17 +2846,43 @@ async function resolveCanonicalLens({
     ============================================================
   */
 
-  const candidates =
+  /*
+    Query Lensfun AND ExifTool's lens database in parallel and merge:
+      - same lens in both          -> one merged candidate
+      - variant only one source has -> supplementary candidate
+    (e.g. Lensfun [AF-P 70-300 VR] + ExifTool [VR, non-VR] -> 2 candidates)
+  */
+  const lensfunOnlyCandidates =
     findLensfunCandidates(
       evidence
     );
 
+  const exifToolOnlyCandidates =
+    findExifToolLensCandidates(
+      evidence
+    );
+
+  const candidates =
+    mergeLensCandidateSources({
+      lensfunCandidates:
+        lensfunOnlyCandidates,
+
+      exifToolCandidates:
+        exifToolOnlyCandidates
+    });
+
 
   console.log(
-    "[LENS RESOLVER] Lensfun candidates:",
+    "[LENS RESOLVER] Lens candidates (Lensfun + ExifTool):",
     {
       productId:
         evidence.productId,
+
+      lensfunCount:
+        lensfunOnlyCandidates.length,
+
+      exifToolCount:
+        exifToolOnlyCandidates.length,
 
       count:
         candidates.length,
@@ -2864,6 +2901,9 @@ async function resolveCanonicalLens({
 
             mount:
               candidate.mount,
+
+            sources:
+              candidate.sources,
 
             score:
               candidate.score
@@ -20528,6 +20568,7 @@ app.get(
 );
 
 loadLensfunDatabase();
+loadExifToolLensDatabase();
 
 app.listen(3000, () => {
   console.log(
