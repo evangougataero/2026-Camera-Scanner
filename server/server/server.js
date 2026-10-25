@@ -21,6 +21,7 @@ import {
 } from "async_hooks";
 
 import util from "util";
+import { createLensVerification } from "./lens-verification/src/index.js";   // LENS_VERIFICATION_INSTALLED
 
 
 import {
@@ -6610,6 +6611,32 @@ app.use(
     );
   }
 );
+
+/*
+  ============================================================
+  LENS VERIFICATION (pre-purchase second opinion)
+  Registers a passive capture middleware + local routes.
+  Polling/worker start at the bottom of this file.
+  ============================================================
+*/
+const lensVerification = createLensVerification({
+  app,
+  env: process.env,
+  getSupabase: () => supabaseAdmin,
+  getSheets: () => {
+    const auth = createGoogleOAuthClient();
+    auth.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
+    return google.sheets({ version: "v4", auth });
+  },
+  createLoggedOpenAiResponse: (args) => createLoggedOpenAiResponse(args),
+  openDb: (dbPath) => {
+    const db = new Database(path.resolve(dbPath));
+    db.pragma("journal_mode = WAL");
+    return db;
+  },
+  sharp,
+  log: (...args) => console.log(...args)
+});
 
 function getSupabaseHitLogObjectPath(
   analysisRunId
@@ -20569,6 +20596,8 @@ app.get(
 
 loadLensfunDatabase();
 loadExifToolLensDatabase();
+
+lensVerification.start();
 
 app.listen(3000, () => {
   console.log(

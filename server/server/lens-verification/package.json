@@ -1,0 +1,9 @@
+{
+  "name": "lens-verification",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pre-purchase lens identification second opinion for the Marketplace scanner server (runs inside the server process)",
+  "scripts": { "test": "node --test test/*.test.js" },
+  "engines": { "node": ">=22" }
+}

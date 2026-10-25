@@ -1,0 +1,487 @@
+[VISION OCR] Reading listing_screenshot
+[VISION OCR] listing_screenshot:
+Marketplace
+Auto Scan
+Analyzing listing
+Elapsed
+Listings clicked
+Hits found
+Outreach queued
+Remaining
+Search term
+Term switches
+LIVE
+3m 08s
+5
+0
+0
+1h 56m 51s
+nikon
+0
+a
++B
+Nikon DX Lens Bundle: 55-300mm
+VR, 35mm f/1.8G, and 40mm f/2.8G
+Micro
+$300
+Ships for $14.03
+Estimated arrival Nov 4 - Nov 7
+Details
+❤Message
+Condition
+Compatible
+Lens Mount
+Used - Good Brand
+Nikon AF
+Nikon
+Nikon
+HB-61
+Marketplace status
+Buying
+Selling
++ Create new listing
+Create multiple listings
+70
+55
+Nikon DX
+SNIKKOR 55-300mm145-5AGED
+VR
+Niko
+Nikon DX
+AE-S NIKKOR 35mm
+Nikon
+AS Micro N
+Location
+Seattle, Washington • Within 500 mi
+Categories
+Vehicles
+$
+Property Rentals
+Apparel
+Classifieds
+Electronics
+Entertainment
+Today's picks
+DX
+NIKKOR 40mm 128G
+Versatile set of three Nikon DX mount lenses. This bundle
+includes an AF-S Nikkor 55-300mm 1:4.5-5.6G ED VR telephoto
+zoom lens, an AF-S Nikkor 35mm 1:1.8G prime lens, and an AF-
+S Micro Nikkor 40mm 1:2.8G macro lens. Each lens is black with
+gold lettering and includes front and rear caps. The 35mm and
+40mm lenses come with their respective Nikon lens hoods (HB-
+46 and HB-61).
+All good quality, no flaws, etc.
+Seller information
+Kate Radovich
+Buy now
+Seller details
+✰✰✰✰✰ (5)
+Covered by Purchase Protection
+Seattle 500 mi
+Session Listings
+Scam Listings
+Saved Deals
+Library Saving: ON
+Stop Scan
+Random Keyword Scan
+Collecting listing...
+[REQ END] POST /vision-ocr 200 464ms
+[REQ CLOSED] POST /vision-ocr 466ms
+[STEP 1] Google-extracted listing text received: 805 characters
+[OPENAI REQUEST] Step 1 listing fact extraction { requestId: 'openai-1792957804152-nwwrjtp', model: 'gpt-4o-mini' }
+[OPENAI USAGE] Step 1 listing fact extraction {
+  model: 'gpt-4o-mini',
+  inputTokens: 1353,
+  cachedTokens: 0,
+  uncachedInputTokens: 1353,
+  outputTokens: 185,
+  totalTokens: 1538,
+  estimatedCostUsd: 0.00031395
+}
+[STEP 1] Raw OpenAI response:
+{
+  "explicitlyIncluded": [
+    "1x AF-S Nikkor 55-300mm 1:4.5-5.6G ED VR telephoto zoom lens",
+    "1x AF-S Nikkor 35mm 1:1.8G prime lens",
+    "1x AF-S Micro Nikkor 40mm 1:2.8G macro lens",
+    "front and rear caps for each lens",
+    "1x Nikon lens hood (HB-46) for 35mm lens",
+    "1x Nikon lens hood (HB-61) for 40mm lens"
+  ],
+  "explicitlyExcluded": [],
+  "listingNotes": [
+    "All lenses are black with gold lettering.",
+    "All in good quality, no flaws."
+  ],
+  "skipDueToDamage": false,
+  "damageReason": ""
+}
+[STEP 1] Parsed listing facts:
+{
+  explicitlyIncluded: [
+    '1x AF-S Nikkor 55-300mm 1:4.5-5.6G ED VR telephoto zoom lens',
+    '1x AF-S Nikkor 35mm 1:1.8G prime lens',
+    '1x AF-S Micro Nikkor 40mm 1:2.8G macro lens',
+    'front and rear caps for each lens',
+    '1x Nikon lens hood (HB-46) for 35mm lens',
+    '1x Nikon lens hood (HB-61) for 40mm lens'
+  ],
+  explicitlyExcluded: [],
+  listingNotes: [
+    'All lenses are black with gold lettering.',
+    'All in good quality, no flaws.'
+  ],
+  skipDueToDamage: false,
+  damageReason: ''
+}
+[REQ END] POST /analyze-listing-facts 200 2292ms
+[REQ CLOSED] POST /analyze-listing-facts 2293ms
+[STEP 2] Received 5 listing image(s).
+[STEP 2] Processing gallery 1/1, starting at Image 1
+[STEP 2] Building collage: {
+  imageCount: 5,
+  columns: 3,
+  rows: 2,
+  collageWidth: 2756,
+  collageHeight: 1442
+}
+[STEP 2] Downloading image 1/5
+[STEP 2] Downloading image 2/5
+[STEP 2] Downloading image 3/5
+[STEP 2] Downloading image 4/5
+[STEP 2] Downloading image 5/5
+[STEP 2] Gallery 1 created: 548460 bytes
+[OPENAI REQUEST] Step 2 gallery analysis 1 { requestId: 'openai-1792957806914-f46zrnu', model: 'gpt-5.6-luna' }
+[OPENAI USAGE] Step 2 gallery analysis 1 {
+  model: 'gpt-5.6-luna',
+  inputTokens: 4506,
+  cachedTokens: 0,
+  uncachedInputTokens: 4506,
+  outputTokens: 825,
+  totalTokens: 5331,
+  estimatedCostUsd: 0.0018912
+}
+[STEP 2] Raw gallery 1 response:
+{
+  "products": [
+    {
+      "productId": "lens_1",
+      "productType": "camera lens",
+      "visibleInImages": [1]
+    },
+    {
+      "productId": "lens_2",
+      "productType": "camera lens",
+      "visibleInImages": [1]
+    },
+    {
+      "productId": "lens_3",
+      "productType": "camera lens",
+      "visibleInImages": [1]
+    }
+  ],
+  "images": [
+    {
+      "imageIndex": 1,
+      "visibleProducts": [
+        {
+          "productId": "lens_1",
+          "productType": "camera lens",
+          "modelReadabilityScore": 9
+        },
+        {
+          "productId": "lens_2",
+          "productType": "camera lens",
+          "modelReadabilityScore": 8
+        },
+        {
+          "productId": "lens_3",
+          "productType": "camera lens",
+          "modelReadabilityScore": 8
+        }
+      ]
+    },
+    {
+      "imageIndex": 2,
+      "visibleProducts": []
+    },
+    {
+      "imageIndex": 3,
+      "visibleProducts": []
+    },
+    {
+      "imageIndex": 4,
+      "visibleProducts": []
+    },
+    {
+      "imageIndex": 5,
+      "visibleProducts": []
+    }
+  ]
+}
+[REQ END] POST /analyze-listing-gallery 200 8818ms
+[REQ CLOSED] POST /analyze-listing-gallery 8819ms
+[VISION OCR] Reading marketplace_image_1
+[VISION OCR] marketplace_image_1:
+5100
+70
+70
+55
+Nikon DX
+AF-S NIKKOR 55-300mm 14.5-5.6G ED
+VR
+HO
+Nikon
+HB-61
+MADE INCH
+Nikon DX
+AF-S NIKKOR 35mm 1:186
+Nikon
+04
+DX
+AF-S Micro NIKKOR 40mm 128G
+[REQ END] POST /vision-ocr 200 403ms
+[REQ CLOSED] POST /vision-ocr 404ms
+[OPENAI REQUEST] Step 5 primary product reconciliation { requestId: 'openai-1792957815777-yw8y504', model: 'gpt-4o-mini' }
+[OPENAI USAGE] Step 5 primary product reconciliation {
+  model: 'gpt-4o-mini',
+  inputTokens: 5793,
+  cachedTokens: 0,
+  uncachedInputTokens: 5793,
+  outputTokens: 307,
+  totalTokens: 6100,
+  estimatedCostUsd: 0.0010531499999999999
+}
+[STEP 5] Raw reconciliation response:
+{"primaryProducts":[{"productId":"lens_1","galleryIndex":1,"productType":"camera lens","nonLensIdentity":null,"lensIdentity":{"brand":"Nikon","mountSeries":"F","focalLength":"55-300mm","maxAperture":"f/4.5-5.6G","featureTokens":["VR","AF-S","ED"],"modelCodes":[],"generation":null},"extracted_evidence":["AF-S NIKKOR 55-300mm 1:4.5-5.6G ED VR"]},{"productId":"lens_2","galleryIndex":1,"productType":"camera lens","nonLensIdentity":null,"lensIdentity":{"brand":"Nikon","mountSeries":"F","focalLength":"35mm","maxAperture":"f/1.8G","featureTokens":[],"modelCodes":[],"generation":null},"extracted_evidence":["AF-S NIKKOR 35mm 1:1.8G"]},{"productId":"lens_3","galleryIndex":1,"productType":"camera lens","nonLensIdentity":null,"lensIdentity":{"brand":"Nikon","mountSeries":"F","focalLength":"40mm","maxAperture":"f/2.8G","featureTokens":[],"modelCodes":[],"generation":null},"extracted_evidence":["AF-S Micro NIKKOR 40mm 1:2.8G"]}],"needsGoogleLens":[]}
+[PHANTOM VALIDATION] Gallery duplicate check: {
+  sellerLensEnumeration: {
+    reliable: false,
+    sellerLensCount: 0,
+    enumeratedCount: 6,
+    explicitCount: null,
+    itemFocalKeys: [ '55-300mm', '35mm', '40mm' ]
+  },
+  diagnostics: [],
+  suppressed: []
+}
+[LENS RESOLVER] Structured evidence: {
+  productId: 'lens_1',
+  brand: 'Nikon',
+  focalLength: '55-300mm',
+  maxAperture: 'f/4.5-5.6G',
+  modelCodes: [],
+  generation: null,
+  explicitMount: 'F',
+  featureTokens: [ 'VR', 'AF-S', 'ED' ]
+}
+[LENS RESOLVER] Lens candidates (Lensfun + ExifTool): {
+  productId: 'lens_1',
+  lensfunCount: 0,
+  exifToolCount: 0,
+  count: 0,
+  candidates: []
+}
+[LENS RESOLVER] notFoundInLensfun=true, identityInsufficient=false. Keeping grounded seller/OCR identity; no visual fallback: {
+  productId: 'lens_1',
+  sufficiency: {
+    sufficient: true,
+    code: 'brand-focal-aperture-plus-discriminator',
+    reason: 'brand, focal length, aperture and mount+featureTokens'
+  },
+  canonicalModel: '55-300mm f/4.5-5.6G VR AF-S ED'
+}
+[LENS RESOLVER] Complete: {
+  productId: 'lens_1',
+  mode: 'seller-ocr-grounded',
+  identity: {
+    brand: 'Nikon',
+    canonicalModel: '55-300mm f/4.5-5.6G VR AF-S ED',
+    mountSeries: 'F',
+    focalLength: '55-300mm',
+    maxAperture: 'f/4.5-5.6G',
+    featureTokens: [ 'VR', 'AF-S', 'ED' ],
+    modelCodes: [],
+    generation: null,
+    resolutionMode: 'seller-ocr-grounded',
+    groundedBy: 'brand-focal-aperture-plus-discriminator'
+  }
+}
+[LENS RESOLVER] Structured evidence: {
+  productId: 'lens_2',
+  brand: 'Nikon',
+  focalLength: '35mm',
+  maxAperture: 'f/1.8G',
+  modelCodes: [],
+  generation: null,
+  explicitMount: 'F',
+  featureTokens: []
+}
+[LENS RESOLVER] Lens candidates (Lensfun + ExifTool): {
+  productId: 'lens_2',
+  lensfunCount: 0,
+  exifToolCount: 0,
+  count: 0,
+  candidates: []
+}
+[LENS RESOLVER] notFoundInLensfun=true, identityInsufficient=false. Keeping grounded seller/OCR identity; no visual fallback: {
+  productId: 'lens_2',
+  sufficiency: {
+    sufficient: true,
+    code: 'brand-focal-aperture-plus-discriminator',
+    reason: 'brand, focal length, aperture and mount'
+  },
+  canonicalModel: '35mm f/1.8G'
+}
+[LENS RESOLVER] Complete: {
+  productId: 'lens_2',
+  mode: 'seller-ocr-grounded',
+  identity: {
+    brand: 'Nikon',
+    canonicalModel: '35mm f/1.8G',
+    mountSeries: 'F',
+    focalLength: '35mm',
+    maxAperture: 'f/1.8G',
+    featureTokens: [],
+    modelCodes: [],
+    generation: null,
+    resolutionMode: 'seller-ocr-grounded',
+    groundedBy: 'brand-focal-aperture-plus-discriminator'
+  }
+}
+[LENS RESOLVER] Structured evidence: {
+  productId: 'lens_3',
+  brand: 'Nikon',
+  focalLength: '40mm',
+  maxAperture: 'f/2.8G',
+  modelCodes: [],
+  generation: null,
+  explicitMount: 'F',
+  featureTokens: []
+}
+[LENS RESOLVER] Lens candidates (Lensfun + ExifTool): {
+  productId: 'lens_3',
+  lensfunCount: 0,
+  exifToolCount: 0,
+  count: 0,
+  candidates: []
+}
+[LENS RESOLVER] notFoundInLensfun=true, identityInsufficient=false. Keeping grounded seller/OCR identity; no visual fallback: {
+  productId: 'lens_3',
+  sufficiency: {
+    sufficient: true,
+    code: 'brand-focal-aperture-plus-discriminator',
+    reason: 'brand, focal length, aperture and mount'
+  },
+  canonicalModel: '40mm f/2.8G'
+}
+[LENS RESOLVER] Complete: {
+  productId: 'lens_3',
+  mode: 'seller-ocr-grounded',
+  identity: {
+    brand: 'Nikon',
+    canonicalModel: '40mm f/2.8G',
+    mountSeries: 'F',
+    focalLength: '40mm',
+    maxAperture: 'f/2.8G',
+    featureTokens: [],
+    modelCodes: [],
+    generation: null,
+    resolutionMode: 'seller-ocr-grounded',
+    groundedBy: 'brand-focal-aperture-plus-discriminator'
+  }
+}
+[STEP 5] Final primary products:
+[REQ END] POST /reconcile-primary-products 200 3360ms
+[REQ CLOSED] POST /reconcile-primary-products 3361ms
+[PRODUCT DATABASE] Supabase lookup results: [
+  {
+    index: 0,
+    found: true,
+    canonicalName: 'nikon 55-300mm f4.5-5.6g vr af-s ed lens',
+    estimatedResalePrice: 144.99,
+    priceStandardDeviation: 38.87
+  },
+  {
+    index: 1,
+    found: true,
+    canonicalName: 'nikon 35mm f1.8g lens',
+    estimatedResalePrice: 118.16,
+    priceStandardDeviation: 30.5
+  },
+  { index: 2, found: false, canonicalName: 'nikon 40mm f2.8g lens' }
+]
+[REQ END] POST /lookup-product-values 200 220ms
+[REQ CLOSED] POST /lookup-product-values 221ms
+[EBAY ACTIVE TRAINING] Searching: {
+  query: 'Nikon 40mm f/2.8G lens',
+  finalQuery: 'Nikon 40mm f/2.8G lens',
+  condition: 'Used',
+  conditionId: '3000'
+}
+[EBAY ACTIVE TRAINING] Results: { apiTotal: 106, returned: 100, usablePriceListings: 100 }
+[OPENAI REQUEST] eBay comp cleanup attempt 1 { requestId: 'openai-1792957820362-lov00if', model: 'gpt-4.1-mini' }
+[OPENAI USAGE] eBay comp cleanup attempt 1 {
+  model: 'gpt-4.1-mini',
+  inputTokens: 4038,
+  cachedTokens: 0,
+  uncachedInputTokens: 4038,
+  outputTokens: 556,
+  totalTokens: 4594,
+  estimatedCostUsd: 0.0025048
+}
+[AI JSON] eBay comp cleanup attempt 1/3
+{
+  "validIndexes": [4, 34, 58, 81, 83, 86, 93],
+  "relatedWrongComps": [
+    {
+      "index": 1,
+      "wrongModelName": "Nikon 40mm f/2.8G Macro AF-S F Mount",
+      "suggestedNegativeTerms": ["Micro", "Macro", "DX"]
+    },
+    {
+      "index": 2,
+      "wrongModelName": "Nikon AF-S DX Micro NIKKOR 40mm f/2.8G Macro Lens",
+      "suggestedNegativeTerms": ["Micro", "Macro", "DX"]
+    },
+    {
+      "index": 3,
+      "wrongModelName": "Nikon AF-S DX Micro NIKKOR 40mm f/2.8G 1:1 Macro Lens",
+      "suggestedNegativeTerms": ["Micro", "Macro", "DX"]
+    },
+    {
+      "index": 5,
+      "wrongModelName": "Nikon AF-S DX Micro NIKKOR 40mm f/2.8 G AF Lens",
+      "suggestedNegativeTerms": ["Micro", "Macro", "DX"]
+    },
+    {
+      "index": 6,
+      "wrongModelName": "Nikon Nikkor AF-S 40mm f2.8 G DX Micro Lens",
+      "suggestedNegativeTerms": ["Micro", "Macro", "DX"]
+    },
+    {
+      "index": 7,
+      "wrongModelName": "Nikon AF-S DX Micro Nikkor 40mm f/2.8 G Lens",
+      "suggestedNegativeTerms": ["Micro", "Macro", "DX"]
+    },
+    {
+      "index": 8,
+      "wrongModelName": "Nikon AF-S DX Micro NIKKOR 40mm f2.8G Lens",
+      "suggestedNegativeTerms": ["Micro", "Macro", "DX"]
+    }
+  ],
+  "searchPollution": {
+    "relatedWrongModelCount": 8,
+    "negativeSearchTerms": ["Micro", "Macro", "DX"],
+    "reason": "The majority of listings are for the Nikon AF-S DX Micro 40mm f/2.8G Macro lens variant (DX format, Macro), which is a different product from the Nikon F 40mm f/2.8G prime lens without Micro/Macro designation and for FX mount. The valid exact listings are fewer than 7, and related wrong model count is at least 8, indicating potential search pollution and recommendation for rerun with negative terms."
+  }
+}
+[PRODUCT DATABASE] Saved globally to Supabase: nikon 40mm f2.8g lens $146.79 stdDev $24.51
+[REQ END] POST /evaluate-active-comps 200 5082ms
+[REQ CLOSED] POST /evaluate-active-comps 5083ms
+[REQ END] POST /evaluate-lot 200 2ms
+[REQ CLOSED] POST /evaluate-lot 3ms
+[HIT LOG] Preparing permanent Supabase log. {
+  analysisRunId: '1846849629637637_966ad59a-2725-413e-81bc-3f3d2f2c6e1a'
+}
