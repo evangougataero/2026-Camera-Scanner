@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Purchase Tracker",
+  "version": "1.0.0",
+  "description": "Every 3 hours, reads Facebook order details and USPS tracking pages for purchased listings and reports to your Google Sheet via Apps Script.",
+  "permissions": ["alarms", "storage", "scripting", "tabs"],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "https://tools.usps.com/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Purchase Tracker" },
+  "options_ui": { "page": "options.html", "open_in_tab": true }
+}

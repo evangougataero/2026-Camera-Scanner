@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Purchase Tracker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; --b: #6b7280; --ok: #1a7f37; --bad: #b3261e; --line: color-mix(in srgb, currentColor 18%, transparent); }
+  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 2rem 0 .5rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+  p.hint { color: var(--b); margin: .1rem 0 .8rem; }
+  label { display: block; font-weight: 600; margin-top: .8rem; }
+  input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: .5rem .6rem; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
+  button { font: inherit; padding: .45rem .9rem; margin: .6rem .5rem 0 0; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+  button.primary { background: #1f4fd8; color: #fff; border-color: #1f4fd8; }
+  button:disabled { opacity: .5; cursor: wait; }
+  pre { white-space: pre-wrap; word-break: break-word; border: 1px solid var(--line); border-radius: 6px; padding: .7rem; max-height: 22rem; overflow: auto; font: 12.5px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  :focus-visible { outline: 2px solid #1f4fd8; outline-offset: 2px; }
+</style>
+</head>
+<body>
+<h1>Purchase Tracker</h1>
+<p class="hint">Every 3 hours while Chrome is open, checks Facebook order details and USPS tracking pages for items in your Purchased tab. Eligible items are moved to eBay inventory by Google Apps Script.</p>
+
+<h2>Connection</h2>
+<label for="apiUrl">Apps Script Web App URL</label>
+<input id="apiUrl" type="text" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
+<label for="apiToken">API token (from showApiToken() in Apps Script)</label>
+<input id="apiToken" type="password" autocomplete="off">
+<button class="primary" id="save">Save</button>
+<button id="ping">Test connection</button>
+<span id="connMsg" role="status"></span>
+
+<h2>Run</h2>
+<p class="hint">"Run now" only checks listings that are due. "Force check all" ignores the recheck interval (still one at a time, 30 s apart).</p>
+<button id="run">Run now</button>
+<button id="force">Force check all</button>
+<button id="refresh">Refresh status</button>
+<pre id="status">…</pre>
+
+<h2>Probe a Facebook listing</h2>
+<p class="hint">Verifies the Order Details extraction on a purchase you actually made. Opens the page in a background tab, shows exactly what was found, and sends nothing to your sheet. Run this on a few real orders (awaiting shipment, shipped, canceled) before trusting the automation.</p>
+<label for="probeInput">Listing URL or ID</label>
+<input id="probeInput" type="text" placeholder="https://www.facebook.com/marketplace/item/1234567890/">
+<button id="probe">Probe</button>
+<pre id="probeOut">Output appears here. The text preview may contain your address — it stays on this screen.</pre>
+
+<h2>Probe a USPS tracking number</h2>
+<p class="hint">Opens tools.usps.com/tracking in a background tab, types the number in, submits, and shows what was read. Nothing is sent to your sheet.</p>
+<label for="probeUspsInput">Tracking number</label>
+<input id="probeUspsInput" type="text" placeholder="9400 1118 …">
+<button id="probeUsps">Probe USPS</button>
+<pre id="probeUspsOut">Output appears here.</pre>
+
+<script src="options.js"></script>
+</body>
+</html>
