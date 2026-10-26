@@ -3194,6 +3194,9 @@ return {
       or claimed this listing.
 */
 
+/*
+  Only the per-listing working copies expire. Session logs are kept.
+*/
 function cleanupOldLocalAnalysisLogs() {
   const MAX_AGE_MS =
     24 * 60 * 60 * 1000;
@@ -3201,7 +3204,7 @@ function cleanupOldLocalAnalysisLogs() {
   try {
     const files =
       fs.readdirSync(
-        ANALYSIS_LOG_DIRECTORY
+        LISTING_LOG_TEMP_DIRECTORY
       );
 
     const now =
@@ -3220,7 +3223,7 @@ function cleanupOldLocalAnalysisLogs() {
 
       const filePath =
         path.join(
-          ANALYSIS_LOG_DIRECTORY,
+          LISTING_LOG_TEMP_DIRECTORY,
           fileName
         );
 
@@ -5723,13 +5726,28 @@ app.patch(
   }
 );
 
-  const ANALYSIS_LOG_DIRECTORY =
+/*
+  marketplace-analysis-logs/
+    session_scan_2026-10-26_09-14-03.log   <- one file per scan session,
+    session_manual_2026-10-26.log             every listing in it, in order
+    .listing-temp/<analysisRunId>.log      <- per-listing working copy, only
+                                              used to upload the clickable
+                                              Supabase hit log; deleted
+                                              after 24 hours
+*/
+const ANALYSIS_LOG_DIRECTORY =
   path.resolve(
     "marketplace-analysis-logs"
   );
 
+const LISTING_LOG_TEMP_DIRECTORY =
+  path.join(
+    ANALYSIS_LOG_DIRECTORY,
+    ".listing-temp"
+  );
+
 fs.mkdirSync(
-  ANALYSIS_LOG_DIRECTORY,
+  LISTING_LOG_TEMP_DIRECTORY,
   {
     recursive: true
   }
@@ -5764,8 +5782,104 @@ function getAnalysisLogFilePath(
   }
 
   return path.join(
-    ANALYSIS_LOG_DIRECTORY,
+    LISTING_LOG_TEMP_DIRECTORY,
     `${safeId}.log`
+  );
+}
+
+
+function getSessionLogFilePath(
+  scanSessionId
+) {
+  const safeId =
+    sanitizeAnalysisRunId(
+      scanSessionId
+    ) ||
+    `manual_${new Date().toISOString().slice(0, 10)}`;
+
+  return path.join(
+    ANALYSIS_LOG_DIRECTORY,
+    `session_${safeId}.log`
+  );
+}
+
+/*
+  Last listing written to each session file, so a listing banner
+  is written whenever the log switches to a different listing
+  (including back to one that was interrupted).
+*/
+const lastRunWrittenToSessionLog =
+  new Map();
+
+function buildSessionListingBanner(
+  analysisRunId,
+  resumed
+) {
+  const listingId =
+    String(analysisRunId).split("_")[0] ||
+    "unknown";
+
+  const line =
+    "=".repeat(78);
+
+  return (
+    `\n${line}\n` +
+    `LISTING ${listingId}${resumed ? " (continued)" : ""}\n` +
+    `Run: ${analysisRunId}\n` +
+    `URL: https://www.facebook.com/marketplace/item/${listingId}/\n` +
+    `Time: ${new Date().toLocaleString()}\n` +
+    `${line}\n`
+  );
+}
+
+const sessionRunsSeen =
+  new Map();
+
+function appendSessionLogText(
+  scanSessionId,
+  analysisRunId,
+  text
+) {
+  const filePath =
+    getSessionLogFilePath(
+      scanSessionId
+    );
+
+  let prefix = "";
+
+  if (!fs.existsSync(filePath)) {
+    prefix +=
+      `SCAN SESSION ${path.basename(filePath, ".log").replace(/^session_/, "")}\n` +
+      `Log started: ${new Date().toLocaleString()}\n`;
+  }
+
+  if (
+    lastRunWrittenToSessionLog.get(filePath) !==
+    analysisRunId
+  ) {
+    const seen =
+      sessionRunsSeen.get(filePath) ||
+      new Set();
+
+    prefix +=
+      buildSessionListingBanner(
+        analysisRunId,
+        seen.has(analysisRunId)
+      );
+
+    seen.add(analysisRunId);
+    sessionRunsSeen.set(filePath, seen);
+
+    lastRunWrittenToSessionLog.set(
+      filePath,
+      analysisRunId
+    );
+  }
+
+  fs.appendFileSync(
+    filePath,
+    `${prefix}${text}\n`,
+    "utf8"
   );
 }
 
@@ -5797,6 +5911,12 @@ function appendAnalysisLogText(
       filePath,
       `${text}\n`,
       "utf8"
+    );
+
+    appendSessionLogText(
+      context?.scanSessionId,
+      analysisRunId,
+      text
     );
   } catch (error) {
     /*
@@ -6605,7 +6725,14 @@ app.use(
 
     analysisLogStorage.run(
       {
-        analysisRunId
+        analysisRunId,
+
+        scanSessionId:
+          sanitizeAnalysisRunId(
+            req.get(
+              "X-Scan-Session-Id"
+            )
+          )
       },
       next
     );
@@ -8184,6 +8311,294 @@ function identifySameFocalLengthDuplicateLenses({
   }
 
   return removals;
+}
+
+/*
+  ============================================================
+  SELLER-EXCLUDED LENS REMOVAL
+  ============================================================
+
+  When the seller says the lens is not included ("Lens not
+  included", "body only", "no lens"), lenses that appear in the
+  photos are display/staging items, not part of the sale. Without
+  this, structural recovery restores them and they get valued as
+  "Unknown Lens".
+
+  Sources:
+    - Step 1 explicitlyExcluded entries that refer to a lens;
+    - the title / description, checked directly as a backup in
+      case Step 1 misses the exclusion.
+
+  Rules:
+    - An exclusion naming a focal length ("the 28mm lens is not
+      included") removes only lenses with that focal length.
+    - A generic exclusion ("lens not included", "body only")
+      removes every gallery lens, unless the seller ALSO lists a
+      lens as included. In that case only the extra lenses go:
+      known non-matching focal lengths first, then the least-seen
+      unidentified ones, keeping as many lenses as the seller
+      includes.
+    - Lens accessories (cap, hood, filter, adapter, mount cap...)
+      are not lens exclusions.
+  ============================================================
+*/
+const LENS_ACCESSORY_WORDS =
+  /\blens(?:es)?\s*(?:cap|caps|hood|hoods|filter|filters|adapter|adaptor|pouch|case|cloth|cleaner|cleaning|mount cap|rear cap|front cap|caps?)\b/i;
+
+const GENERIC_LENS_EXCLUSION_PATTERNS = [
+  /\blens(?:es)?\s+(?:is\s+|are\s+)?not\s+included\b/i,
+  /\blens(?:es)?\s+(?:is\s+|are\s+)?sold\s+separately\b/i,
+  /\bnot\s+includ(?:ed|ing)\s+(?:a\s+|the\s+|any\s+)?lens(?:es)?\b/i,
+  /\b(?:does\s*n[o']?t|doesn't|will\s+not|won't)\s+(?:come\s+with|include)\s+(?:a\s+|the\s+|any\s+)?lens(?:es)?\b/i,
+  /\b(?:no|without(?:\s+a|\s+the|\s+any)?)\s+lens(?:es)?\b(?!\s*(?:cap|hood|filter|adapter|mount))/i,
+  /\b(?:camera\s+)?body\s+only\b/i,
+  /\bjust\s+(?:the\s+)?(?:camera\s+)?body\b/i,
+  /\bonly\s+(?:the\s+)?(?:camera\s+)?body\b/i,
+  /\blens(?:es)?\s+(?:shown|pictured|in\s+(?:the\s+)?(?:photos?|pictures?|pics?))\s+(?:is\s+|are\s+)?(?:not|for\s+display)/i
+];
+
+function mentionsLens(text) {
+  const value = String(text || "");
+
+  return (
+    /\blens(?:es)?\b/i.test(value) &&
+    !LENS_ACCESSORY_WORDS.test(value)
+  );
+}
+
+function getLensProductFocalKey(product) {
+  const identity =
+    product?.lensIdentity || {};
+
+  for (const candidate of [
+    identity.focalLength,
+    extractFocalLengthFromText(
+      identity.canonicalModel || ""
+    )
+  ]) {
+    const key =
+      normalizeFocalForComparison(candidate);
+
+    if (key && isCompleteLensfunFocalEvidence(key)) {
+      return key;
+    }
+  }
+
+  return null;
+}
+
+function identifySellerExcludedLensProducts({
+  primaryProducts,
+  galleryResults,
+  listingTitle,
+  listingDescription,
+  explicitFacts,
+  alreadySuppressedIds = new Set()
+}) {
+  const excludedStrings =
+    (Array.isArray(explicitFacts?.explicitlyExcluded)
+      ? explicitFacts.explicitlyExcluded
+      : []
+    ).map(value => String(value || "").trim()).filter(Boolean);
+
+  const includedStrings =
+    (Array.isArray(explicitFacts?.explicitlyIncluded)
+      ? explicitFacts.explicitlyIncluded
+      : []
+    ).map(value => String(value || "").trim()).filter(Boolean);
+
+  const sellerText =
+    [listingTitle, listingDescription]
+      .map(value => String(value || ""))
+      .join("\n");
+
+  /*
+    1. What lenses did the seller exclude?
+  */
+  let genericExclusion = false;
+  const excludedFocalKeys = new Set();
+  const exclusionEvidence = [];
+
+  for (const entry of excludedStrings) {
+    if (!mentionsLens(entry) && !/\bbody\s+only\b/i.test(entry)) {
+      continue;
+    }
+
+    const focalKey =
+      normalizeFocalForComparison(
+        extractFocalLengthFromText(entry)
+      );
+
+    if (focalKey && isCompleteLensfunFocalEvidence(focalKey)) {
+      excludedFocalKeys.add(focalKey);
+    } else {
+      genericExclusion = true;
+    }
+
+    exclusionEvidence.push(`explicitlyExcluded: "${entry}"`);
+  }
+
+  for (const pattern of GENERIC_LENS_EXCLUSION_PATTERNS) {
+    const match = sellerText.match(pattern);
+
+    if (match) {
+      genericExclusion = true;
+      exclusionEvidence.push(`seller text: "${match[0]}"`);
+      break;
+    }
+  }
+
+  if (!genericExclusion && !excludedFocalKeys.size) {
+    return [];
+  }
+
+  /*
+    2. Lenses the seller says ARE included.
+  */
+  const includedLensEntries =
+    includedStrings.filter(mentionsLens);
+
+  const includedFocalKeys = new Set(
+    includedLensEntries
+      .map(entry =>
+        normalizeFocalForComparison(
+          extractFocalLengthFromText(entry)
+        )
+      )
+      .filter(key => key && isCompleteLensfunFocalEvidence(key))
+  );
+
+  /*
+    3. Every lens product still in play: reconciled primary
+    products plus gallery lenses the reconciliation dropped
+    (those are what recovery would restore).
+  */
+  const { registry } =
+    buildGalleryProductRegistry(galleryResults);
+
+  const lensById = new Map();
+
+  (Array.isArray(primaryProducts) ? primaryProducts : [])
+    .forEach(product => {
+      const productId =
+        String(product?.productId || "").trim();
+
+      if (
+        productId &&
+        isLensProductType(product?.productType)
+      ) {
+        lensById.set(productId, {
+          productId,
+          productType: product.productType,
+          focalKey: getLensProductFocalKey(product)
+        });
+      }
+    });
+
+  for (const [productId, entry] of registry) {
+    if (
+      !lensById.has(productId) &&
+      isLensProductType(entry?.productType)
+    ) {
+      lensById.set(productId, {
+        productId,
+        productType: entry.productType,
+        focalKey: null
+      });
+    }
+  }
+
+  const lenses =
+    Array.from(lensById.values())
+      .filter(lens => !alreadySuppressedIds.has(lens.productId))
+      .map(lens => ({
+        ...lens,
+        imageCount:
+          registry.get(lens.productId)?.visibleInImages?.size || 0,
+        maxReadability:
+          registry.get(lens.productId)?.maxReadability || 0
+      }));
+
+  const toRemove = new Map();
+
+  const remove = (lens, why) => {
+    if (!toRemove.has(lens.productId)) {
+      toRemove.set(lens.productId, { lens, why });
+    }
+  };
+
+  /*
+    Focal-specific exclusions always apply.
+  */
+  for (const lens of lenses) {
+    if (
+      lens.focalKey &&
+      excludedFocalKeys.has(lens.focalKey) &&
+      !includedFocalKeys.has(lens.focalKey)
+    ) {
+      remove(lens, `seller excludes the ${lens.focalKey} lens`);
+    }
+  }
+
+  if (genericExclusion) {
+    if (!includedLensEntries.length) {
+      for (const lens of lenses) {
+        remove(lens, "seller says no lens is included");
+      }
+    } else {
+      /*
+        Seller excludes "the other lenses" but includes some.
+        Keep up to the included count, preferring matching focal
+        lengths, then the most-seen lenses.
+      */
+      const keepCount = includedLensEntries.length;
+
+      const remaining =
+        lenses.filter(lens => !toRemove.has(lens.productId));
+
+      for (const lens of remaining) {
+        if (
+          lens.focalKey &&
+          includedFocalKeys.size &&
+          !includedFocalKeys.has(lens.focalKey)
+        ) {
+          remove(lens, `${lens.focalKey} is not among the included lenses`);
+        }
+      }
+
+      const ranked =
+        lenses
+          .filter(lens => !toRemove.has(lens.productId))
+          .sort((a, b) =>
+            Number(includedFocalKeys.has(b.focalKey)) -
+              Number(includedFocalKeys.has(a.focalKey)) ||
+            b.imageCount - a.imageCount ||
+            b.maxReadability - a.maxReadability
+          );
+
+      ranked.slice(keepCount).forEach(lens =>
+        remove(lens, "more lenses pictured than the seller includes")
+      );
+    }
+  }
+
+  return Array.from(toRemove.values()).map(({ lens, why }) => ({
+    productId: lens.productId,
+    productType: lens.productType,
+    suppressedAsSellerExcluded: true,
+    suppressedBy: "seller-excluded",
+    reason:
+      `Removed: ${why}. The lens appears in the photos but is not ` +
+      `part of the sale.`,
+    evidence: {
+      exclusions: exclusionEvidence,
+      excludedFocalKeys: Array.from(excludedFocalKeys),
+      genericExclusion,
+      includedLenses: includedLensEntries,
+      focalKey: lens.focalKey,
+      imageCount: lens.imageCount
+    }
+  }));
 }
 
 function evaluateLikelyPhantomGalleryProducts({
@@ -14142,6 +14557,38 @@ for (const removal of nonSellableLensRemovals) {
       removal
     );
   }
+}
+
+/*
+  Lenses the seller explicitly says are not part of the sale
+  (see identifySellerExcludedLensProducts). Runs before the
+  duplicate merge so excluded lenses are never compared.
+*/
+const sellerExcludedLensRemovals =
+  identifySellerExcludedLensProducts({
+    primaryProducts:
+      parsedPrimaryProducts,
+    galleryResults,
+    listingTitle,
+    listingDescription,
+    explicitFacts,
+    alreadySuppressedIds:
+      new Set(
+        suppressedGalleryProducts.map(
+          entry => entry.productId
+        )
+      )
+  });
+
+for (const removal of sellerExcludedLensRemovals) {
+  console.warn(
+    "[SELLER-EXCLUDED LENS] Removing lens the seller says is not included:",
+    removal
+  );
+
+  suppressedGalleryProducts.push(
+    removal
+  );
 }
 
 /*

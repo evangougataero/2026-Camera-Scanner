@@ -9118,6 +9118,18 @@ async function fetchLocalServer(
       "X-Analysis-Run-Id"
     ] =
       analysisRunId;
+
+    const scanSessionId =
+      storedRun[
+        MARKETPLACE_ANALYSIS_RUN_KEY
+      ]?.scanSessionId || "";
+
+    if (scanSessionId) {
+      requestHeaders[
+        "X-Scan-Session-Id"
+      ] =
+        scanSessionId;
+    }
   }
 
   for (
@@ -9781,6 +9793,13 @@ async function getOrCreateMarketplaceAnalysisRun() {
 
     listingId,
 
+    /*
+      Groups this listing's server log into the scan session's
+      log file (marketplace-analysis-logs/session_<id>.log).
+    */
+    scanSessionId:
+      await getCurrentScanSessionLogId(),
+
     startedAt:
       Date.now(),
 
@@ -9794,6 +9813,55 @@ async function getOrCreateMarketplaceAnalysisRun() {
   });
 
   return run;
+}
+
+
+/*
+  Session log ID for the server's per-session log file.
+
+  Auto scan running  -> "scan_2026-10-26_09-14-03" (scan start time,
+                        local), shared by every listing in that scan.
+  No auto scan       -> "manual_2026-10-26", one file per day for
+                        listings opened by hand.
+*/
+async function getCurrentScanSessionLogId() {
+  const pad = value => String(value).padStart(2, "0");
+
+  const formatDate = date =>
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+
+  const formatTime = date =>
+    `${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
+
+  try {
+    const stored =
+      await chrome.storage.local.get(
+        MARKETPLACE_AUTO_STATE_KEY
+      );
+
+    const state =
+      stored[MARKETPLACE_AUTO_STATE_KEY];
+
+    const startedAt =
+      Number(
+        state?.createdAt ||
+        state?.sessionLog?.startedAt ||
+        0
+      );
+
+    if (state?.running && startedAt) {
+      const date = new Date(startedAt);
+
+      return `scan_${formatDate(date)}_${formatTime(date)}`;
+    }
+  } catch (error) {
+    console.warn(
+      "[ANALYSIS LOG] Could not read scan state for session log ID:",
+      error
+    );
+  }
+
+  return `manual_${formatDate(new Date())}`;
 }
 
 
