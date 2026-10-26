@@ -19562,8 +19562,8 @@ const SCAM_DETECTION_ENABLED = true;
          - 10.25% x (purchase price + shipping fee)
 
   Buy Now   : profit at the asking price >= $35
-  Negotiate : profit at 15% below asking >= $35 (shipping unchanged)
-  Pass      : otherwise
+  Negotiate : profit at the asking price >= $0 and < $35
+  Pass      : profit at the asking price < $0
 
   maxBuyPrice is the purchase price at which profit is exactly $35.
 */
@@ -19676,13 +19676,16 @@ function makeLotDecision({
     };
   }
 
-  if (profitAtNegotiated >= LOT_MIN_PROFIT) {
+  /*
+    Negotiate: profit at the asking price is between $0 and
+    just under the $35 target.
+  */
+  if (profitAtAsk >= 0) {
     return {
       recommendation: "Negotiate",
       reason:
-        `Estimated profit at asking price is $${profitAtAsk}, below ` +
-        `the $${LOT_MIN_PROFIT} target, but it reaches ` +
-        `$${profitAtNegotiated} at ${LOT_NEGOTIATION_DISCOUNT * 100}% below ask.`,
+        `Estimated profit at asking price is $${profitAtAsk}: ` +
+        `not negative, but below the $${LOT_MIN_PROFIT} Buy Now target.`,
       scamFlag: false,
       resaleToAskRatio
     };
@@ -19691,9 +19694,7 @@ function makeLotDecision({
   return {
     recommendation: "Pass",
     reason:
-      `Estimated profit is $${profitAtAsk} at asking price and ` +
-      `$${profitAtNegotiated} at ${LOT_NEGOTIATION_DISCOUNT * 100}% below ask; ` +
-      `neither clears the $${LOT_MIN_PROFIT} target.`,
+      `Estimated profit at asking price is $${profitAtAsk}, below $0.`,
     scamFlag: false,
     resaleToAskRatio
   };
