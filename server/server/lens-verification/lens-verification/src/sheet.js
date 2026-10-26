@@ -13,19 +13,27 @@ const COLORS = { Pass: { red: 0.80, green: 0.93, blue: 0.80 }, Review: { red: 1,
 
 export function createSheet({ sheets, cfg, log = console.log }) {
   const ssId = cfg.spreadsheetId;
-  const trig = colIndex(cfg.triggerColumn), urlCol = colIndex(cfg.urlColumn), logCol = colIndex(cfg.logColumn);
+  // Column letters are only the fallback: on every read the header row decides (so adding/removing/reordering columns on Main is safe).
+  let trig = colIndex(cfg.triggerColumn), urlCol = colIndex(cfg.urlColumn), logCol = colIndex(cfg.logColumn);
+  const norm = (h) => String(h ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  function resolveColumns(rows) {
+    const hdr = (rows[0] || []).map(norm);
+    const find = (test) => hdr.findIndex(test);
+    const t = find(h => h.startsWith('interested')), u = find(h => h === 'facebooklink' || h === 'facebookurl' || h === 'listinglink'), l = find(h => h === 'loglink' || h === 'analysislog' || h === 'viewlog');
+    if (t >= 0) trig = t; if (u >= 0) urlCol = u; if (l >= 0) logCol = l;
+  }
   let resultsGid = null;
 
   async function readMain() {
     const r = await sheets.spreadsheets.values.get({ spreadsheetId: ssId, range: `${q(cfg.mainTab)}!A1:AD`, valueRenderOption: 'FORMULA' });
-    return r.data.values || [];
+    const rows = r.data.values || []; resolveColumns(rows); return rows;
   }
   async function meta() {
-    const r = await sheets.spreadsheets.get({ spreadsheetId: ssId, fields: 'sheets(properties(sheetId,title),merges)' });
+    const r = await sheets.spreadsheets.get({ spreadsheetId: ssId, fields: 'sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)),merges)' });
     const all = r.data.sheets || [];
     const main = all.find(s => s.properties.title === cfg.mainTab);
     if (!main) throw new Error(`Tab not found: ${cfg.mainTab}`);
-    return { mainGid: main.properties.sheetId, merges: main.merges || [], all };
+    return { mainGid: main.properties.sheetId, mainCols: main.properties.gridProperties?.columnCount ?? null, merges: main.merges || [], all };
   }
   const cell = (rows, r, c) => String((rows[r] || [])[c] ?? '');
   const logUrlOf = (c) => (String(c).match(/https?:\/\/[^"')\s]+\.log/) || [''])[0];
@@ -53,6 +61,14 @@ export function createSheet({ sheets, cfg, log = console.log }) {
   const headerIdx = (rows, name) => (rows[0] || []).findIndex(h => String(h).trim().toLowerCase() === name.toLowerCase());
   const statusCols = (rows) => { const h = cfg.statusHeaders; const o = { job: headerIdx(rows, h.job), result: headerIdx(rows, h.result), summary: headerIdx(rows, h.summary), report: headerIdx(rows, h.report) }; return Object.values(o).every(i => i >= 0) ? o : null; };
 
+  /** A tab only has as many columns as it was created with (your Main tab: A–Q). Writing past that fails, so add columns first. */
+  async function ensureColumns(needed) {
+    const { mainGid, mainCols } = await meta();
+    if (mainCols == null || mainCols >= needed) return;
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId: ssId, requestBody: { requests: [{ appendDimension: { sheetId: mainGid, dimension: 'COLUMNS', length: needed - mainCols } }] } });
+    log(`[LENS VERIFY] ${cfg.mainTab} tab had ${mainCols} columns; added ${needed - mainCols} so the status columns fit.`);
+  }
+
   async function ensureStatusColumns(rows) {
     const have = statusCols(rows); if (have) return have;
     const hdr = rows[0] || []; let last = -1; hdr.forEach((h, i) => { if (String(h).trim()) last = i; });
@@ -62,6 +78,7 @@ export function createSheet({ sheets, cfg, log = console.log }) {
     const idx = {}; let next = start;
     for (const k of ['job', 'result', 'summary', 'report']) { const f = headerIdx(rows, cfg.statusHeaders[k]); idx[k] = f >= 0 ? f : next++; }
     for (const k of missing) { for (let r = 1; r < rows.length; r++) if (cell(rows, r, idx[k]).trim()) throw new Error(`COLUMN_COLLISION: ${colLetter(idx[k])} already has data; refusing to overwrite.`); }
+    await ensureColumns(Math.max(...Object.values(idx)) + 1);
     await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: ssId, requestBody: { valueInputOption: 'RAW', data: missing.map(k => ({ range: `${q(cfg.mainTab)}!${colLetter(idx[k])}1`, values: [[cfg.statusHeaders[k]]] })) } });
     return idx;
   }

@@ -131,6 +131,9 @@ export function createWorker({ queue, cfg, ai, evidenceStore, sheet, uploadRepor
   }
 
   /** Pushes job state (+ results rows once finished) to the sheet. Failure leaves sheet_synced=0 so it is retried. */
+  const syncFails = new Map();                                                    // jobId -> { n, nextAt }: do not hammer the Sheets API (or the log) when a sync keeps failing
+  const syncKey = (job) => `${job.id}:${job.status}:${job.attempts}`;            // a new job state is synced immediately; only repeats of the SAME state back off
+  const syncDue = (job) => { const f = syncFails.get(syncKey(job)); return !f || now() >= f.nextAt; };
   async function syncJob(job) {
     try {
       let resultsRow = job.results_row || null;
@@ -140,9 +143,14 @@ export function createWorker({ queue, cfg, ai, evidenceStore, sheet, uploadRepor
         resultsRow = await sheet.appendResults(job, lensRows, rep);
       }
       await sheet.writeStatus(job.listing_id, { job: jobLabel(job), result: verdictLabel(job.verdict), summary: job.summary || job.last_error || '', resultsRow });
-      queue.markSynced(job.id, resultsRow);
+      queue.markSynced(job.id, resultsRow); syncFails.delete(syncKey(job));
       return true;
-    } catch (e) { queue.markSyncFailed(job.id, e.message); log('[LENS VERIFY] sheet sync failed:', e.message); return false; }
+    } catch (e) {
+      const f = syncFails.get(syncKey(job)) || { n: 0 }; f.n++; f.nextAt = now() + Math.min(10 * 60000, 15000 * 2 ** (f.n - 1)); syncFails.set(syncKey(job), f);
+      queue.markSyncFailed(job.id, e.message);
+      if (f.n === 1 || f.n % 10 === 0) log(`[LENS VERIFY] sheet sync failed (attempt ${f.n}; next try in ${Math.round((f.nextAt - now()) / 1000)}s):`, e.message);
+      return false;
+    }
   }
 
   return {
@@ -153,7 +161,7 @@ export function createWorker({ queue, cfg, ai, evidenceStore, sheet, uploadRepor
       try {
         const job = queue.claimNext();
         if (job) { await syncJob(queue.get(job.id)); let r; try { r = await process(job); } catch (e) { const c = classifyError(e); log('[LENS VERIFY] job crashed:', e); r = queue.scheduleRetry(job.id, c); } }
-        for (const j of queue.unsynced()) await syncJob(j);
+        for (const j of queue.unsynced()) if (syncDue(j)) await syncJob(j);
         return !!job;
       } finally { busy = false; }
     }

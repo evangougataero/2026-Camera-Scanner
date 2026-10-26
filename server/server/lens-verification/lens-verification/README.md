@@ -51,6 +51,11 @@ So a small **passive** middleware stores a snapshot when a hit is saved (title, 
 - **`Lens Verification` tab** (auto-created): one row per lens — original scanner identification, verdict, independent identification, potential alternative, finding, value impact, recommended manual check, photo used (link), evidence used, notes. The `Verify Report` cell links to the right row.
 - **Full audit JSON** (both passes, alternatives, guardrail adjustments, photo choice incl. other candidates, evidence source) in Supabase `lens-verification/reports/<listingId>/<jobId>.json` and in the job database. Every OpenAI call is also in your existing `openai-api-logs`.
 
+## Troubleshooting: columns not appearing
+- Your Main tab only has columns A–Q, so the module **adds columns itself** (up to V) the first time it writes status. If you ever see `exceeds grid limits` in the console you are on an older copy of this module.
+- A listing scanned **before** the module was installed has no saved photos: it ends as `Failed` ("re-scan") in the status columns; scan it again and re-type `Y`.
+- A sheet write that keeps failing now retries with a growing delay (15 s up to 10 min) and logs once, instead of every 5 seconds.
+
 ## Statuses
 | `Verify Job` (processing) | meaning |
 |---|---|

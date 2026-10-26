@@ -142,7 +142,7 @@ test('sheet failures are retried without re-running the AI: job stays done, stat
   rig.fs.failNext = Object.assign(new Error('sheets 503'), { status: 503 });                                          // first sheet call after queueing fails
   await rig.lv.parts().worker.tick();
   const callsAfter = rig.openai.calls.length;
-  for (let i = 0; i < 4; i++) await rig.lv.parts().worker.tick();
+  for (let i = 0; i < 4; i++) { rig.c.advance(16000); await rig.lv.parts().worker.tick(); }   // sync retries back off (15s+), so let time pass
   const j = rig.queue.list()[0]; assert.equal(j.status, 'done'); assert.equal(j.sheet_synced, 1); assert.equal(rig.openai.calls.length, callsAfter); assert.equal(rig.mainStatus(2).job, 'Done');
   assert.equal(rig.openai.calls.length, 2);
 });
@@ -185,4 +185,41 @@ test('selftest route: reports each prerequisite separately; one OpenAI structure
   await routes['/lens-verification/selftest']({ socket: { remoteAddress: '127.0.0.1' } }, res);
   assert.equal(body.ok, true, JSON.stringify(body)); assert.equal(calls, 1); assert.ok(body.checks.sheets_read.ok && body.checks.results_tab.ok && body.checks.storage.ok && body.checks.openai_structured_vision.ok);
   let denied; await routes['/lens-verification/selftest']({ socket: { remoteAddress: '203.0.113.9' } }, { status() { return this; }, json(b) { denied = b; } }); assert.equal(denied.ok, false);
+});
+
+test('real Main tab has only columns A-Q: the status columns are added (grid expanded) and the write succeeds', async () => {
+  const rig = makeRig({ lenses: [{ name: 'Canon EF 50mm', brand: 'Canon', focal: '50mm', scores: { 1: 9 } }] });
+  assert.equal(rig.fs.tab('Main').cols, 17);
+  setY(rig.fs, 2); await rig.run();
+  assert.ok(rig.fs.tab('Main').cols >= 22);                                       // S..V now exist
+  const j = rig.queue.list()[0]; assert.equal(j.status, 'done'); assert.equal(j.sheet_synced, 1);
+  assert.equal(rig.mainStatus(2).job, 'Done'); assert.equal(rig.mainStatus(2).result, 'Pass');
+});
+
+test('a sheet error that keeps failing backs off instead of retrying every tick (no log/API spam)', async () => {
+  const rig = makeRig({ lenses: [{ name: 'Canon EF 50mm', brand: 'Canon', focal: '50mm', scores: { 1: 9 } }] });
+  setY(rig.fs, 2); await rig.lv.poll(); rig.c.advance(21000); await rig.lv.poll();       // queued
+  let sheetCalls = 0; rig.fs.fail = () => { sheetCalls++; throw new Error('permanent sheet problem'); };   // every Sheets call now fails
+  await rig.lv.parts().worker.tick();                                                    // job runs (AI ok); its sheet sync fails
+  assert.equal(rig.queue.list()[0].status, 'done');
+  const afterFirst = sheetCalls;
+  for (let i = 0; i < 20; i++) await rig.lv.parts().worker.tick();                       // 20 ticks inside the backoff window
+  assert.equal(sheetCalls, afterFirst, 'ticks inside the backoff window must not call the Sheets API');
+  rig.c.advance(16000); await rig.lv.parts().worker.tick(); assert.ok(sheetCalls > afterFirst && sheetCalls <= afterFirst + 3);
+  rig.fs.fail = () => {};                                                                // sheet recovers -> next due retry succeeds
+  rig.c.advance(11 * 60000); await rig.lv.parts().worker.tick();
+  assert.equal(rig.queue.list()[0].sheet_synced, 1); assert.equal(rig.mainStatus(2).job, 'Done');
+});
+
+test('trigger / URL / log columns are found by header name, so rearranged Main columns still work', async () => {
+  const rig = makeRig({ lenses: [{ name: 'Canon EF 50mm', brand: 'Canon', focal: '50mm', scores: { 1: 9 } }], seed: false });
+  // build a Main tab whose columns were moved: Interested? at column D, Facebook Link at C, Log Link at E
+  const fs = rig.fs; const L = rig.listing[0];
+  ['Name', 'Notes', 'Facebook Link', 'Interested?', 'Log Link'].forEach((h, c) => fs.set('Main', 0, c, h));
+  fs.set('Main', 1, 0, L.items[0]); fs.set('Main', 1, 2, `https://www.facebook.com/marketplace/item/${L.id}/`);
+  fs.set('Main', 1, 4, `=HYPERLINK("https://x.supabase.co/storage/v1/object/public/marketplace-hit-logs/${L.id}/${L.id}_run1.log","View Log")`);
+  fs.set('Main', 1, 3, 'Y');
+  await rig.run();
+  const j = rig.queue.list(); assert.equal(j.length, 1); assert.equal(j[0].status, 'done'); assert.equal(rig.mainStatus(2).result, 'Pass');
+  assert.equal(fs.get('Main', 1, 3), 'Y');                                         // the moved trigger cell untouched
 });

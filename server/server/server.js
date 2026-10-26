@@ -15720,6 +15720,112 @@ function getGoogleSheetHitDate() {
   }).format(new Date());
 }
 
+/*
+  ============================================================
+  MAIN SHEET COLUMNS ARE FOUND BY HEADER NAME
+  ============================================================
+
+  The scanner used to write by fixed column letters (A..Q). If you
+  add / remove / reorder columns on the Main tab, values then land
+  under the wrong headers. Now row 1 is read on every save and each
+  value goes under the header that names it (case / punctuation
+  ignored). Add or move columns freely; just keep these header names:
+
+    Name | Facebook Link | Decision | Ask Price | Estimated Resale... |
+    Price Deviation | Manual Evaluation | Threshold Buy | Log Link |
+    Date | Purchase (Y/N) (receives the Checklist link) | Relisted (optional)
+
+  Any other header (Notes, Interested?, Total Acquisition, ...) is a
+  manual column: the scanner leaves it blank and never fills it.
+  A header the scanner cannot find is NOT guessed: that value is
+  skipped and a warning is printed, so nothing lands in the wrong place.
+*/
+const MAIN_SHEET_MIN_WIDTH = 17; // keep the scanner's A:Q look (white fill, divider, right border)
+
+const MAIN_SHEET_FIELDS = {
+  name:               { legacy: 0,    test: n => n === "name" || n === "item" || n === "itemname" },
+  facebookUrl:        { legacy: 1,    test: n => n.startsWith("facebook") && (n.includes("link") || n.includes("url")) || n === "listinglink" },
+  decision:           { legacy: 2,    test: n => n === "decision" || n === "recommendation" },
+  askPrice:           { legacy: 3,    test: n => n === "askprice" || n === "askingprice" },
+  estimatedResale:    { legacy: 4,    test: n => n.startsWith("estimatedresale") || n.startsWith("estresale") },
+  priceDeviation:     { legacy: 5,    test: n => n === "pricedeviation" || n === "pricestddev" || n === "stddev" || n.includes("standarddeviation") },
+  manualEvaluation:   { legacy: 6,    test: n => n.startsWith("manualeval") },
+  thresholdBuy:       { legacy: 7,    test: n => n.startsWith("thresholdbuy") || n === "maxbuy" || n === "maxbuyprice" },
+  logLink:            { legacy: 8,    test: n => n === "loglink" || n === "analysislog" || n === "viewlog" },
+  date:               { legacy: null, test: n => n === "date" || n === "hitdate" || n === "datefound" || n === "dateadded" },
+  checklist:          { legacy: null, test: n => n === "purchaseyn" || n === "purchase" || n === "purchasechecklist" || n === "checklist" },
+  relisted:           { legacy: null, test: n => n === "relisted" || n === "relistedyn" },
+  ongoingConversation:{ legacy: null, test: n => n.startsWith("ongoingconversation") || n === "conversation" },
+  followUp:           { legacy: null, test: n => n === "followup" || n === "followupdue" }
+};
+
+/* Per-item columns: never merged across a listing's rows. */
+const MAIN_SHEET_PER_ITEM_FIELDS = ["name", "estimatedResale", "priceDeviation", "manualEvaluation"];
+
+function normalizeSheetHeader(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function sheetColumnLetter(index) {
+  let n = index + 1, out = "";
+  while (n > 0) { const r = (n - 1) % 26; out = String.fromCharCode(65 + r) + out; n = Math.floor((n - 1) / 26); }
+  return out;
+}
+
+function resolveMainSheetColumns(headerRow) {
+  const headers = Array.isArray(headerRow) ? headerRow : [];
+  const index = {};
+  const warnings = [];
+  const claimed = new Set();
+
+  for (const [field, def] of Object.entries(MAIN_SHEET_FIELDS)) {
+    const found = headers.findIndex((h, i) => !claimed.has(i) && def.test(normalizeSheetHeader(h)));
+    if (found >= 0) { index[field] = found; claimed.add(found); }
+  }
+  // Columns A..I have always been the same; if a header there was merely renamed, keep the old position.
+  for (const [field, def] of Object.entries(MAIN_SHEET_FIELDS)) {
+    if (index[field] !== undefined || def.legacy === null) continue;
+    if (!claimed.has(def.legacy)) {
+      index[field] = def.legacy; claimed.add(def.legacy);
+      warnings.push(`header for "${field}" not found; using legacy column ${sheetColumnLetter(def.legacy)}`);
+    } else {
+      warnings.push(`header for "${field}" not found; that value will not be written`);
+    }
+  }
+
+  let lastHeader = -1;
+  headers.forEach((h, i) => { if (String(h ?? "").trim()) lastHeader = i; });
+  const width = Math.max(MAIN_SHEET_MIN_WIDTH, lastHeader + 1, ...Object.values(index).map(i => i + 1));
+
+  const perItem = new Set(MAIN_SHEET_PER_ITEM_FIELDS.map(f => index[f]).filter(i => i !== undefined));
+  const mergedColumns = [];
+  for (let c = 0; c < width; c++) if (!perItem.has(c)) mergedColumns.push(c);
+
+  // Columns the scanner fills itself; every other column in A..width is manual-entry and is kept blank.
+  const written = new Set(Object.entries(index).filter(([f]) => f !== "ongoingConversation" && f !== "followUp").map(([, i]) => i));
+  const manualColumns = [];
+  for (let c = 0; c < width; c++) if (!written.has(c)) manualColumns.push(c);
+
+  return { index, width, lastLetter: sheetColumnLetter(width - 1), mergedColumns, manualColumns, warnings };
+}
+
+/** Contiguous [start, endExclusive) runs from a sorted list of column indexes. */
+function sheetColumnRuns(columns) {
+  const runs = [];
+  for (const c of columns) {
+    const last = runs[runs.length - 1];
+    if (last && last[1] === c) last[1] = c + 1; else runs.push([c, c + 1]);
+  }
+  return runs;
+}
+
+async function loadMainSheetColumns(sheets, spreadsheetId, tabName) {
+  const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${tabName}!1:1` });
+  const layout = resolveMainSheetColumns((response.data.values || [])[0] || []);
+  for (const w of layout.warnings) console.warn(`[GOOGLE SHEETS] Column layout: ${w}`);
+  return layout;
+}
+
 async function appendSavedDealToGoogleSheet(deal) {
   const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
   const tabName = process.env.GOOGLE_SHEETS_TAB_NAME || "Main";
@@ -15862,6 +15968,9 @@ const checklistUrl =
     ""
   ).trim();
 
+
+const sheetColumns = await loadMainSheetColumns(sheets, spreadsheetId, tabName);
+const sheetWidth = sheetColumns.width;
 
 const rows = rowItems.map((item, index) => {
 const analysisLogLink =
@@ -16015,25 +16124,27 @@ const relistedYN =
     ? (deal.relisted ?? deal.relistedYN ?? "")
     : "";
 
-   return [
-  itemName,        // A
-  facebookUrl,     // B
-  decision,        // C
-  askPrice,        // D
-  estimatedResale, // E
-  priceStdDev,     // F
-  "",              // G — Manual Evaluation
-  thresholdBuy,    // H
-  analysisLogLink, // I — Analysis Log
-  manualColumnJ,   // J
-  manualColumnK,   // K
-  manualColumnL,   // L
-  checklistColumnM, // M — Purchase Checklist
-  hitDateColumnN,  // N
-  manualColumnO,   // O
-  manualColumnP,   // P
-  relistedYN       // Q
-];
+   // Each value goes under the header that names it (see MAIN_SHEET_FIELDS).
+   const rowValues = new Array(sheetWidth).fill("");
+   const put = (field, value) => {
+     const columnIndex = sheetColumns.index[field];
+     if (columnIndex !== undefined) rowValues[columnIndex] = value;
+   };
+
+   put("name", itemName);
+   put("facebookUrl", facebookUrl);
+   put("decision", decision);
+   put("askPrice", askPrice);
+   put("estimatedResale", estimatedResale);
+   put("priceDeviation", priceStdDev);
+   put("manualEvaluation", "");
+   put("thresholdBuy", thresholdBuy);
+   put("logLink", analysisLogLink);
+   put("checklist", checklistColumnM);
+   put("date", hitDateColumnN);
+   put("relisted", relistedYN);
+
+   return rowValues;
   });
 
 const existingColumnA =
@@ -16145,7 +16256,7 @@ if (
 await sheets.spreadsheets.values.update({
   spreadsheetId,
   range:
-    `${tabName}!A${insertedStartRowNumber}:Q${insertedEndRowNumber}`,
+    `${tabName}!A${insertedStartRowNumber}:${sheetColumns.lastLetter}${insertedEndRowNumber}`,
   valueInputOption: "USER_ENTERED",
   requestBody: {
     values: rows
@@ -16160,21 +16271,8 @@ const endRowIndex =
 
   const requests = [];
 
-const mergedColumns = [
-  1, // B Facebook link
-  2, // C Decision
-  3, // D Ask price
-  7, // H Threshold buy
-  8, // I Analysis Log
-  9, // J
-  10, // K
-  11, // L
-  12, // M
-  13, // N
-  14, // O
-  15, // P
-  16  // Q Relisted
-];
+// Every listing-level column is merged down the listing's rows (all except Name / Estimated Resale / Price Deviation / Manual Evaluation).
+const mergedColumns = sheetColumns.mergedColumns;
 
   if (listingRowCount > 1) {
     for (const columnIndex of mergedColumns) {
@@ -16194,43 +16292,26 @@ const mergedColumns = [
   }
 
   // Center merged columns vertically/horizontally
-  requests.push({
-    repeatCell: {
-      range: {
-        sheetId,
-        startRowIndex,
-        endRowIndex,
-        startColumnIndex: 1,
-        endColumnIndex: 4
-      },
-      cell: {
-        userEnteredFormat: {
-          verticalAlignment: "MIDDLE",
-          horizontalAlignment: "CENTER"
-        }
-      },
-      fields: "userEnteredFormat(verticalAlignment,horizontalAlignment)"
-    }
-  });
-
-  requests.push({
-    repeatCell: {
-      range: {
-        sheetId,
-        startRowIndex,
-        endRowIndex,
-        startColumnIndex: 7,
-        endColumnIndex: 16
-      },
-      cell: {
-        userEnteredFormat: {
-          verticalAlignment: "MIDDLE",
-          horizontalAlignment: "CENTER"
-        }
-      },
-      fields: "userEnteredFormat(verticalAlignment,horizontalAlignment)"
-    }
-  });
+  for (const [runStart, runEnd] of sheetColumnRuns(mergedColumns)) {
+    requests.push({
+      repeatCell: {
+        range: {
+          sheetId,
+          startRowIndex,
+          endRowIndex,
+          startColumnIndex: runStart,
+          endColumnIndex: runEnd
+        },
+        cell: {
+          userEnteredFormat: {
+            verticalAlignment: "MIDDLE",
+            horizontalAlignment: "CENTER"
+          }
+        },
+        fields: "userEnteredFormat(verticalAlignment,horizontalAlignment)"
+      }
+    });
+  }
 
   // Force every newly added cell from A:Q to have a white background.
 // This prevents the manual background color from the previous listing
@@ -16242,7 +16323,7 @@ requests.push({
       startRowIndex,
       endRowIndex,
       startColumnIndex: 0,
-      endColumnIndex: 17
+      endColumnIndex: sheetWidth
     },
     cell: {
       userEnteredFormat: {
@@ -16258,71 +16339,41 @@ requests.push({
 });
 
 /*
-  Columns I:M and O:P are controlled manually.
-
-  Column N is intentionally excluded because it stores the
-  date when the hit was recorded.
+  Manual-entry columns (whatever headers are not scanner-filled, e.g.
+  Total Acquisition, Agreed to Price, Notes, Interested?) are cleared
+  for the new rows so nothing is inherited from the row above.
+  Name / URL / Decision / Ask / Resale / Deviation / Threshold / Log /
+  Date / Purchase / Relisted are scanner-filled and are never cleared.
 */
-
-/*
-  Clear J:L.
-
-  Column I = Analysis Log
-  Column M = Purchase Checklist
-*/
-
-requests.push({
-  repeatCell: {
-    range: {
-      sheetId,
-      startRowIndex,
-      endRowIndex,
-
-      startColumnIndex:
-        9,
-
-      endColumnIndex:
-        12
-    },
-
-    cell: {
-      userEnteredValue:
-        null
-    },
-
-    fields:
-      "userEnteredValue"
-  }
-});
-
-// Clear O:P.
-requests.push({
-  repeatCell: {
-    range: {
-      sheetId,
-      startRowIndex,
-      endRowIndex,
-      startColumnIndex: 14,
-      endColumnIndex: 16
-    },
-    cell: {
-      userEnteredValue: null
-    },
-    fields: "userEnteredValue"
-  }
-});
-
-// Make Threshold Buy black if the listing is NOT marked Negotiate.
-// This must stay after the white-background request.
-if (!isNegotiate) {
+for (const [runStart, runEnd] of sheetColumnRuns(sheetColumns.manualColumns)) {
   requests.push({
     repeatCell: {
       range: {
         sheetId,
         startRowIndex,
         endRowIndex,
-        startColumnIndex: 7,
-        endColumnIndex: 8
+        startColumnIndex: runStart,
+        endColumnIndex: runEnd
+      },
+      cell: {
+        userEnteredValue: null
+      },
+      fields: "userEnteredValue"
+    }
+  });
+}
+
+// Make Threshold Buy black if the listing is NOT marked Negotiate.
+// This must stay after the white-background request.
+if (!isNegotiate && sheetColumns.index.thresholdBuy !== undefined) {
+  requests.push({
+    repeatCell: {
+      range: {
+        sheetId,
+        startRowIndex,
+        endRowIndex,
+        startColumnIndex: sheetColumns.index.thresholdBuy,
+        endColumnIndex: sheetColumns.index.thresholdBuy + 1
       },
       cell: {
         userEnteredFormat: {
@@ -16346,7 +16397,7 @@ requests.push({
       startRowIndex,
       endRowIndex,
       startColumnIndex: 0,
-      endColumnIndex: 17
+      endColumnIndex: sheetWidth
     },
     bottom: {
       style: "SOLID_MEDIUM",
@@ -16366,8 +16417,8 @@ requests.push({
       sheetId,
       startRowIndex,
       endRowIndex,
-      startColumnIndex: 16,
-      endColumnIndex: 17
+      startColumnIndex: sheetWidth - 1,
+      endColumnIndex: sheetWidth
     },
     right: {
       style: "SOLID_MEDIUM",
@@ -16722,6 +16773,29 @@ async function updateMarketplaceConversationFollowUpColumn({
     });
 
 
+  const followUpLayout =
+    await loadMainSheetColumns(
+      sheets,
+      spreadsheetId,
+      tabName
+    );
+
+  const followUpColumnIndex =
+    followUpLayout.index.followUp;
+
+  if (followUpColumnIndex === undefined) {
+    console.warn(
+      "[CONVERSATION TRACKER] The Main tab has no \"Follow Up\" column header; follow-up flag not written."
+    );
+
+    return;
+  }
+
+  const followUpColumnLetter =
+    sheetColumnLetter(
+      followUpColumnIndex
+    );
+
   await sheets
     .spreadsheets
     .values
@@ -16729,10 +16803,10 @@ async function updateMarketplaceConversationFollowUpColumn({
       spreadsheetId,
 
       /*
-        Q = Follow Up
+        Follow Up column is found by its header name.
       */
       range:
-        `${tabName}!Q${cleanRowNumber}`,
+        `${tabName}!${followUpColumnLetter}${cleanRowNumber}`,
 
       valueInputOption:
         "USER_ENTERED",
@@ -16756,7 +16830,7 @@ async function updateMarketplaceConversationFollowUpColumn({
         cleanRowNumber,
 
       column:
-        "Q",
+        followUpColumnLetter,
 
       value:
         followUpDue
@@ -19690,14 +19764,51 @@ async function getMarketplaceConversationSheetStatus(
     });
 
   /*
-    B = Facebook Marketplace URL
-    J = Ongoing Conversation
-
-    Because we're requesting B:J:
-
-    row[0] = B
-    row[8] = J
+    The "Facebook Link" and "Ongoing Conversation" columns are found
+    by header name (not by fixed letters). If the tab has no
+    "Ongoing Conversation" column, nothing is eligible.
   */
+  const conversationLayout =
+    await loadMainSheetColumns(
+      sheets,
+      spreadsheetId,
+      tabName
+    );
+
+  const urlColumnIndex =
+    conversationLayout.index.facebookUrl;
+
+  const conversationColumnIndex =
+    conversationLayout.index.ongoingConversation;
+
+  if (
+    urlColumnIndex === undefined ||
+    conversationColumnIndex === undefined
+  ) {
+    console.warn(
+      "[CONVERSATION TRACKER] Main tab has no \"Ongoing Conversation\" column header; no listing is eligible."
+    );
+
+    return {
+      found: false,
+      rowNumber: null,
+      status: "",
+      eligible: false
+    };
+  }
+
+  const firstColumnIndex =
+    Math.min(
+      urlColumnIndex,
+      conversationColumnIndex
+    );
+
+  const lastColumnIndex =
+    Math.max(
+      urlColumnIndex,
+      conversationColumnIndex
+    );
+
   const response =
     await sheets
       .spreadsheets
@@ -19706,7 +19817,7 @@ async function getMarketplaceConversationSheetStatus(
         spreadsheetId,
 
         range:
-          `${tabName}!B:J`
+          `${tabName}!${sheetColumnLetter(firstColumnIndex)}:${sheetColumnLetter(lastColumnIndex)}`
       });
 
   const rows =
@@ -19724,12 +19835,12 @@ async function getMarketplaceConversationSheetStatus(
 
     const facebookUrl =
       String(
-        row[0] || ""
+        row[urlColumnIndex - firstColumnIndex] || ""
       ).trim();
 
     const ongoingConversation =
       String(
-        row[8] || ""
+        row[conversationColumnIndex - firstColumnIndex] || ""
       )
         .trim()
         .toUpperCase();
@@ -20342,9 +20453,52 @@ app.get(
 
 
       /*
-        B = Marketplace listing URL
-        J = Ongoing Conversation status
+        "Facebook Link" and "Ongoing Conversation" are found by
+        header name. Without an "Ongoing Conversation" column there
+        are no targets.
       */
+      const targetsLayout =
+        await loadMainSheetColumns(
+          sheets,
+          spreadsheetId,
+          tabName
+        );
+
+      const targetsUrlIndex =
+        targetsLayout.index.facebookUrl;
+
+      const targetsConversationIndex =
+        targetsLayout.index.ongoingConversation;
+
+      if (
+        targetsUrlIndex === undefined ||
+        targetsConversationIndex === undefined
+      ) {
+        console.warn(
+          "[CONVERSATION TRACKER] Main tab has no \"Ongoing Conversation\" column header; no conversation targets."
+        );
+
+        return res.json({
+          ok: true,
+          count: 0,
+          mappedCount: 0,
+          unmappedCount: 0,
+          targets: []
+        });
+      }
+
+      const targetsFirstIndex =
+        Math.min(
+          targetsUrlIndex,
+          targetsConversationIndex
+        );
+
+      const targetsLastIndex =
+        Math.max(
+          targetsUrlIndex,
+          targetsConversationIndex
+        );
+
       const sheetResponse =
         await sheets
           .spreadsheets
@@ -20353,7 +20507,7 @@ app.get(
             spreadsheetId,
 
             range:
-              `${tabName}!B:J`
+              `${tabName}!${sheetColumnLetter(targetsFirstIndex)}:${sheetColumnLetter(targetsLastIndex)}`
           });
 
 
@@ -20379,13 +20533,13 @@ app.get(
 
         const listingUrl =
           String(
-            row[0] ||
+            row[targetsUrlIndex - targetsFirstIndex] ||
             ""
           ).trim();
 
         const conversationStatus =
           String(
-            row[8] ||
+            row[targetsConversationIndex - targetsFirstIndex] ||
             ""
           )
             .trim()

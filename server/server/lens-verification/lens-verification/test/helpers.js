@@ -12,7 +12,8 @@ export const makeDb = () => new DatabaseSync(':memory:');
 // ------------------------------------------------------------------------------------------------ fake Google Sheets
 export class FakeSheets {
   constructor() { this.tabs = new Map(); this.nextGid = 100; this.writes = []; this.failNext = null; this.addTab('Main'); }
-  addTab(title) { const t = { gid: this.nextGid++, title, grid: new Map(), merges: [], formats: [] }; this.tabs.set(title, t); return t; }
+  // the real Main tab has only columns A–Q (17)
+  addTab(title) { const t = { gid: this.nextGid++, title, grid: new Map(), merges: [], formats: [], cols: title === 'Main' ? 17 : 26 }; this.tabs.set(title, t); return t; }
   tab(title) { return this.tabs.get(title); }
   set(title, r, c, v) { this.tab(title).grid.set(`${r},${c}`, v); }                      // 0-based
   get(title, r, c) { return this.tab(title).grid.get(`${r},${c}`) ?? ''; }
@@ -24,15 +25,16 @@ export class FakeSheets {
     return { spreadsheets: {
       values: {
         async get({ range }) { self.fail(); const p = self.parse(range); return { data: { values: self.rows(p.tab) } }; },
-        async batchUpdate({ requestBody }) { self.fail(); for (const d of requestBody.data) { const p = self.parse(d.range); d.values.forEach((row, i) => row.forEach((v, j) => self.set(p.tab, p.r + i, p.c + j, v))); self.writes.push(...requestBody.data.map(d => d.range)); } return { data: {} }; },
+        async batchUpdate({ requestBody }) { self.fail(); for (const d of requestBody.data) { const p = self.parse(d.range); if (p.c >= self.tab(p.tab).cols) throw new Error(`Invalid data[0]: Range (${d.range}) exceeds grid limits. Max rows: 644, max columns: ${self.tab(p.tab).cols}`); d.values.forEach((row, i) => row.forEach((v, j) => self.set(p.tab, p.r + i, p.c + j, v))); self.writes.push(...requestBody.data.map(d => d.range)); } return { data: {} }; },
         async update({ range, requestBody }) { self.fail(); const p = self.parse(range); requestBody.values.forEach((row, i) => row.forEach((v, j) => self.set(p.tab, p.r + i, p.c + j, v))); self.writes.push(range); return { data: {} }; },
         async append({ range, requestBody }) { self.fail(); const p = self.parse(range); const t = self.tab(p.tab); let last = -1; for (const k of t.grid.keys()) last = Math.max(last, +k.split(',')[0]); const start = last + 1; requestBody.values.forEach((row, i) => row.forEach((v, j) => self.set(p.tab, start + i, j, v))); self.writes.push(range); return { data: { updates: { updatedRange: `'${p.tab}'!A${start + 1}:P${start + requestBody.values.length}` } } }; }
       },
-      async get() { self.fail(); return { data: { sheets: [...self.tabs.values()].map(t => ({ properties: { sheetId: t.gid, title: t.title }, merges: t.merges })) } }; },
+      async get() { self.fail(); return { data: { sheets: [...self.tabs.values()].map(t => ({ properties: { sheetId: t.gid, title: t.title, gridProperties: { rowCount: 644, columnCount: t.cols } }, merges: t.merges })) } }; },
       async batchUpdate({ requestBody }) {
         self.fail(); const replies = [];
         for (const rq of requestBody.requests) {
           if (rq.addSheet) { const t = self.addTab(rq.addSheet.properties.title); replies.push({ addSheet: { properties: { sheetId: t.gid, title: t.title } } }); }
+          else if (rq.appendDimension) { const t = [...self.tabs.values()].find(x => x.gid === rq.appendDimension.sheetId); t.cols += rq.appendDimension.length; replies.push({}); }
           else if (rq.mergeCells) { const t = [...self.tabs.values()].find(x => x.gid === rq.mergeCells.range.sheetId); const r = rq.mergeCells.range; if (!t.merges.some(m => JSON.stringify(m) === JSON.stringify(r))) t.merges.push({ startRowIndex: r.startRowIndex, endRowIndex: r.endRowIndex, startColumnIndex: r.startColumnIndex, endColumnIndex: r.endColumnIndex }); replies.push({}); }
           else if (rq.repeatCell) { const t = [...self.tabs.values()].find(x => x.gid === rq.repeatCell.range.sheetId); t.formats.push(rq.repeatCell); replies.push({}); }
           else replies.push({});
