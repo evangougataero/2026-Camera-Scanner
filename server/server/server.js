@@ -7497,12 +7497,13 @@ function parseSellerLensEnumeration({
             .replace(/\s+/g, " ");
 
     /*
-      explicitFacts restates the description; don't
-      double count the same lens across those sources.
+      The title, the OCR'd description (which itself restates the
+      title, often twice: once in the header, once in the details
+      panel) and explicitFacts all describe the SAME items. Count a
+      lens signature once across every source; an explicit quantity
+      ("two lenses", "2x 50mm") is captured separately below.
     */
     if (
-      line.source ===
-        "explicitFacts" &&
       signaturesSeenInDescription.has(
         signature
       )
@@ -7510,14 +7511,9 @@ function parseSellerLensEnumeration({
       continue;
     }
 
-    if (
-      line.source !==
-      "explicitFacts"
-    ) {
-      signaturesSeenInDescription.add(
-        signature
-      );
-    }
+    signaturesSeenInDescription.add(
+      signature
+    );
 
     focal.keys.forEach(
       key => itemKeys.add(key)
@@ -7853,6 +7849,341 @@ function productHasUniqueLensOcr({
     value =>
       !claimedEndpoints.has(value)
   );
+}
+
+/*
+  ============================================================
+  SAME-FOCAL-LENGTH DUPLICATE LENS MERGE
+  ============================================================
+
+  Gallery analysis sometimes gives the SAME physical lens a second
+  ID in a later gallery (e.g. lens_1 in images 1-6, lens_2 in
+  image 8 with a filter screwed on). Visual identification then
+  returns slightly different variants for each (f/1.4 vs f/2), so
+  every identity-based duplicate check sees two "different" lenses
+  and the lot gets double-valued.
+
+  Rule: two lens products with the same focal length (50mm and
+  50mm, 18-55mm and 18-55mm) are ONE lens, regardless of aperture,
+  mount, generation or model, unless the seller explicitly says
+  the listing includes more than one lens at that focal length:
+    - a quantity next to the focal length: "2x 50mm", "two 50mm
+      lenses", "pair of 50mm", "50mm lenses x2", "50mm (2)";
+    - or the title / extracted seller facts name two different
+      versions of that focal length: "50mm f/1.8 and 50mm f/1.4".
+  Lenses with an unknown/incomplete focal length are not touched.
+
+  Survivor: the lens seen in the most images, then the higher
+  readability score, then the lower product number.
+  ============================================================
+*/
+const SELLER_QUANTITY_WORD_VALUES = {
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  pair: 2
+};
+
+function buildFocalLengthRegexSource(
+  focalKey
+) {
+  const match =
+    String(focalKey || "")
+      .match(
+        /^(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?mm$/
+      );
+
+  if (!match) {
+    return null;
+  }
+
+  const escape =
+    value =>
+      value.replace(/\./g, "\\.");
+
+  return match[2]
+    ? `(?<![\\d.])${escape(match[1])}\\s*[-–—]\\s*${escape(match[2])}\\s*mm`
+    : `(?<![\\d.\\-–—])${escape(match[1])}\\s*mm`;
+}
+
+function getSellerStatedCountForFocalLength({
+  focalKey,
+  listingTitle,
+  listingDescription,
+  explicitFacts
+}) {
+  const focalSource =
+    buildFocalLengthRegexSource(
+      focalKey
+    );
+
+  if (!focalSource) {
+    return 1;
+  }
+
+  const factStrings = [
+    ...(Array.isArray(explicitFacts?.explicitlyIncluded)
+      ? explicitFacts.explicitlyIncluded
+      : []),
+    ...(Array.isArray(explicitFacts?.listingNotes)
+      ? explicitFacts.listingNotes
+      : [])
+  ].map(value => String(value || ""));
+
+  const titleAndFacts =
+    [String(listingTitle || ""), ...factStrings]
+      .join("\n");
+
+  const allSellerText =
+    [titleAndFacts, String(listingDescription || "")]
+      .join("\n");
+
+  let count = 1;
+
+  /*
+    Quantity BEFORE the focal length. The lookbehind stops
+    "f/2 50mm", "1:2 50mm" or "#2 50mm" from reading as "2 x 50mm".
+  */
+  const beforePattern =
+    new RegExp(
+      `(?<![\\w/.:#-])(2|3|4|5|two|three|four|five|pair)(?:\\s*x\\b|\\b)(?:\\s+of)?[^\\n\\d]{0,25}?${focalSource}`,
+      "gi"
+    );
+
+  /*
+    Quantity AFTER the focal length: "50mm lenses x2", "50mm (2)".
+  */
+  const afterPattern =
+    new RegExp(
+      `${focalSource}[^\\n]{0,25}?(?:\\bx\\s*([2-5])\\b|\\(\\s*([2-5])\\s*\\))`,
+      "gi"
+    );
+
+  let match;
+
+  while ((match = beforePattern.exec(allSellerText)) !== null) {
+    const token = match[1].toLowerCase();
+    const value =
+      SELLER_QUANTITY_WORD_VALUES[token] ||
+      Number(token);
+
+    if (Number.isFinite(value)) {
+      count = Math.max(count, value);
+    }
+  }
+
+  while ((match = afterPattern.exec(allSellerText)) !== null) {
+    const value = Number(match[1] || match[2]);
+
+    if (Number.isFinite(value)) {
+      count = Math.max(count, value);
+    }
+  }
+
+  /*
+    Two different versions of the same focal length named by the
+    seller. Title + extracted facts only: the raw OCR description
+    can include other listings' tiles ("Today's picks").
+  */
+  const aperturePattern =
+    new RegExp(
+      `${focalSource}\\s*(?:f\\s*\\/?\\s*|1\\s*:\\s*)(\\d+(?:\\.\\d+)?)`,
+      "gi"
+    );
+
+  const apertures = new Set();
+
+  while ((match = aperturePattern.exec(titleAndFacts)) !== null) {
+    apertures.add(Number(match[1]));
+  }
+
+  return Math.max(count, apertures.size || 1);
+}
+
+function getLensFocalKeyForDuplicateCheck(
+  product
+) {
+  const identity =
+    product?.lensIdentity || {};
+
+  const candidates = [
+    identity.focalLength,
+    extractFocalLengthFromText(
+      identity.canonicalModel || ""
+    )
+  ];
+
+  for (const candidate of candidates) {
+    const key =
+      normalizeFocalForComparison(
+        candidate
+      );
+
+    if (
+      key &&
+      isCompleteLensfunFocalEvidence(
+        key
+      )
+    ) {
+      return key;
+    }
+  }
+
+  return null;
+}
+
+function identifySameFocalLengthDuplicateLenses({
+  primaryProducts,
+  galleryResults,
+  listingTitle,
+  listingDescription,
+  explicitFacts,
+  alreadySuppressedIds = new Set()
+}) {
+  const { registry } =
+    buildGalleryProductRegistry(
+      galleryResults
+    );
+
+  const groups = new Map();
+
+  (Array.isArray(primaryProducts) ? primaryProducts : [])
+    .forEach((product, order) => {
+      const productId =
+        String(product?.productId || "").trim();
+
+      if (
+        !productId ||
+        alreadySuppressedIds.has(productId) ||
+        !isLensProductType(product?.productType)
+      ) {
+        return;
+      }
+
+      const focalKey =
+        getLensFocalKeyForDuplicateCheck(
+          product
+        );
+
+      if (!focalKey) {
+        return;
+      }
+
+      const galleryEntry =
+        registry.get(productId);
+
+      const list =
+        groups.get(focalKey) || [];
+
+      list.push({
+        productId,
+        productType: product?.productType,
+        focalKey,
+        order,
+        imageCount:
+          galleryEntry?.visibleInImages?.size || 0,
+        maxReadability:
+          galleryEntry?.maxReadability || 0,
+        idNumber:
+          Number(
+            (productId.match(/(\d+)$/) || [])[1]
+          ) || Number.MAX_SAFE_INTEGER,
+        identity:
+          [
+            product?.lensIdentity?.brand,
+            product?.lensIdentity?.canonicalModel ||
+              [
+                product?.lensIdentity?.focalLength,
+                product?.lensIdentity?.maxAperture
+              ]
+                .filter(Boolean)
+                .join(" ")
+          ]
+            .filter(Boolean)
+            .join(" ")
+      });
+
+      groups.set(focalKey, list);
+    });
+
+  const removals = [];
+
+  for (const [focalKey, lenses] of groups) {
+    if (lenses.length < 2) {
+      continue;
+    }
+
+    const allowed =
+      getSellerStatedCountForFocalLength({
+        focalKey,
+        listingTitle,
+        listingDescription,
+        explicitFacts
+      });
+
+    if (lenses.length <= allowed) {
+      console.log(
+        "[SAME-FOCAL DUPLICATE] Keeping multiple lenses: seller explicitly lists that many.",
+        {
+          focalKey,
+          sellerStatedCount: allowed,
+          productIds:
+            lenses.map(lens => lens.productId)
+        }
+      );
+
+      continue;
+    }
+
+    const ranked =
+      [...lenses].sort(
+        (a, b) =>
+          b.imageCount - a.imageCount ||
+          b.maxReadability - a.maxReadability ||
+          a.idNumber - b.idNumber ||
+          a.order - b.order
+      );
+
+    const kept =
+      ranked.slice(0, allowed);
+
+    for (const duplicate of ranked.slice(allowed)) {
+      removals.push({
+        productId:
+          duplicate.productId,
+        productType:
+          duplicate.productType,
+        suppressedAsLikelyDuplicate:
+          true,
+        suppressedBy:
+          "same-focal-length",
+        reason:
+          `Same ${focalKey} focal length as ${kept
+            .map(lens => lens.productId)
+            .join(", ")}; the seller does not explicitly list ` +
+          `more than ${allowed} ${focalKey} lens(es), so this is ` +
+          `treated as the same physical lens (identity "${duplicate.identity || "unknown"}" ignored).`,
+        possibleDuplicateOf:
+          kept.map(lens => lens.productId),
+        evidence: {
+          focalKey,
+          sellerStatedCount: allowed,
+          kept: kept.map(lens => ({
+            productId: lens.productId,
+            identity: lens.identity,
+            imageCount: lens.imageCount
+          })),
+          removedIdentity:
+            duplicate.identity,
+          removedImageCount:
+            duplicate.imageCount
+        }
+      });
+    }
+  }
+
+  return removals;
 }
 
 function evaluateLikelyPhantomGalleryProducts({
@@ -13813,6 +14144,39 @@ for (const removal of nonSellableLensRemovals) {
   }
 }
 
+/*
+  Same-focal-length duplicate merge (see
+  identifySameFocalLengthDuplicateLenses). Runs on both passes,
+  after the other suppressions so it only compares lenses that
+  are still in play.
+*/
+const sameFocalDuplicateRemovals =
+  identifySameFocalLengthDuplicateLenses({
+    primaryProducts:
+      parsedPrimaryProducts,
+    galleryResults,
+    listingTitle,
+    listingDescription,
+    explicitFacts,
+    alreadySuppressedIds:
+      new Set(
+        suppressedGalleryProducts.map(
+          entry => entry.productId
+        )
+      )
+  });
+
+for (const removal of sameFocalDuplicateRemovals) {
+  console.warn(
+    "[SAME-FOCAL DUPLICATE] Merging duplicate lens product:",
+    removal
+  );
+
+  suppressedGalleryProducts.push(
+    removal
+  );
+}
+
 const suppressedGalleryProductIds =
   new Set(
     suppressedGalleryProducts.map(
@@ -15740,7 +16104,22 @@ function getGoogleSheetHitDate() {
   A header the scanner cannot find is NOT guessed: that value is
   skipped and a warning is printed, so nothing lands in the wrong place.
 */
-const MAIN_SHEET_MIN_WIDTH = 17; // keep the scanner's A:Q look (white fill, divider, right border)
+/*
+  The fill / divider / right border now stop at the last column that
+  has a header. (This used to be forced out to column Q, which kept a
+  blank column inside every listing block.)
+*/
+const MAIN_SHEET_MIN_WIDTH = 1;
+
+/*
+  Any header named "Notes" (or "Note", "Item Notes", ...) is a manual,
+  per-product column: one cell per primary item, never merged across
+  the listing's rows. Matches every such column, not just the first.
+*/
+const isPerItemNotesHeader = normalized =>
+  normalized === "note" ||
+  normalized === "notes" ||
+  normalized.endsWith("notes");
 
 const MAIN_SHEET_FIELDS = {
   name:               { legacy: 0,    test: n => n === "name" || n === "item" || n === "itemname" },
@@ -15798,6 +16177,9 @@ function resolveMainSheetColumns(headerRow) {
   const width = Math.max(MAIN_SHEET_MIN_WIDTH, lastHeader + 1, ...Object.values(index).map(i => i + 1));
 
   const perItem = new Set(MAIN_SHEET_PER_ITEM_FIELDS.map(f => index[f]).filter(i => i !== undefined));
+  headers.forEach((h, i) => {
+    if (isPerItemNotesHeader(normalizeSheetHeader(h))) perItem.add(i);
+  });
   const mergedColumns = [];
   for (let c = 0; c < width; c++) if (!perItem.has(c)) mergedColumns.push(c);
 
@@ -19168,9 +19550,79 @@ const MAX_RESALE_TO_ASK_RATIO = 2.5;
 */
 const SCAM_DETECTION_ENABLED = true;
 
+/*
+  ============================================================
+  LOT PROFIT FORMULA
+  ============================================================
+
+  Profit = total estimated resale of primary items
+         + $5 x number of primary items
+         - shipping fee
+         - purchase price
+         - 10.25% x (purchase price + shipping fee)
+
+  Buy Now   : profit at the asking price >= $35
+  Negotiate : profit at 15% below asking >= $35 (shipping unchanged)
+  Pass      : otherwise
+
+  maxBuyPrice is the purchase price at which profit is exactly $35.
+*/
+const LOT_MIN_PROFIT = 35;
+const LOT_PER_ITEM_ADJUSTMENT = 5;
+const LOT_PURCHASE_FEE_RATE = 0.1025;
+const LOT_NEGOTIATION_DISCOUNT = 0.15;
+
+function roundMoney(value) {
+  return Number(Number(value).toFixed(2));
+}
+
+function calculateLotProfit({
+  totalExpectedSalePrice,
+  primaryItemCount,
+  shippingFee,
+  purchasePrice
+}) {
+  const resale = Number(totalExpectedSalePrice) || 0;
+  const shipping = Number(shippingFee) || 0;
+  const price = Number(purchasePrice) || 0;
+  const itemAdjustment =
+    LOT_PER_ITEM_ADJUSTMENT * (Number(primaryItemCount) || 0);
+
+  return roundMoney(
+    resale +
+    itemAdjustment -
+    shipping -
+    price -
+    LOT_PURCHASE_FEE_RATE * (price + shipping)
+  );
+}
+
+function calculateLotMaxBuyPrice({
+  totalExpectedSalePrice,
+  primaryItemCount,
+  shippingFee
+}) {
+  const resale = Number(totalExpectedSalePrice) || 0;
+  const shipping = Number(shippingFee) || 0;
+  const itemAdjustment =
+    LOT_PER_ITEM_ADJUSTMENT * (Number(primaryItemCount) || 0);
+
+  return roundMoney(
+    (
+      resale +
+      itemAdjustment -
+      shipping * (1 + LOT_PURCHASE_FEE_RATE) -
+      LOT_MIN_PROFIT
+    ) /
+    (1 + LOT_PURCHASE_FEE_RATE)
+  );
+}
+
 function makeLotDecision({
   totalExpectedSalePrice,
-  facebookPrice
+  facebookPrice,
+  profitAtAsk,
+  profitAtNegotiated
 }) {
   if (!totalExpectedSalePrice || !facebookPrice) {
     return {
@@ -19190,11 +19642,8 @@ function makeLotDecision({
   );
 
   /*
-    Scam safeguard:
-
-    If the combined estimated resale value of every
-    included item is more than 2x the Facebook asking
-    price, prevent the listing from becoming a hit.
+    Scam safeguard (unchanged): combined resale more than
+    MAX_RESALE_TO_ASK_RATIO x the asking price.
   */
   if (
     SCAM_DETECTION_ENABLED &&
@@ -19214,45 +19663,26 @@ function makeLotDecision({
     };
   }
 
-  const targetProfit = 85;
-
-  const negotiatedPrice15 = Number(
-    (facebookPrice * 0.85).toFixed(2)
-  );
-
-  const profitAtAsk = Number(
-    (
-      totalExpectedSalePrice -
-      facebookPrice
-    ).toFixed(2)
-  );
-
-  const profitAt15 = Number(
-    (
-      totalExpectedSalePrice -
-      negotiatedPrice15
-    ).toFixed(2)
-  );
-
-  if (profitAtAsk >= targetProfit) {
+  if (profitAtAsk >= LOT_MIN_PROFIT) {
     return {
       recommendation: "Buy Now",
       reason:
-        `Using the estimated resale values, the lot clears the ` +
-        `$85 target at asking price with a $${profitAtAsk} ` +
-        `estimated profit.`,
+        `Estimated profit at asking price is $${profitAtAsk} ` +
+        `(after shipping, the ${LOT_PURCHASE_FEE_RATE * 100}% fee and ` +
+        `the $${LOT_PER_ITEM_ADJUSTMENT}/item adjustment), clearing ` +
+        `the $${LOT_MIN_PROFIT} target.`,
       scamFlag: false,
       resaleToAskRatio
     };
   }
 
-  if (profitAt15 >= targetProfit) {
+  if (profitAtNegotiated >= LOT_MIN_PROFIT) {
     return {
       recommendation: "Negotiate",
       reason:
-        `Using the estimated resale values, the lot does not clear the ` +
-        `$85 target at asking price, but it reaches a ` +
-        `$${profitAt15} estimated profit at 15% below ask.`,
+        `Estimated profit at asking price is $${profitAtAsk}, below ` +
+        `the $${LOT_MIN_PROFIT} target, but it reaches ` +
+        `$${profitAtNegotiated} at ${LOT_NEGOTIATION_DISCOUNT * 100}% below ask.`,
       scamFlag: false,
       resaleToAskRatio
     };
@@ -19261,8 +19691,9 @@ function makeLotDecision({
   return {
     recommendation: "Pass",
     reason:
-      `Using the estimated resale values, even buying 15% below asking ` +
-      `price does not clear the $85 target.`,
+      `Estimated profit is $${profitAtAsk} at asking price and ` +
+      `$${profitAtNegotiated} at ${LOT_NEGOTIATION_DISCOUNT * 100}% below ask; ` +
+      `neither clears the $${LOT_MIN_PROFIT} target.`,
     scamFlag: false,
     resaleToAskRatio
   };
@@ -19393,21 +19824,88 @@ reason:
         .toFixed(2)
     );
 
+    /*
+      Shipping fee comes from the listing OCR (content.js). Missing
+      = $0, logged so it is visible in the analysis log.
+    */
+    const shippingFeeValue =
+      Number(context.shippingFee);
+
+    const shippingFee =
+      Number.isFinite(shippingFeeValue) &&
+      shippingFeeValue >= 0
+        ? roundMoney(shippingFeeValue)
+        : 0;
+
+    if (
+      !Number.isFinite(shippingFeeValue)
+    ) {
+      console.warn(
+        "[EVALUATE LOT] No shipping fee in context; using $0."
+      );
+    }
+
+    /*
+      Primary items only. content.js sends the count of every
+      primary sellable item; fall back to counting the results.
+    */
+    const contextPrimaryCount =
+      Number(context.primaryItemCount);
+
+    const primaryItemCount =
+      Number.isFinite(contextPrimaryCount) &&
+      contextPrimaryCount > 0
+        ? contextPrimaryCount
+        : items.filter(
+            item =>
+              item?.isPrimarySellableItem !== false
+          ).length;
+
+    const profitInputs = {
+      totalExpectedSalePrice,
+      primaryItemCount,
+      shippingFee
+    };
+
     const spreadAtAsk = facebookPrice
-      ? Number((totalExpectedSalePrice - facebookPrice).toFixed(2))
+      ? calculateLotProfit({
+          ...profitInputs,
+          purchasePrice: facebookPrice
+        })
       : null;
 
     const spreadAt15 = facebookPrice && negotiatedPrice15
-      ? Number((totalExpectedSalePrice - negotiatedPrice15).toFixed(2))
+      ? calculateLotProfit({
+          ...profitInputs,
+          purchasePrice: negotiatedPrice15
+        })
       : null;
 
     const maxBuyPrice = totalExpectedSalePrice
-      ? Number((totalExpectedSalePrice - 85).toFixed(2))
+      ? calculateLotMaxBuyPrice(profitInputs)
       : null;
+
+    console.log(
+      "[EVALUATE LOT] Profit:",
+      {
+        totalExpectedSalePrice,
+        primaryItemCount,
+        perItemAdjustment:
+          LOT_PER_ITEM_ADJUSTMENT * primaryItemCount,
+        shippingFee,
+        facebookPrice,
+        profitAtAsk: spreadAtAsk,
+        negotiatedPrice15,
+        profitAt15: spreadAt15,
+        maxBuyPrice
+      }
+    );
 
     const decision = makeLotDecision({
       totalExpectedSalePrice,
-      facebookPrice
+      facebookPrice,
+      profitAtAsk: spreadAtAsk,
+      profitAtNegotiated: spreadAt15
     });
 
     res.json({
@@ -19425,8 +19923,16 @@ reason:
   facebookPrice,
       negotiatedPrice15,
       totalExpectedSalePrice,
+      shippingFee,
+      primaryItemCount,
       profitAtAsk: spreadAtAsk,
       profitAt15: spreadAt15,
+      /*
+        The extension UI, library and Sheets read the legacy
+        "35" field names for the negotiated scenario.
+      */
+      negotiatedPrice35: negotiatedPrice15,
+      profitAt35: spreadAt15,
       maxBuyPrice,
       items,
       ignoredItems: context.ignoredItems || []

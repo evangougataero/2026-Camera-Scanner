@@ -8401,6 +8401,96 @@ function extractFacebookAskingPriceFromOcr(ocrText, title) {
 }
 
 /*
+  ============================================================
+  SHIPPING FEE FROM LISTING OCR
+
+  Marketplace renders shipping directly under the asking price:
+
+    $214
+    Ships for $14.03
+    Estimated arrival Nov 4 - Nov 7
+
+  or "Free shipping". Other listing tiles on the page can show
+  their own "Ships for" lines, so look first in the few lines that
+  follow the listing's own price line, and only fall back to the
+  first shipping line anywhere in the OCR.
+
+  Returns a number (0 for free shipping) or null when no shipping
+  information is visible.
+  ============================================================
+*/
+function extractShippingFeeFromOcr(ocrText, askingPrice) {
+  const lines =
+    String(ocrText || "")
+      .split("\n")
+      .map(line => line.trim())
+      .filter(Boolean);
+
+  const parseShippingLine = line => {
+    if (/\bfree shipping\b|\bships? (?:for )?free\b/i.test(line)) {
+      return 0;
+    }
+
+    const match =
+      line.match(
+        /\b(?:ships for|shipping(?: fee| cost)?:?|\+)\s*\$\s?([\d,]+(?:\.\d{1,2})?)/i
+      ) ||
+      line.match(
+        /\$\s?([\d,]+(?:\.\d{1,2})?)\s*shipping\b/i
+      );
+
+    if (!match) {
+      return null;
+    }
+
+    const value =
+      Number(match[1].replace(/,/g, ""));
+
+    return Number.isFinite(value) && value >= 0 && value < 1000
+      ? value
+      : null;
+  };
+
+  if (Number.isFinite(Number(askingPrice))) {
+    const priceIndex =
+      lines.findIndex(line => {
+        const match =
+          line.match(/^\$\s?([\d,]+(?:\.\d{1,2})?)/);
+
+        return (
+          match &&
+          Number(match[1].replace(/,/g, "")) ===
+            Number(askingPrice)
+        );
+      });
+
+    if (priceIndex !== -1) {
+      for (
+        let i = priceIndex;
+        i < Math.min(priceIndex + 6, lines.length);
+        i++
+      ) {
+        const fee = parseShippingLine(lines[i]);
+
+        if (fee != null) {
+          return fee;
+        }
+      }
+    }
+  }
+
+  for (const line of lines) {
+    const fee = parseShippingLine(line);
+
+    if (fee != null) {
+      return fee;
+    }
+  }
+
+  return null;
+}
+
+/*
   Every dollar amount that appears anywhere in the OCR text.
   Used to sanity-check a DOM-scraped price: if the DOM price
   is not visible anywhere in the listing screenshot, it came
@@ -10733,6 +10823,27 @@ if (ocrAnchoredPrice != null) {
       ")"
     );
   }
+}
+
+/*
+  Shipping fee for the profit calculation (see
+  extractShippingFeeFromOcr). Raw OCR is used, same as price.
+*/
+const shippingFee =
+  extractShippingFeeFromOcr(
+    listingScreenshotOcrRaw,
+    facebookPrice
+  );
+
+console.log(
+  "[STEP 1A] Shipping fee from OCR:",
+  shippingFee
+);
+
+if (shippingFee == null) {
+  console.warn(
+    "[STEP 1A] No shipping fee visible in listing OCR; profit will be calculated with $0 shipping."
+  );
 }
 
 /*
@@ -13403,6 +13514,16 @@ await chrome.storage.local.set({
 
     facebookPrice,
 
+    shippingFee,
+
+    /*
+      Every primary sellable item in the listing, including ones
+      priced from the database, so the server's $5-per-item
+      adjustment counts all of them.
+    */
+    primaryItemCount:
+      primaryItems.length,
+
     facebookUrl,
 
     imageUrls:
@@ -14458,10 +14579,11 @@ function showLotCompPanel(result) {
     <div style="font-size:20px; font-weight:800; margin-bottom:10px;">${escapeHtml(result.recommendation || "Unknown")}</div>
 
     <div><b>Facebook ask:</b> ${result.facebookPrice ? "$" + result.facebookPrice : "Not detected"}</div>
-<div><b>35% negotiated price:</b> ${result.negotiatedPrice35 ? "$" + result.negotiatedPrice35 : "N/A"}</div>
+<div><b>Shipping fee:</b> ${result.shippingFee != null ? "$" + result.shippingFee : "N/A"}</div>
+<div><b>15% negotiated price:</b> ${result.negotiatedPrice35 ? "$" + result.negotiatedPrice35 : "N/A"}</div>
 <div><b>Estimated resale value:</b> ${result.totalExpectedSalePrice != null ? "$" + result.totalExpectedSalePrice : "N/A"}</div>
 <div><b>Profit at ask:</b> ${result.profitAtAsk != null ? "$" + result.profitAtAsk : "N/A"}</div>
-<div><b>Profit at 35% off:</b> ${result.profitAt35 != null ? "$" + result.profitAt35 : "N/A"}</div>
+<div><b>Profit at 15% off:</b> ${result.profitAt35 != null ? "$" + result.profitAt35 : "N/A"}</div>
 <div><b>Max buy price:</b> ${result.maxBuyPrice != null ? "$" + result.maxBuyPrice : "N/A"}</div>
 
     <hr style="margin:10px 0;" />
