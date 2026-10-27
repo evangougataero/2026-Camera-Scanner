@@ -7455,8 +7455,15 @@ function extractFocalInfoFromText(
   const keys = new Set();
   const endpoints = new Set();
 
+  /*
+    "35mm Film Camera" / "35mm SLR" name the film FORMAT, not a
+    35mm lens. Strip those before reading focal lengths.
+  */
   let remaining =
-    String(text || "");
+    String(text || "").replace(
+      /\b(?:35|16|8)\s*mm\s+(?=film\b|camera\b|slr\b|rangefinder\b|format\b|point\b|cartridge\b|movie\b)/gi,
+      " "
+    );
 
   const rangePattern =
     /(\d{1,3}(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d{1,3}(?:\.\d+)?)\s*mm/gi;
@@ -7980,6 +7987,279 @@ function productHasUniqueLensOcr({
 
 /*
   ============================================================
+  LENS FIELD GROUNDING (own OCR + seller text)
+  ============================================================
+
+  Step 5 sees every product's OCR at once and sometimes copies a
+  focal length / aperture from a NEIGHBOURING product, or reads a
+  stray number off a distance/aperture scale ("1.2", "1.5") as the
+  lens speed. Example: a Canon FD 50mm f/1.8 came back as
+  "50mm f/1.2" with evidence ["50mm","Canon"], and the f/1.2 was
+  priced as a ~$289 lens.
+
+  Rule: when we HAVE OCR for a lens product, its focal length and
+  maximum aperture must be visible in that product's own OCR or in
+  the seller's text. Unsupported values are removed so the existing
+  sufficiency check treats the lens as unresolved and routes it to
+  visual identification instead of pricing an invented identity.
+  A lens with no OCR at all is left untouched (nothing to verify).
+  ============================================================
+*/
+function getProductOwnOcrText(productId, productOcrResults) {
+  return (Array.isArray(productOcrResults) ? productOcrResults : [])
+    .filter(
+      entry => String(entry?.productId || "").trim() === productId
+    )
+    .map(entry => String(entry?.ocrText || ""))
+    .join("\n");
+}
+
+function textShowsAperture(text, apertureValue, focalValue) {
+  const value = String(apertureValue).replace(/\./g, "\\.");
+  const lensSpeedForm = new RegExp(
+    `(?:\\bf\\s*[/:]?\\s*|\\b1\\s*[:/]\\s*)${value}(?![\\d])`,
+    "i"
+  );
+
+  if (lensSpeedForm.test(text)) {
+    return true;
+  }
+
+  if (focalValue) {
+    const focal = String(focalValue).replace(/\./g, "\\.");
+    const afterFocal = new RegExp(
+      `${focal}\\s*mm?\\s*[,/:\\-]?\\s*(?:f\\s*[/:]?\\s*|1\\s*[:/]\\s*)?${value}(?![\\d])`,
+      "i"
+    );
+
+    if (afterFocal.test(text)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function groundLensIdentitiesAgainstOwnEvidence({
+  primaryProducts,
+  productOcrResults,
+  listingTitle,
+  listingDescription,
+  explicitFacts
+}) {
+  const sellerText = [
+    String(listingTitle || ""),
+    String(listingDescription || ""),
+    ...(Array.isArray(explicitFacts?.explicitlyIncluded)
+      ? explicitFacts.explicitlyIncluded
+      : []),
+    ...(Array.isArray(explicitFacts?.listingNotes)
+      ? explicitFacts.listingNotes
+      : [])
+  ].map(value => String(value || "")).join("\n");
+
+  const cleanedSellerText = sellerText.replace(
+    /\b(?:35|16|8)\s*mm\s+(?=film\b|camera\b|slr\b|rangefinder\b)/gi,
+    " "
+  );
+
+  const removals = [];
+
+  for (const product of Array.isArray(primaryProducts) ? primaryProducts : []) {
+    if (!isLensProductType(product?.productType) || !product?.lensIdentity) {
+      continue;
+    }
+
+    const productId = String(product.productId || "").trim();
+    const ownText = getProductOwnOcrText(productId, productOcrResults);
+
+    if (ownText.replace(/\s+/g, "").length < 8) {
+      continue;
+    }
+
+    const combinedText = `${ownText}\n${cleanedSellerText}`;
+    const identity = product.lensIdentity;
+    const dropped = [];
+
+    // Focal length: every endpoint must appear as a number.
+    const focalInfo = extractFocalInfoFromText(identity.focalLength || "");
+
+    if (focalInfo.endpoints.size) {
+      const supported = Array.from(focalInfo.endpoints).every(endpoint => {
+        const number = String(endpoint).replace(/\./g, "\\.");
+        return new RegExp(`(?<![\\d.:/])${number}(?![\\d.])`).test(combinedText);
+      });
+
+      if (!supported) {
+        dropped.push({ field: "focalLength", value: identity.focalLength });
+        identity.focalLength = null;
+      }
+    }
+
+    // Maximum aperture: first number must appear in lens-speed form.
+    const apertureMatch = String(identity.maxAperture || "").match(/\d+(?:\.\d+)?/);
+
+    if (apertureMatch) {
+      const focalKey =
+        identity.focalLength
+          ? String(
+              (extractFocalInfoFromText(identity.focalLength).keys.values().next().value || "")
+                .replace(/mm$/, "")
+            ).split("-")[0]
+          : "";
+
+      if (!textShowsAperture(combinedText, apertureMatch[0], focalKey)) {
+        dropped.push({ field: "maxAperture", value: identity.maxAperture });
+        identity.maxAperture = null;
+      }
+    }
+
+    if (dropped.length) {
+      removals.push({
+        productId,
+        dropped,
+        evidenceWas: product.extracted_evidence || []
+      });
+    }
+  }
+
+  return removals;
+}
+
+/*
+  ============================================================
+  PHOTO-ONLY CAMERA BODY REMOVAL
+  ============================================================
+
+  A seller often photographs a lens mounted on / next to a camera
+  they are NOT selling (or a camera sits in the background of
+  another lens's photo). When the seller's own text offers only
+  lens(es)/lens accessories and never names or describes a body,
+  a camera body that exists only in the photos is not part of the
+  sale.
+
+  Conservative: the body is KEPT unless ALL of these hold:
+    - Step 1 produced a non-empty explicitlyIncluded list and every
+      entry is a lens or lens accessory;
+    - the title also reads as a lens (and names no body);
+    - the body's model is not mentioned in title/included/notes;
+    - no "kit/bundle/combo/package" wording and no "with/includes
+      camera|body" wording anywhere in the seller text.
+  Sparse listings (empty explicitlyIncluded) are never touched.
+  ============================================================
+*/
+const LENS_OR_LENS_ACCESSORY_TEXT =
+  /\blens(?:es)?\b|\b\d{1,3}(?:\.\d+)?(?:\s*[-–—]\s*\d{1,3}(?:\.\d+)?)?\s*mm\b|\b(?:hood|caps?|filter|case|pouch|strap|adapter|adaptor|teleconverter|converter|box|manual|bag|coating)\b/i;
+
+const CAMERA_BODY_WORDS =
+  /\b(?:camera|body|slr|dslr|mirrorless|rangefinder|viewfinder)\b/i;
+
+function textNamesCameraBody(text) {
+  return CAMERA_BODY_WORDS.test(
+    String(text || "").replace(/\bcamera\s+lens(?:es)?\b/gi, " ")
+  );
+}
+
+function identifyPhotoOnlyCameraBodies({
+  primaryProducts,
+  listingTitle,
+  listingDescription,
+  explicitFacts,
+  alreadySuppressedIds = new Set()
+}) {
+  const included = (
+    Array.isArray(explicitFacts?.explicitlyIncluded)
+      ? explicitFacts.explicitlyIncluded
+      : []
+  )
+    .map(entry =>
+      typeof entry === "string"
+        ? entry
+        : String(entry?.text || entry?.item || entry?.name || "")
+    )
+    .map(entry => entry.trim())
+    .filter(Boolean);
+
+  const notes = (
+    Array.isArray(explicitFacts?.listingNotes) ? explicitFacts.listingNotes : []
+  ).map(value => String(value || ""));
+
+  const title = String(listingTitle || "");
+
+  const lensOnlyIncluded =
+    included.length > 0 &&
+    included.every(
+      entry =>
+        LENS_OR_LENS_ACCESSORY_TEXT.test(entry) &&
+        !textNamesCameraBody(entry)
+    );
+
+  const titleLooksLikeLens =
+    LENS_OR_LENS_ACCESSORY_TEXT.test(title) && !textNamesCameraBody(title);
+
+  if (!lensOnlyIncluded || !titleLooksLikeLens) {
+    return [];
+  }
+
+  const core = [title, ...included, ...notes].join("\n");
+
+  if (/\b(?:kit|bundle|combo|package)\b/i.test(core)) {
+    return [];
+  }
+
+  const offersCamera =
+    /\b(?:with|includes?|including|included|plus|and)\s+(?:the\s+|a\s+|an\s+)?(?:[\w-]+\s+){0,2}(?:camera\s+body|body|camera)\b(?!\s+(?:lens|cap))/i;
+
+  if (offersCamera.test(`${core}\n${String(listingDescription || "")}`)) {
+    return [];
+  }
+
+  const normalizedCore =
+    ` ${core.toLowerCase().replace(/[^a-z0-9]+/g, " ")} `;
+
+  const removals = [];
+
+  for (const product of Array.isArray(primaryProducts) ? primaryProducts : []) {
+    const productId = String(product?.productId || "").trim();
+
+    if (
+      !productId ||
+      alreadySuppressedIds.has(productId) ||
+      isLensProductType(product?.productType) ||
+      !/\bcamera\b|\bbody\b/i.test(String(product?.productType || ""))
+    ) {
+      continue;
+    }
+
+    const modelText =
+      String(product?.model || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+    if (modelText.length >= 2 && normalizedCore.includes(` ${modelText} `)) {
+      continue;
+    }
+
+    removals.push({
+      productId,
+      productType: product.productType,
+      suppressedAsPhotoOnlyBody: true,
+      suppressedBy: "photo-only-camera-body",
+      reason:
+        `Removed: the seller's text offers only lens(es) (${included.join("; ")}) ` +
+        `and never mentions a camera body or "${product?.model || "this body"}". ` +
+        `The body appears in the photos but is not part of the sale.`,
+      evidence: {
+        brand: product?.brand || null,
+        model: product?.model || null,
+        explicitlyIncluded: included
+      }
+    });
+  }
+
+  return removals;
+}
+
+/*
+  ============================================================
   SAME-FOCAL-LENGTH DUPLICATE LENS MERGE
   ============================================================
 
@@ -8212,6 +8492,11 @@ function identifySameFocalLengthDuplicateLenses({
           galleryEntry?.visibleInImages?.size || 0,
         maxReadability:
           galleryEntry?.maxReadability || 0,
+        completeness:
+          (product?.lensIdentity?.focalLength ? 1 : 0) +
+          (product?.lensIdentity?.maxAperture ? 1 : 0) +
+          ((product?.lensIdentity?.modelCodes || []).length ? 1 : 0) +
+          (product?.lensIdentity?.generation ? 1 : 0),
         idNumber:
           Number(
             (productId.match(/(\d+)$/) || [])[1]
@@ -8266,6 +8551,7 @@ function identifySameFocalLengthDuplicateLenses({
     const ranked =
       [...lenses].sort(
         (a, b) =>
+          b.completeness - a.completeness ||
           b.imageCount - a.imageCount ||
           b.maxReadability - a.maxReadability ||
           a.idNumber - b.idNumber ||
@@ -14488,6 +14774,23 @@ if (!isPostDataForSeoPass) {
           sanitizeStep5Product
         )
       : [];
+
+  const lensGroundingRemovals =
+    groundLensIdentitiesAgainstOwnEvidence({
+      primaryProducts:
+        parsedPrimaryProducts,
+      productOcrResults,
+      listingTitle,
+      listingDescription,
+      explicitFacts
+    });
+
+  for (const removal of lensGroundingRemovals) {
+    console.warn(
+      "[LENS GROUNDING] Removed lens fields not visible in the product's own OCR or the seller text:",
+      removal
+    );
+  }
 }
 
 
@@ -14583,6 +14886,36 @@ const sellerExcludedLensRemovals =
 for (const removal of sellerExcludedLensRemovals) {
   console.warn(
     "[SELLER-EXCLUDED LENS] Removing lens the seller says is not included:",
+    removal
+  );
+
+  suppressedGalleryProducts.push(
+    removal
+  );
+}
+
+/*
+  Camera bodies that only exist in the photos while the seller's
+  text offers lens(es) only (see identifyPhotoOnlyCameraBodies).
+*/
+const photoOnlyBodyRemovals =
+  identifyPhotoOnlyCameraBodies({
+    primaryProducts:
+      parsedPrimaryProducts,
+    listingTitle,
+    listingDescription,
+    explicitFacts,
+    alreadySuppressedIds:
+      new Set(
+        suppressedGalleryProducts.map(
+          entry => entry.productId
+        )
+      )
+  });
+
+for (const removal of photoOnlyBodyRemovals) {
+  console.warn(
+    "[PHOTO-ONLY BODY] Removing camera body the seller does not offer:",
     removal
   );
 
@@ -16544,7 +16877,12 @@ function getGoogleSheetHitDate() {
 
     Name | Facebook Link | Decision | Ask Price | Estimated Resale... |
     Price Deviation | Manual Evaluation | Threshold Buy | Log Link |
-    Date | Purchase (Y/N) (receives the Checklist link) | Relisted (optional)
+    Date | Checklist (receives the checklist link) | Relisted (optional)
+
+  "Purchase (Y/N)" is NOT the checklist column: it is a manual column
+  the scanner leaves blank for you to fill in. The checklist link goes
+  under a header named "Checklist" (or "Purchase Checklist" /
+  "Checklist Link"); if no such header exists the link is not written.
 
   Any other header (Notes, Interested?, Total Acquisition, ...) is a
   manual column: the scanner leaves it blank and never fills it.
@@ -16579,7 +16917,7 @@ const MAIN_SHEET_FIELDS = {
   thresholdBuy:       { legacy: 7,    test: n => n.startsWith("thresholdbuy") || n === "maxbuy" || n === "maxbuyprice" },
   logLink:            { legacy: 8,    test: n => n === "loglink" || n === "analysislog" || n === "viewlog" },
   date:               { legacy: null, test: n => n === "date" || n === "hitdate" || n === "datefound" || n === "dateadded" },
-  checklist:          { legacy: null, test: n => n === "purchaseyn" || n === "purchase" || n === "purchasechecklist" || n === "checklist" },
+  checklist:          { legacy: null, test: n => n === "checklist" || n === "purchasechecklist" || n === "checklistlink" },
   relisted:           { legacy: null, test: n => n === "relisted" || n === "relistedyn" },
   ongoingConversation:{ legacy: null, test: n => n.startsWith("ongoingconversation") || n === "conversation" },
   followUp:           { legacy: null, test: n => n === "followup" || n === "followupdue" }
@@ -17172,7 +17510,7 @@ requests.push({
   Total Acquisition, Agreed to Price, Notes, Interested?) are cleared
   for the new rows so nothing is inherited from the row above.
   Name / URL / Decision / Ask / Resale / Deviation / Threshold / Log /
-  Date / Purchase / Relisted are scanner-filled and are never cleared.
+  Date / Checklist / Relisted are scanner-filled and are never cleared.
 */
 for (const [runStart, runEnd] of sheetColumnRuns(sheetColumns.manualColumns)) {
   requests.push({

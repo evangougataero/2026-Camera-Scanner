@@ -8053,9 +8053,102 @@ function parsePriceValue(value) {
   call and before pricing). Any detection skips the listing.
   ============================================================
 */
+/*
+  NO-BUY MODEL LIST (extends the original PowerShot skip)
+
+  Add a model family by appending it to one of the arrays below;
+  nothing else needs to change.
+
+  strong: distinctive names. Matched in the listing TITLE (as
+          "<brand> <family>") and in resolved non-lens items.
+  weak:   short/generic names ("AF", "Zoom", "Dial"...) that
+          would collide with lenses and accessories in free
+          text. Matched ONLY against the resolved model name of
+          a non-lens item, and only at the START of the model
+          (e.g. "AF600" matches, "AF-S Nikkor 50mm" is a lens
+          and is never checked).
+*/
+const NO_BUY_MODEL_FAMILIES = {
+  canon: {
+    strong: [
+      "Sure Shot", "IXY", "IXY Digital", "IXUS", "Digital IXUS",
+      "ELPH", "Digital ELPH", "Prima", "Autoboy", "Snappy",
+      "Sprint", "Top Shot", "Photura", "Epoca", "AF35M",
+      "AF35ML", "Canonet", "Autoboy Luna", "Prima Super",
+      "Sure Shot Zoom", "Sure Shot Tele", "Sure Shot Max",
+      "Sure Shot Supreme", "Sure Shot Classic",
+      "Sure Shot Sleek", "Sure Shot Z", "Sure Shot WP-1",
+      "Sure Shot A-1"
+    ],
+    weak: ["Owl", "Demi", "Dial"]
+  },
+  nikon: {
+    strong: [
+      "Coolpix", "One Touch", "Lite Touch", "Zoom Touch",
+      "Fun Touch", "Nice Touch", "Easy Touch", "Action Touch",
+      "Tele Touch", "Nuvis", "Pikaichi", "L35AF", "L35AD",
+      "L35AW AF", "L135AF", "28Ti", "35Ti", "W35"
+    ],
+    weak: ["Mini", "Zoom", "TW", "AF", "EF", "RF", "RD"]
+  }
+};
+
+/*
+  Extra per-brand patterns that are not simple name prefixes.
+  Matched against the normalized model name (start of model) and,
+  prefixed with the brand, against the normalized title.
+*/
+const NO_BUY_EXTRA_MODEL_PATTERNS = {
+  // PowerShot G7 / G7 X (Mark II, III)
+  canon: [/g\s*7\s*x?(?![a-z0-9])/],
+  nikon: []
+};
+
+function normalizeNoBuyText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function noBuyFamilyToPattern(family) {
+  return normalizeNoBuyText(family)
+    .split(" ")
+    .map(part => part.replace(/([a-z])(?=\d)|(\d)(?=[a-z])/g, "$1$2 ").split(" ").filter(Boolean).join("\\s*"))
+    .join("\\s*");
+}
+
+const NO_BUY_COMPILED = Object.keys(NO_BUY_MODEL_FAMILIES).map(brand => {
+  const fam = NO_BUY_MODEL_FAMILIES[brand];
+  const strong = fam.strong.map(noBuyFamilyToPattern);
+  const all = strong.concat(fam.weak.map(noBuyFamilyToPattern));
+  const extra = (NO_BUY_EXTRA_MODEL_PATTERNS[brand] || []).map(r => r.source);
+  return {
+    brand,
+    titleRegex: new RegExp(
+      `\\b${brand}\\s+(?:${strong.concat(extra).join("|")})`
+    ),
+    modelRegex: new RegExp(
+      `^(?:${all.concat(extra).join("|")})(?![a-z])`
+    )
+  };
+});
+
+function isLensProductType(productType) {
+  return /\blens\b/i.test(String(productType || ""));
+}
+
 function isCanonPowerShotText(text) {
-  return /power\s*-?\s*shot/i.test(
-    String(text || "")
+  const raw = String(text || "");
+
+  if (/power\s*-?\s*shot/i.test(raw)) {
+    return true;
+  }
+
+  const normalized = normalizeNoBuyText(raw);
+
+  return NO_BUY_COMPILED.some(
+    entry => entry.titleRegex.test(normalized)
   );
 }
 
@@ -8064,12 +8157,41 @@ function findCanonPowerShotPrimaryItems(items) {
     Array.isArray(items)
       ? items
       : []
-  ).filter(
-    item =>
+  ).filter(item => {
+    const modelText =
+      `${item?.model || ""} ${item?.nonLensIdentity?.modelName || ""}`;
+
+    if (
       isCanonPowerShotText(
-        `${item?.brand || ""} ${item?.model || ""} ${item?.nonLensIdentity?.modelName || ""}`
+        `${item?.brand || ""} ${modelText}`
       )
-  );
+    ) {
+      return true;
+    }
+
+    // Family-prefix check, non-lens items only.
+    if (isLensProductType(item?.productType)) {
+      return false;
+    }
+
+    const brand = normalizeNoBuyText(item?.brand);
+
+    return NO_BUY_COMPILED.some(entry => {
+      if (!brand.includes(entry.brand)) {
+        return false;
+      }
+
+      return [
+        item?.model,
+        item?.nonLensIdentity?.modelName
+      ].some(value => {
+        const model = normalizeNoBuyText(value)
+          .replace(new RegExp(`^${entry.brand}\\s+`), "");
+
+        return model && entry.modelRegex.test(model);
+      });
+    });
+  });
 }
 
 function buildCanonPowerShotPassResult({
@@ -8082,7 +8204,7 @@ function buildCanonPowerShotPassResult({
       "Pass",
 
     reason:
-      `Immediate skip: Canon PowerShot detected (${detectedFrom}). PowerShot listings are not analyzed.`,
+      `Immediate skip: no-buy camera model detected (${detectedFrom}). These listings are not analyzed.`,
 
     facebookPrice,
 
