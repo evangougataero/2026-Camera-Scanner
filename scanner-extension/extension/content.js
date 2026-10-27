@@ -4368,6 +4368,144 @@ function getFacebookMarketplaceItemId(url = window.location.href) {
   }
 }
 
+/*
+  ============================================================
+  LISTING CLAIM LIFECYCLE: reserve -> confirm (done) / release
+
+  claimMarketplaceListingId() only RESERVES a listing. It becomes
+  permanently "processed" when markMarketplaceAutoAnalysisComplete()
+  confirms a real result, and is RELEASED when the analysis fails
+  (error / timeout / no credits). A released listing is also kept out
+  of THIS browser's selection for a short cooldown so a persistent
+  failure cannot make the scanner re-open the same listing in a loop.
+  ============================================================
+*/
+const RELEASED_LISTING_COOLDOWN_KEY =
+  "marketplaceReleasedListingCooldown";
+
+const RELEASED_LISTING_COOLDOWN_MS =
+  15 * 60 * 1000;
+
+async function getRecentlyReleasedListingIds() {
+  try {
+    const stored =
+      await chrome.storage.local.get(
+        RELEASED_LISTING_COOLDOWN_KEY
+      );
+
+    const map =
+      stored[RELEASED_LISTING_COOLDOWN_KEY] || {};
+
+    const now = Date.now();
+
+    return Object.keys(map).filter(
+      id => now - Number(map[id] || 0) < RELEASED_LISTING_COOLDOWN_MS
+    );
+  } catch (error) {
+    return [];
+  }
+}
+
+async function postListingClaimAction(path, listingId) {
+  const response =
+    await fetchLocalServer(
+      path,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ listingId })
+      }
+    );
+
+  const data = await readJsonSafely(response);
+
+  if (!response.ok || data?.error) {
+    throw new Error(
+      data?.error || `${path} failed (${response.status})`
+    );
+  }
+
+  return data;
+}
+
+/** Best effort, retried once, never throws: it must not break the analysis pipeline. */
+async function confirmListingProcessed(listingId) {
+  const id = String(listingId || "").trim();
+
+  if (!id) return;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await postListingClaimAction(
+        "/processed-marketplace-listings/complete",
+        id
+      );
+      return;
+    } catch (error) {
+      console.warn(
+        `[LISTING CLAIM] Could not confirm ${id} (attempt ${attempt}):`,
+        error?.message || error
+      );
+      await sleep(500);
+    }
+  }
+}
+
+async function releaseListingClaim(listingId, reason = "") {
+  const id = String(listingId || "").trim();
+
+  if (!id) return;
+
+  try {
+    const stored =
+      await chrome.storage.local.get(
+        RELEASED_LISTING_COOLDOWN_KEY
+      );
+
+    const now = Date.now();
+    const map = {};
+
+    for (const [key, value] of Object.entries(
+      stored[RELEASED_LISTING_COOLDOWN_KEY] || {}
+    )) {
+      if (now - Number(value || 0) < RELEASED_LISTING_COOLDOWN_MS) {
+        map[key] = value;
+      }
+    }
+
+    map[id] = now;
+
+    await chrome.storage.local.set({
+      [RELEASED_LISTING_COOLDOWN_KEY]: map
+    });
+  } catch (error) {
+    /* cooldown is a convenience only */
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await postListingClaimAction(
+        "/processed-marketplace-listings/release",
+        id
+      );
+
+      console.warn(
+        "[LISTING CLAIM] Released unanalyzed listing so it is rescanned later:",
+        id,
+        reason
+      );
+
+      return;
+    } catch (error) {
+      console.warn(
+        `[LISTING CLAIM] Could not release ${id} (attempt ${attempt}):`,
+        error?.message || error
+      );
+      await sleep(500);
+    }
+  }
+}
+
 async function getProcessedMarketplaceListingIds(
   candidateListingIds = []
 ) {
@@ -4423,11 +4561,24 @@ async function getProcessedMarketplaceListingIds(
     );
   }
 
-  return Array.isArray(
-    data.processedListingIds
-  )
-    ? data.processedListingIds
-    : [];
+  const serverProcessedIds =
+    Array.isArray(
+      data.processedListingIds
+    )
+      ? data.processedListingIds
+      : [];
+
+  const recentlyReleasedIds =
+    await getRecentlyReleasedListingIds();
+
+  return [
+    ...new Set([
+      ...serverProcessedIds,
+      ...listingIds.filter(id =>
+        recentlyReleasedIds.includes(id)
+      )
+    ])
+  ];
 }
 
 
@@ -6716,6 +6867,11 @@ if (
     "timeout-with-other-job"
   );
 
+  await releaseListingClaim(
+    currentListingId,
+    "stale child abandoned"
+  );
+
 
   console.warn(
     "[MARKETPLACE TAB] Abandoning stale child:",
@@ -6843,6 +6999,11 @@ if (
   */
   await updateSessionListingResult(
     finalTimeoutResult
+  );
+
+  await releaseListingClaim(
+    currentListingId,
+    "analysis timed out after retry"
   );
 
   await clearListingAnalysisRetryCount(
@@ -9368,6 +9529,19 @@ async function fetchLocalServer(
           }
         );
 
+      if (response.headers.get("X-Fatal-Api-Error")) {
+        let fatalReason = "";
+
+        try {
+          fatalReason =
+            JSON.parse(await response.clone().text())?.fatalReason || "";
+        } catch (parseError) {
+          /* reason is optional */
+        }
+
+        await handleFatalApiBlock(fatalReason);
+      }
+
       return response;
 
 } catch (error) {
@@ -9443,6 +9617,116 @@ async function fetchLocalServer(
     `Check that the server is running at ` +
     `${LOCAL_SERVER_BASE_URL}.`
   );
+}
+
+/*
+  ============================================================
+  FATAL API ERROR (no OpenAI credits / bad key)
+
+  The server tags responses with the header X-Fatal-Api-Error when
+  every further call is doomed to fail. fetchLocalServer() sees the
+  header on ANY response, so the scan stops even if a step swallows
+  the error: the in-flight listing is released (rescanned later), the
+  scanner is stopped, and a banner explains what to fix.
+  ============================================================
+*/
+let fatalApiStopInProgress = false;
+const FATAL_API_ERROR_STORAGE_KEY = "marketplaceFatalApiError";
+
+function showFatalApiBanner(message) {
+  try {
+    const existing = document.getElementById("fatal-api-banner");
+
+    if (existing) existing.remove();
+
+    const banner = document.createElement("div");
+    banner.id = "fatal-api-banner";
+    banner.style.cssText =
+      "position:fixed;top:0;left:0;right:0;z-index:2147483647;" +
+      "background:#b00020;color:#fff;font:600 15px/1.4 system-ui,sans-serif;" +
+      "padding:14px 48px 14px 16px;box-shadow:0 2px 12px rgba(0,0,0,.4);";
+    banner.textContent =
+      `SCAN STOPPED: ${message} ` +
+      "The listing being analyzed was released and will be rescanned.";
+
+    const close = document.createElement("button");
+    close.textContent = "×";
+    close.style.cssText =
+      "position:absolute;right:12px;top:8px;background:none;border:0;" +
+      "color:#fff;font-size:24px;cursor:pointer;";
+    close.onclick = () => banner.remove();
+    banner.appendChild(close);
+
+    document.body.appendChild(banner);
+  } catch (error) {
+    /* display only */
+  }
+}
+
+async function handleFatalApiBlock(reason) {
+  if (fatalApiStopInProgress) return;
+
+  fatalApiStopInProgress = true;
+
+  const message =
+    reason || "A required API is unavailable (no credits or invalid key).";
+
+  try {
+    console.error("[FATAL API ERROR] Stopping scan:", message);
+
+    const stored =
+      await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
+
+    const state = stored[MARKETPLACE_AUTO_STATE_KEY] || {};
+
+    const listingId =
+      getFacebookMarketplaceItemId(
+        String(window.location.href || "").split("?")[0]
+      ) ||
+      getFacebookMarketplaceItemId(
+        String(state.currentListingUrl || "").split("?")[0]
+      );
+
+    if (listingId) {
+      await releaseListingClaim(listingId, message);
+    }
+
+    await chrome.storage.local.set({
+      [FATAL_API_ERROR_STORAGE_KEY]: {
+        message,
+        at: Date.now()
+      }
+    });
+
+    if (state.running) {
+      await stopMarketplaceAutoAnalyzer({
+        reason: `Stopped automatically: ${message}`
+      });
+    }
+
+    showFatalApiBanner(message);
+  } catch (error) {
+    console.error("[FATAL API ERROR] Could not complete the stop:", error);
+  } finally {
+    setTimeout(() => {
+      fatalApiStopInProgress = false;
+    }, 30000);
+  }
+}
+
+/* Show the banner on every open Facebook tab, not just the one that hit the error. */
+try {
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") return;
+
+    const change = changes[FATAL_API_ERROR_STORAGE_KEY];
+
+    if (change?.newValue?.message) {
+      showFatalApiBanner(change.newValue.message);
+    }
+  });
+} catch (error) {
+  /* storage listener is a convenience only */
 }
 
 class LocalServerError extends Error {
@@ -14127,6 +14411,15 @@ if (!opened) {
       error
     );
 
+    /*
+      Out of credits / bad key: fetchLocalServer already released the
+      listing, stopped the scan and showed the banner. Nothing more to do
+      (and no alert() dialog on top of it).
+    */
+    if (error?.code === "FATAL_API_ERROR") {
+      return;
+    }
+
     const shouldRestartForJson =
       error
         ?.retryEntireListing ===
@@ -15032,6 +15325,29 @@ async function markMarketplaceAutoAnalysisComplete(
       await clearMalformedJsonRetryCount(listingId);
     }
   }
+
+/*
+  The listing's claim is only a reservation until here.
+  A real result makes it permanent; an "Error" result (analysis
+  did not actually happen) releases it so it is scanned again.
+*/
+{
+  const claimListingId =
+    getFacebookMarketplaceItemId(
+      String(window.location.href || "").split("?")[0]
+    );
+
+  if (claimListingId) {
+    if (finalResult?.recommendation === "Error") {
+      await releaseListingClaim(
+        claimListingId,
+        finalResult?.reason || "analysis error"
+      );
+    } else {
+      await confirmListingProcessed(claimListingId);
+    }
+  }
+}
 
 if (!state?.running) return;
 
@@ -16260,6 +16576,13 @@ button.onclick =
           failedAt:
             Date.now()
         });
+
+        await releaseListingClaim(
+          getFacebookMarketplaceItemId(
+            String(window.location.href || "").split("?")[0]
+          ),
+          "unhandled analysis failure"
+        );
 
         await releaseMarketplaceFinishLock();
 

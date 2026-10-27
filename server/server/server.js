@@ -21,6 +21,7 @@ import {
 } from "async_hooks";
 
 import util from "util";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createLensVerification } from "./lens-verification/src/index.js";   // LENS_VERIFICATION_INSTALLED
 
 
@@ -3300,6 +3301,83 @@ app.use(cors({
 app.use(express.json({
   limit: "50mb"
 }));
+
+/*
+  ============================================================
+  FATAL API ERROR FLAG (out of credits / bad key)
+  ============================================================
+  When OpenAI says the account has no credits (or the key is
+  rejected), EVERY later call will fail too. The OpenAI wrapper
+  marks the current request as fatal; every JSON response for that
+  request then carries the header X-Fatal-Api-Error and
+  code "FATAL_API_ERROR", so the extension can stop the scan
+  instead of burning through listings. A plain rate limit (429
+  rate_limit_exceeded) is transient and is NOT treated as fatal.
+  ============================================================
+*/
+const fatalApiRequestContext = new AsyncLocalStorage();
+
+function classifyFatalOpenAiError(error) {
+  const status = Number(error?.status);
+  const code = String(error?.code || error?.error?.code || "");
+  const type = String(error?.type || error?.error?.type || "");
+  const message = String(error?.message || "");
+
+  if (
+    code === "insufficient_quota" ||
+    code === "credit_balance_exhausted" ||
+    type === "insufficient_quota" ||
+    /no credits remaining|exceeded your current quota|insufficient[_ ]quota|billing hard limit/i.test(message)
+  ) {
+    return "OpenAI credits exhausted. Add credits at platform.openai.com/settings/organization/billing, then restart the scan.";
+  }
+
+  if (
+    status === 401 ||
+    code === "invalid_api_key" ||
+    /incorrect api key|invalid api key/i.test(message)
+  ) {
+    return "OpenAI rejected the API key (invalid or revoked). Fix OPENAI_API_KEY in the server .env, then restart the scan.";
+  }
+
+  return "";
+}
+
+function markRequestFatalApiError(reason) {
+  const store = fatalApiRequestContext.getStore();
+
+  console.error(`[FATAL API ERROR] ${reason}`);
+
+  if (store) {
+    store.fatalReason = reason;
+  }
+}
+
+app.use((req, res, next) => {
+  fatalApiRequestContext.run({ fatalReason: "" }, () => {
+    const store = fatalApiRequestContext.getStore();
+    const originalJson = res.json.bind(res);
+
+    res.json = body => {
+      if (store?.fatalReason) {
+        res.set("X-Fatal-Api-Error", "1");
+
+        if (body && typeof body === "object" && !Array.isArray(body)) {
+          body = {
+            ...body,
+            code: "FATAL_API_ERROR",
+            fatalApiError: true,
+            fatalReason: store.fatalReason
+          };
+        }
+      }
+
+      return originalJson(body);
+    };
+
+    next();
+  });
+});
 
 app.post(
   "/prepare-dataforseo-crops",
@@ -9720,78 +9798,230 @@ process.on("unhandledRejection", reason => {
   console.error(reason);
 });
 
+/*
+  ============================================================
+  PROCESSED LISTINGS: RESERVE -> CONFIRM / RELEASE
+  ============================================================
+
+  A listing is RESERVED ("in_progress", with a timestamp) when the
+  scanner opens it, and only becomes permanently processed ("done")
+  when the analysis really finished. If the analysis fails (no OpenAI
+  credits, server error, timeout, crash) the extension RELEASES the
+  reservation, and an abandoned reservation expires on its own after
+  PROCESSED_LISTING_LEASE_MS, so a failed run can never hide listings.
+  While a reservation is fresh, other scanners treat the listing as
+  taken, which is what prevents two scanners analyzing the same one.
+
+  Table marketplace_processed_listings needs two extra columns:
+    status     text        not null default 'done'
+    claimed_at timestamptz not null default now()
+  (see add_processed_listing_status.sql). Until they exist this code
+  falls back to the old behaviour (claim = permanent) and logs a warning.
+*/
+const PROCESSED_LISTING_LEASE_MS = 45 * 60 * 1000;
+const PROCESSED_LISTINGS_TABLE = "marketplace_processed_listings";
+
+function isMissingProcessedStatusColumn(error) {
+  return Boolean(
+    error &&
+    (
+      error.code === "42703" ||
+      error.code === "PGRST204" ||
+      /column .*(status|claimed_at).* does not exist|could not find the .*(status|claimed_at).* column/i.test(
+        String(error.message || "")
+      )
+    )
+  );
+}
+
+function warnProcessedListingsLegacyMode() {
+  console.warn(
+    "[PROCESSED LISTINGS] status/claimed_at columns are missing. Using legacy permanent claims. " +
+    "Run add_processed_listing_status.sql in Supabase so failed analyses can be released."
+  );
+}
+
+function isProcessedListingLeaseExpired(claimedAt) {
+  const time = Date.parse(claimedAt || "");
+  return !Number.isFinite(time) || Date.now() - time > PROCESSED_LISTING_LEASE_MS;
+}
+
 app.post(
   "/processed-marketplace-listings/claim",
   async (req, res) => {
     try {
       const listingId =
-        String(
-          req.body?.listingId || ""
-        ).trim();
+        String(req.body?.listingId || "").trim();
 
       if (!listingId) {
-        return res.status(400).json({
-          error:
-            "Missing listingId."
-        });
+        return res.status(400).json({ error: "Missing listingId." });
       }
 
-      const {
-        error
-      } =
+      let { error } =
         await supabaseAdmin
-          .from(
-            "marketplace_processed_listings"
-          )
+          .from(PROCESSED_LISTINGS_TABLE)
           .insert({
-            listing_id:
-              listingId
+            listing_id: listingId,
+            status: "in_progress",
+            claimed_at: new Date().toISOString()
           });
 
+      if (isMissingProcessedStatusColumn(error)) {
+        warnProcessedListingsLegacyMode();
+
+        ({ error } =
+          await supabaseAdmin
+            .from(PROCESSED_LISTINGS_TABLE)
+            .insert({ listing_id: listingId }));
+      }
+
       /*
-        PostgreSQL unique-constraint violation.
-
-        Because listing_id is the primary key,
-        this means another scanner/device
-        already claimed it.
+        Unique-key violation: someone already has a row. It only
+        blocks us if that row is "done" or a still-fresh reservation.
       */
-      if (
-        error?.code === "23505"
-      ) {
-        console.log(
-          "[PROCESSED LISTINGS] Already claimed:",
-          listingId
-        );
+      if (error?.code === "23505") {
+        const { data: existing, error: lookupError } =
+          await supabaseAdmin
+            .from(PROCESSED_LISTINGS_TABLE)
+            .select("status, claimed_at")
+            .eq("listing_id", listingId)
+            .maybeSingle();
 
-        return res.json({
-          claimed: false,
-          listingId
-        });
+        if (
+          !lookupError &&
+          existing &&
+          existing.status === "in_progress" &&
+          isProcessedListingLeaseExpired(existing.claimed_at)
+        ) {
+          /*
+            Expired reservation (a scanner died mid-analysis).
+            Take it over with a compare-and-swap so two scanners
+            cannot both win.
+          */
+          const { data: taken } =
+            await supabaseAdmin
+              .from(PROCESSED_LISTINGS_TABLE)
+              .update({ claimed_at: new Date().toISOString() })
+              .eq("listing_id", listingId)
+              .eq("status", "in_progress")
+              .eq("claimed_at", existing.claimed_at)
+              .select("listing_id");
+
+          if (Array.isArray(taken) && taken.length) {
+            console.log("[PROCESSED LISTINGS] Took over expired reservation:", listingId);
+            return res.json({ claimed: true, listingId, tookOver: true });
+          }
+        }
+
+        console.log("[PROCESSED LISTINGS] Already claimed:", listingId);
+        return res.json({ claimed: false, listingId });
       }
 
       if (error) {
         throw error;
       }
 
-      console.log(
-        "[PROCESSED LISTINGS] Claimed:",
-        listingId
-      );
+      console.log("[PROCESSED LISTINGS] Reserved:", listingId);
 
-      res.json({
-        claimed: true,
-        listingId
-      });
+      res.json({ claimed: true, listingId });
     } catch (error) {
-      console.error(
-        "[PROCESSED LISTINGS] Claim failed:",
-        error
-      );
+      console.error("[PROCESSED LISTINGS] Claim failed:", error);
 
       res.status(500).json({
-        error:
-          error?.message ||
-          "Could not claim Marketplace listing."
+        error: error?.message || "Could not claim Marketplace listing."
+      });
+    }
+  }
+);
+
+/*
+  The analysis finished (any real result: Buy, Negotiate, Pass...):
+  make the reservation permanent.
+*/
+app.post(
+  "/processed-marketplace-listings/complete",
+  async (req, res) => {
+    try {
+      const listingId =
+        String(req.body?.listingId || "").trim();
+
+      if (!listingId) {
+        return res.status(400).json({ error: "Missing listingId." });
+      }
+
+      const { error } =
+        await supabaseAdmin
+          .from(PROCESSED_LISTINGS_TABLE)
+          .update({ status: "done" })
+          .eq("listing_id", listingId);
+
+      if (isMissingProcessedStatusColumn(error)) {
+        warnProcessedListingsLegacyMode();
+        return res.json({ completed: true, listingId, legacy: true });
+      }
+
+      if (error) {
+        throw error;
+      }
+
+      console.log("[PROCESSED LISTINGS] Completed:", listingId);
+
+      res.json({ completed: true, listingId });
+    } catch (error) {
+      console.error("[PROCESSED LISTINGS] Complete failed:", error);
+
+      res.status(500).json({
+        error: error?.message || "Could not complete Marketplace listing."
+      });
+    }
+  }
+);
+
+/*
+  The analysis did NOT finish (error, timeout, no credits): give the
+  listing back so a later scan analyzes it. Only an "in_progress"
+  reservation is ever deleted; a "done" row is never touched.
+*/
+app.post(
+  "/processed-marketplace-listings/release",
+  async (req, res) => {
+    try {
+      const listingId =
+        String(req.body?.listingId || "").trim();
+
+      if (!listingId) {
+        return res.status(400).json({ error: "Missing listingId." });
+      }
+
+      let { error } =
+        await supabaseAdmin
+          .from(PROCESSED_LISTINGS_TABLE)
+          .delete()
+          .eq("listing_id", listingId)
+          .eq("status", "in_progress");
+
+      if (isMissingProcessedStatusColumn(error)) {
+        warnProcessedListingsLegacyMode();
+
+        ({ error } =
+          await supabaseAdmin
+            .from(PROCESSED_LISTINGS_TABLE)
+            .delete()
+            .eq("listing_id", listingId));
+      }
+
+      if (error) {
+        throw error;
+      }
+
+      console.log("[PROCESSED LISTINGS] Released (analysis did not finish):", listingId);
+
+      res.json({ released: true, listingId });
+    } catch (error) {
+      console.error("[PROCESSED LISTINGS] Release failed:", error);
+
+      res.status(500).json({
+        error: error?.message || "Could not release Marketplace listing."
       });
     }
   }
@@ -9803,70 +10033,56 @@ app.post(
     try {
       const listingIds = [
         ...new Set(
-          (
-            Array.isArray(req.body?.listingIds)
-              ? req.body.listingIds
-              : []
-          )
-            .map(value =>
-              String(value || "").trim()
-            )
+          (Array.isArray(req.body?.listingIds) ? req.body.listingIds : [])
+            .map(value => String(value || "").trim())
             .filter(Boolean)
         )
       ];
 
       if (!listingIds.length) {
-        res.json({
-          processedListingIds: []
-        });
-
+        res.json({ processedListingIds: [] });
         return;
       }
 
-      const {
-        data,
-        error
-      } =
+      let { data, error } =
         await supabaseAdmin
-          .from(
-            "marketplace_processed_listings"
-          )
-          .select(
-            "listing_id"
-          )
-          .in(
-            "listing_id",
-            listingIds
-          );
+          .from(PROCESSED_LISTINGS_TABLE)
+          .select("listing_id, status, claimed_at")
+          .in("listing_id", listingIds);
+
+      if (isMissingProcessedStatusColumn(error)) {
+        warnProcessedListingsLegacyMode();
+
+        ({ data, error } =
+          await supabaseAdmin
+            .from(PROCESSED_LISTINGS_TABLE)
+            .select("listing_id")
+            .in("listing_id", listingIds));
+      }
 
       if (error) {
         throw error;
       }
 
+      /*
+        Processed = finished ("done"/legacy rows) OR a reservation
+        that is still fresh. An expired reservation is up for grabs.
+      */
       const processedListingIds =
-        Array.isArray(data)
-          ? data
-              .map(row =>
-                String(
-                  row?.listing_id || ""
-                ).trim()
-              )
-              .filter(Boolean)
-          : [];
+        (Array.isArray(data) ? data : [])
+          .filter(row =>
+            row?.status !== "in_progress" ||
+            !isProcessedListingLeaseExpired(row.claimed_at)
+          )
+          .map(row => String(row?.listing_id || "").trim())
+          .filter(Boolean);
 
-      res.json({
-        processedListingIds
-      });
+      res.json({ processedListingIds });
     } catch (error) {
-      console.error(
-        "[PROCESSED LISTINGS] Check failed:",
-        error
-      );
+      console.error("[PROCESSED LISTINGS] Check failed:", error);
 
       res.status(500).json({
-        error:
-          error?.message ||
-          "Could not check processed listings."
+        error: error?.message || "Could not check processed listings."
       });
     }
   }
@@ -16850,6 +17066,12 @@ return response;
           String(error)
       }
     );
+
+    const fatalReason = classifyFatalOpenAiError(error);
+
+    if (fatalReason) {
+      markRequestFatalApiError(fatalReason);
+    }
 
     throw error;
   }

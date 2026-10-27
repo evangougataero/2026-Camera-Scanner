@@ -324,7 +324,9 @@ function applyDashboardFormatting_(sh) {
   // summary strip (labels above values), no explanatory text
   sh.getRange(DASH.LABEL_ROW, 1, 1, 10).setFontSize(9).setFontColor('#555555').setWrap(true).setVerticalAlignment('bottom').setHorizontalAlignment('center');
   sh.getRange(DASH.VALUE_ROW, 1, 1, 10).setFontSize(16).setFontWeight('bold').setHorizontalAlignment('center').setBackground('#F7F7F7');
+  sh.getRange(DASH.VALUE_ROW, 1, 1, 10).setNumberFormat('0');                           // counts are plain integers (a stray currency format made "Missing Cost" read $1.00)
   sh.getRange(DASH.VALUE_ROW, 3).setNumberFormat('$#,##0.00');
+  sh.getRange(DASH.VALUE_ROW, 10).setNumberFormat('@');
   sh.getRange(DASH.VALUE_ROW, 10).setFontSize(9).setFontWeight('normal').setFontColor('#777777');
 
   sh.getBandings().forEach(function (b) { b.remove(); });

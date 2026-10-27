@@ -241,6 +241,29 @@ function planSync_(listings, records, forceIds) {
   return { creates: creates, voids: voids };
 }
 
+/**
+ * Cost typed into the scanner sheet AFTER the purchase row was created.
+ * For every open purchase, if the scanner listing now has a number in the cost column and it differs from the
+ * Purchased row, the scanner value wins. A blank scanner cost never erases anything (a cost typed directly into
+ * the Purchased tab is left alone). Returns [{purchaseId, cost, previous}].
+ */
+function planCostUpdates_(listings, records) {
+  var costById = {};
+  (listings || []).forEach(function (l) {
+    if (l.cost === '' || l.cost === undefined || l.cost === null) return;
+    if (costById[l.listingId] === undefined || l.purchased) costById[l.listingId] = l.cost;
+  });
+  var out = [];
+  (records || []).forEach(function (r) {
+    if (isTerminalStatus_(r['Purchase Status']) || isTestRecord_(r) || !isInScope_(r)) return;
+    var c = costById[str_(r['Listing ID'])];
+    if (c === undefined) return;
+    var prev = parseMoney_(r['Purchase Cost']);
+    if (prev === '' || Math.abs(prev - c) > 0.004) out.push({ purchaseId: str_(r['Purchase ID']), cost: c, previous: prev });
+  });
+  return out;
+}
+
 function buildPurchaseRecord_(listing, attempt, ts, costFromScanner) {
   var notes = '';
   var cost = (costFromScanner !== undefined && costFromScanner !== '') ? costFromScanner : '';

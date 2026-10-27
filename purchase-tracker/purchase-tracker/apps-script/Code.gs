@@ -170,6 +170,13 @@ function readScannerListings_() {
   return { listings: groupScannerListings_(values, first, cols), cols: cols };
 }
 
+/** 1-based column of the scanner cost header (first of CONFIG.SCANNER.costHeaders that exists), or 0. */
+function costColumn1_(hm) {
+  var list = CONFIG.SCANNER.costHeaders || [];
+  for (var i = 0; i < list.length; i++) if (hm[list[i]]) return hm[list[i]];
+  return 0;
+}
+
 /** Idempotent. Safe to call from onEdit, reconcile, or by hand any number of times. */
 function syncFromScanner_(forceRows) {
   var scan = readScannerListings_();
@@ -199,7 +206,18 @@ function syncFromScanner_(forceRows) {
       log_(r['Purchase ID'], 'PURCHASE_VOIDED', 'un-marked in scanner');
     }
   });
-  return { created: plan.creates.length, voided: plan.voids.length };
+
+  // Cost typed into the scanner sheet after the purchase row exists (creation only read it once).
+  var costUpdates = planCostUpdates_(scan.listings, rd.records);
+  costUpdates.forEach(function (u) {
+    var rec = rd.records.filter(function (r) { return str_(r['Purchase ID']) === u.purchaseId; })[0] || {};
+    updateRecord_(u.purchaseId, {
+      'Purchase Cost': u.cost,
+      'Notes': appendNote_(rec['Notes'], ts, 'Purchase Cost set from scanner sheet: $' + u.cost + (u.previous === '' ? '' : ' (was $' + u.previous + ')'))
+    });
+    log_(u.purchaseId, 'COST_SYNCED', '$' + u.cost + (u.previous === '' ? '' : ' (was $' + u.previous + ')'));
+  });
+  return { created: plan.creates.length, voided: plan.voids.length, costUpdated: costUpdates.length };
 }
 
 /** Installable trigger (created by setup()). */
@@ -210,11 +228,14 @@ function onScannerEdit(e) {
     if (sh.getName() !== CONFIG.SCANNER.tab) return;
     var hm = headerMap_(sh, CONFIG.SCANNER.headerRow);
     var pc = hm[CONFIG.SCANNER.purchasedHeader];
-    if (!pc || e.range.getColumn() > pc || e.range.getLastColumn() < pc) return;
+    var cc = costColumn1_(hm);
+    var hitsPurchased = !!pc && e.range.getColumn() <= pc && e.range.getLastColumn() >= pc;
+    var hitsCost = !!cc && e.range.getColumn() <= cc && e.range.getLastColumn() >= cc;
+    if (!hitsPurchased && !hitsCost) return;
 
     var force = [];
     // Newly typed Y on a single cell => allow a fresh purchase attempt for canceled/voided listings.
-    if (e.range.getNumRows() === 1 && e.range.getNumColumns() === 1 &&
+    if (hitsPurchased && e.range.getNumRows() === 1 && e.range.getNumColumns() === 1 &&
         isYes_(e.value) && !isYes_(e.oldValue)) force.push(e.range.getRow());
 
     withLock_(function () { syncFromScanner_(force); }, 25000);
