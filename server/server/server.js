@@ -8678,6 +8678,942 @@ function identifySameFocalLengthDuplicateLenses({
 
 /*
   ============================================================
+  SINGLE-UNIT GUARD (camera bodies, cameras, flashes, other
+  non-lens primary products)
+  ============================================================
+
+  The lens pipeline already collapses duplicate detections of the
+  same lens unless the seller states a quantity. Non-lens products
+  had no equivalent, so two failure modes slipped through:
+
+    1. Gallery analysis gives one physical item two IDs
+       (camera_1 + camera_2, flash_1 + flash_2) and Step 5 assigns
+       the SAME model to both -> the item is priced twice.
+    2. Step 5 correctly drops the extra ID, but structural
+       recovery restores it as an unresolved placeholder, which is
+       then sent to paid visual identification and later copies
+       the real item's identity.
+
+  RULE: unless the seller's own text (title, description, Step 1
+  facts) EXPLICITLY states more than one of a product, it is ONE
+  product, whatever the gallery analysis thinks it saw.
+
+    Phase A - identical identity: products of the same family with
+      the same normalized model collapse to the number the seller
+      explicitly states for that model (default 1).
+    Phase B - unresolved siblings: a product with no specific model
+      of its own, in the same family as products that are already
+      accounted for, is dropped unless the seller explicitly states
+      more items of that family than are already accounted for.
+      Skipped when the seller's title/included list uses a plural
+      for that family ("cameras", "flashes") without a number,
+      because the seller is then clearly selling several.
+
+  Products with DIFFERENT specific models are never merged: they
+  are different products, not duplicate detections.
+
+  Survivor: the product with a specific model, then the one seen in
+  the most images, then the higher readability score, then the
+  lower product number.
+  ============================================================
+*/
+const SINGLE_UNIT_QUANTITY_WORDS = {
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  pair: 2,
+  both: 2,
+  couple: 2
+};
+
+const SINGLE_UNIT_ACCESSORY_TOKEN =
+  /^(?:batter(?:y|ies)|chargers?|straps?|caps?|cards?|cases?|bags?|cables?|cords?|manuals?|box(?:es)?|grips?|filters?|hoods?|lens(?:es)?|adapters?|adaptors?|covers?|protectors?|plates?|stands?|diffusers?|pouch(?:es)?|remotes?|triggers?|eyecups?|eyepieces?|screens?|shoes?|mounts?|brackets?)$/;
+
+/*
+  Words that end a quantity phrase: "2 batteries FOR the D2x",
+  "comes WITH 2 ... AND camera body", "used 2 YEARS".
+*/
+const SINGLE_UNIT_PHRASE_BREAK_TOKEN =
+  /^(?:for|with|and|plus|or|fits?|fitting|from|also|includ(?:e|es|ed|ing)|comes?|years?|months?|weeks?|days?|times?|hours?|old|owners?|shots?|clicks?|actuations?|count)$/;
+
+const SINGLE_UNIT_FAMILY_NOUNS = {
+  camera:
+    /^(?:cameras?|bod(?:y|ies)|dslrs?|slrs?|mirrorless)$/,
+  flash:
+    /^(?:flash(?:es)?|speedlites?|speedlights?|flashguns?|strobes?)$/
+};
+
+const SINGLE_UNIT_FAMILY_PLURALS = {
+  camera:
+    /^(?:cameras|bodies|dslrs|slrs)$/,
+  flash:
+    /^(?:flashes|speedlites|speedlights|flashguns|strobes)$/
+};
+
+function getSingleUnitProductFamily(
+  productType
+) {
+  const type =
+    String(productType || "")
+      .trim()
+      .toLowerCase();
+
+  if (!type || isLensProductType(type)) {
+    return null;
+  }
+
+  if (/flash|speedlite|speedlight|strobe/.test(type)) {
+    return "flash";
+  }
+
+  if (/camera|body|slr|dslr|mirrorless|rangefinder/.test(type)) {
+    return "camera";
+  }
+
+  return type.replace(/\s+/g, " ");
+}
+
+/*
+  Tokenize seller text, remembering the character just before each
+  token so "$250", "f/2", "1:2", "#2", "26,522" are not read as
+  quantities.
+*/
+function tokenizeSingleUnitSellerText(
+  text
+) {
+  const source =
+    String(text || "").toLowerCase();
+
+  const tokens = [];
+  const pattern = /[a-z0-9]+/g;
+  let match;
+
+  while ((match = pattern.exec(source)) !== null) {
+    tokens.push({
+      t: match[0],
+      prevChar:
+        match.index > 0
+          ? source[match.index - 1]
+          : "",
+      nextChar:
+        source[match.index + match[0].length] || ""
+    });
+  }
+
+  return tokens;
+}
+
+function readSingleUnitQuantityToken(
+  token,
+  previousToken = null
+) {
+  if (!token) {
+    return null;
+  }
+
+  if (SINGLE_UNIT_QUANTITY_WORDS[token.t]) {
+    return SINGLE_UNIT_QUANTITY_WORDS[token.t];
+  }
+
+  /*
+    "2", "2x", "2pcs" (but not "$2", "f/2", "1:2", "2.5", "26,522",
+    "OM-2", "Mark 2"). An "x10"-style token is a model name (Fujifilm
+    X10), never a leading quantity.
+  */
+  const numeric =
+    token.t.match(/^(\d{1,2})(?:x|pcs|pc|units?)?$/);
+
+  if (!numeric) {
+    return null;
+  }
+
+  if (/[$/:#.,\-]/.test(token.prevChar)) {
+    return null;
+  }
+
+  if (
+    previousToken &&
+    /^(?:mark|mk|mkii|version|ver|v|gen|generation|series|model|no|number|type|edition)$/.test(
+      previousToken.t
+    )
+  ) {
+    return null;
+  }
+
+  if (/[.,:/]/.test(token.nextChar)) {
+    return null;
+  }
+
+  const value = Number(numeric[1]);
+
+  return value >= 2 && value <= 20
+    ? value
+    : null;
+}
+
+/*
+  Returns the anchor end index if tokens starting at `start` spell
+  the anchor (allowing "430EX" to be written "430 EX").
+*/
+function matchSingleUnitAnchorAt(
+  tokens,
+  start,
+  anchor
+) {
+  let built = "";
+
+  for (
+    let index = start;
+    index < tokens.length && index < start + 3;
+    index++
+  ) {
+    built += tokens[index].t;
+
+    if (built === anchor) {
+      return index;
+    }
+
+    if (!anchor.startsWith(built)) {
+      return -1;
+    }
+  }
+
+  return -1;
+}
+
+/*
+  Highest quantity the seller attaches to an anchor, e.g.
+    "2 Nikon D2x bodies", "two 430EX III-RT", "pair of D2x",
+    "D2x x2", "D2x (2)", "D2x bodies" (plural -> "several").
+  Returns 1 when no explicit quantity is attached.
+  Returns Infinity for an un-numbered plural right after the model
+  ("Nikon D2x cameras"), meaning "the seller says more than one".
+*/
+function getSellerStatedSingleUnitCount({
+  anchors,
+  family,
+  texts,
+  anchorIsFamilyNoun = false
+}) {
+  let count = 1;
+
+  const familyPlural =
+    SINGLE_UNIT_FAMILY_PLURALS[family] || null;
+
+  for (const text of texts) {
+    const tokens =
+      tokenizeSingleUnitSellerText(text);
+
+    for (let start = 0; start < tokens.length; start++) {
+      let end = -1;
+
+      for (const anchor of anchors) {
+        if (anchorIsFamilyNoun) {
+          if (anchor.test(tokens[start].t)) {
+            end = start;
+            break;
+          }
+
+          continue;
+        }
+
+        end =
+          matchSingleUnitAnchorAt(
+            tokens,
+            start,
+            anchor
+          );
+
+        if (end >= 0) {
+          break;
+        }
+      }
+
+      if (end < 0) {
+        continue;
+      }
+
+      /*
+        The anchor must describe the product itself, not an
+        accessory for it: "D2x neck strap", "body cap",
+        "430EX III-RT diffuser".
+      */
+      let describesAccessory = false;
+      let pluralAfterAnchor = false;
+
+      for (
+        let index = end + 1;
+        index < tokens.length && index <= end + 3;
+        index++
+      ) {
+        const next = tokens[index].t;
+
+        if (SINGLE_UNIT_PHRASE_BREAK_TOKEN.test(next)) {
+          break;
+        }
+
+        if (SINGLE_UNIT_ACCESSORY_TOKEN.test(next)) {
+          describesAccessory = true;
+          break;
+        }
+
+        if (
+          !anchorIsFamilyNoun &&
+          familyPlural &&
+          familyPlural.test(next)
+        ) {
+          pluralAfterAnchor = true;
+        }
+      }
+
+      if (describesAccessory) {
+        continue;
+      }
+
+      /*
+        Quantity BEFORE the anchor, at most 4 words back, stopping
+        at phrase breaks / accessory words.
+      */
+      let foundQuantity = false;
+
+      for (
+        let index = start - 1;
+        index >= 0 && index >= start - 4;
+        index--
+      ) {
+        const token = tokens[index];
+
+        if (
+          SINGLE_UNIT_PHRASE_BREAK_TOKEN.test(token.t) ||
+          SINGLE_UNIT_ACCESSORY_TOKEN.test(token.t)
+        ) {
+          break;
+        }
+
+        const value =
+          readSingleUnitQuantityToken(
+            token,
+            tokens[index - 1] || null
+          );
+
+        if (value) {
+          count = Math.max(count, value);
+          foundQuantity = true;
+          break;
+        }
+      }
+
+      /*
+        Quantity AFTER the anchor: "D2x x2", "D2x x 2", "D2x (2)",
+        "D2x qty 2".
+      */
+      for (
+        let index = end + 1;
+        index < tokens.length && index <= end + 4;
+        index++
+      ) {
+        const token = tokens[index];
+
+        if (
+          SINGLE_UNIT_PHRASE_BREAK_TOKEN.test(token.t) ||
+          SINGLE_UNIT_ACCESSORY_TOKEN.test(token.t)
+        ) {
+          break;
+        }
+
+        const xForm =
+          token.t.match(/^x(\d{1,2})$/);
+
+        const previous =
+          tokens[index - 1]?.t || "";
+
+        const value =
+          xForm
+            ? Number(xForm[1])
+            : (previous === "x" || previous === "qty" || token.prevChar === "(") &&
+                /^\d{1,2}$/.test(token.t)
+              ? Number(token.t)
+              : null;
+
+        if (value && value >= 2 && value <= 20) {
+          count = Math.max(count, value);
+          foundQuantity = true;
+          break;
+        }
+      }
+
+      if (!foundQuantity && pluralAfterAnchor) {
+        count = Infinity;
+      }
+    }
+  }
+
+  return count;
+}
+
+/*
+  True when the seller's title / included list uses an un-numbered
+  plural for the family ("Vintage cameras", "Godox flashes"),
+  ignoring compatibility phrases ("fits Nikon cameras").
+*/
+function sellerUsesFamilyPlural({
+  family,
+  texts
+}) {
+  const plural =
+    SINGLE_UNIT_FAMILY_PLURALS[family];
+
+  if (!plural) {
+    return false;
+  }
+
+  for (const text of texts) {
+    const tokens =
+      tokenizeSingleUnitSellerText(text);
+
+    for (let index = 0; index < tokens.length; index++) {
+      if (!plural.test(tokens[index].t)) {
+        continue;
+      }
+
+      const lookback =
+        tokens
+          .slice(Math.max(0, index - 3), index)
+          .map(token => token.t);
+
+      if (
+        lookback.some(word =>
+          /^(?:for|with|fits?|fitting|compatible|other|all|most|any|from)$/.test(word)
+        )
+      ) {
+        continue;
+      }
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/*
+  How many DIFFERENT items of this family the seller's Step 1
+  "included" list names. Entries naming the same resolved model
+  count once ("Nikon D2x body" + "Nikon D2x camera" = 1); entries
+  that only name the item as an accessory target ("D2x neck strap",
+  "body cap") do not count.
+*/
+function countSellerListedFamilyItems({
+  familyNoun,
+  resolvedModels,
+  included
+}) {
+  const keys = new Set();
+
+  const anchorDescribesProduct = (tokens, end) => {
+    for (
+      let index = end + 1;
+      index < tokens.length && index <= end + 3;
+      index++
+    ) {
+      const next = tokens[index].t;
+
+      if (SINGLE_UNIT_PHRASE_BREAK_TOKEN.test(next)) {
+        return true;
+      }
+
+      if (SINGLE_UNIT_ACCESSORY_TOKEN.test(next)) {
+        return false;
+      }
+    }
+
+    return true;
+  };
+
+  for (const entry of included) {
+    const tokens =
+      tokenizeSingleUnitSellerText(entry);
+
+    if (!tokens.length) {
+      continue;
+    }
+
+    let key = null;
+
+    for (const normalizedModel of resolvedModels) {
+      const anchors =
+        buildSingleUnitModelAnchors(normalizedModel);
+
+      for (let start = 0; start < tokens.length && !key; start++) {
+        for (const anchor of anchors) {
+          const end =
+            matchSingleUnitAnchorAt(tokens, start, anchor);
+
+          if (end >= 0 && anchorDescribesProduct(tokens, end)) {
+            key = `model:${normalizedModel}`;
+            break;
+          }
+        }
+      }
+
+      if (key) {
+        break;
+      }
+    }
+
+    if (!key) {
+      for (let index = 0; index < tokens.length; index++) {
+        if (
+          familyNoun.test(tokens[index].t) &&
+          anchorDescribesProduct(tokens, index)
+        ) {
+          key =
+            `text:${tokens.map(token => token.t).join(" ")}`;
+          break;
+        }
+      }
+    }
+
+    if (key) {
+      keys.add(key);
+    }
+  }
+
+  return keys.size;
+}
+
+function buildSingleUnitModelAnchors(
+  normalizedModel
+) {
+  const words =
+    String(normalizedModel || "")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean);
+
+  if (!words.length) {
+    return [];
+  }
+
+  /*
+    Prefer the distinctive designator(s) carrying a digit
+    ("d2x", "430ex"); fall back to the whole name for named
+    models ("nikkormat el" -> "nikkormatel").
+  */
+  const designators =
+    words.filter(word => /\d/.test(word) && word.length >= 2);
+
+  if (designators.length) {
+    return designators;
+  }
+
+  return [words.join("")];
+}
+
+function identifyDuplicateSingleUnitProducts({
+  primaryProducts,
+  galleryResults,
+  listingTitle,
+  listingDescription,
+  explicitFacts,
+  alreadySuppressedIds = new Set()
+}) {
+  const { registry } =
+    buildGalleryProductRegistry(
+      galleryResults
+    );
+
+  const productsById =
+    new Map(
+      (Array.isArray(primaryProducts) ? primaryProducts : [])
+        .map(product => [
+          String(product?.productId || "").trim(),
+          product
+        ])
+        .filter(([productId]) => productId)
+    );
+
+  const allIds =
+    new Set([
+      ...registry.keys(),
+      ...productsById.keys()
+    ]);
+
+  const included = (
+    Array.isArray(explicitFacts?.explicitlyIncluded)
+      ? explicitFacts.explicitlyIncluded
+      : []
+  ).map(entry =>
+    typeof entry === "string"
+      ? entry
+      : String(entry?.text || entry?.item || entry?.name || "")
+  );
+
+  const notes = (
+    Array.isArray(explicitFacts?.listingNotes)
+      ? explicitFacts.listingNotes
+      : []
+  ).map(value => String(value || ""));
+
+  const allSellerTexts = [
+    String(listingTitle || ""),
+    String(listingDescription || ""),
+    ...included,
+    ...notes
+  ].filter(text => text.trim());
+
+  const titleAndIncluded = [
+    String(listingTitle || ""),
+    ...included
+  ].filter(text => text.trim());
+
+  /*
+    Build one entry per still-active non-lens product.
+  */
+  const entries = [];
+
+  for (const productId of allIds) {
+    if (alreadySuppressedIds.has(productId)) {
+      continue;
+    }
+
+    const product =
+      productsById.get(productId) || null;
+
+    const galleryEntry =
+      registry.get(productId) || null;
+
+    /*
+      Gallery type first: Step 5 sometimes relabels a flash as
+      "camera"; the gallery's "flash unit" is the better family
+      signal.
+    */
+    const family =
+      getSingleUnitProductFamily(
+        galleryEntry?.productType ||
+        product?.productType
+      ) ||
+      getSingleUnitProductFamily(
+        product?.productType
+      );
+
+    if (!family) {
+      continue;
+    }
+
+    if (
+      isLensProductType(product?.productType) ||
+      isLensProductType(galleryEntry?.productType)
+    ) {
+      continue;
+    }
+
+    const brand =
+      cleanNullableIdentityField(product?.brand) || null;
+
+    const model =
+      cleanNullableIdentityField(product?.model) || null;
+
+    const specificity =
+      model
+        ? classifyCameraModelSpecificity(brand, model)
+        : null;
+
+    const normalizedModel =
+      specificity && !specificity.vague
+        ? String(specificity.normalizedModel || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, " ")
+            .trim()
+        : "";
+
+    entries.push({
+      productId,
+      productType:
+        product?.productType ||
+        galleryEntry?.productType ||
+        null,
+      family,
+      brand,
+      model,
+      normalizedModel,
+      resolved:
+        Boolean(normalizedModel),
+      inStep5Output:
+        Boolean(product),
+      imageCount:
+        galleryEntry?.visibleInImages?.size || 0,
+      images:
+        galleryEntry
+          ? Array.from(galleryEntry.visibleInImages).sort((a, b) => a - b)
+          : [],
+      maxReadability:
+        galleryEntry?.maxReadability || 0,
+      idNumber:
+        Number((productId.match(/(\d+)$/) || [])[1]) ||
+        Number.MAX_SAFE_INTEGER
+    });
+  }
+
+  const rank = (a, b) =>
+    Number(b.resolved) - Number(a.resolved) ||
+    b.imageCount - a.imageCount ||
+    b.maxReadability - a.maxReadability ||
+    a.idNumber - b.idNumber ||
+    a.productId.localeCompare(b.productId);
+
+  const removals = [];
+  const removedIds = new Set();
+
+  const describe = entry =>
+    [entry.brand, entry.model].filter(Boolean).join(" ") ||
+    "unresolved";
+
+  const families =
+    new Map();
+
+  for (const entry of entries) {
+    const list = families.get(entry.family) || [];
+    list.push(entry);
+    families.set(entry.family, list);
+  }
+
+  for (const [family, members] of families) {
+    if (members.length < 2) {
+      continue;
+    }
+
+    const familyNoun =
+      SINGLE_UNIT_FAMILY_NOUNS[family] ||
+      new RegExp(
+        `^${family.split(" ").pop().replace(/[^a-z0-9]/g, "")}s?$`
+      );
+
+    const familyCount =
+      getSellerStatedSingleUnitCount({
+        anchors: [familyNoun],
+        family,
+        texts: allSellerTexts,
+        anchorIsFamilyNoun: true
+      });
+
+    /*
+      ---------- Phase A: identical identity ----------
+    */
+    const modelGroups = new Map();
+
+    for (const entry of members) {
+      if (!entry.resolved) {
+        continue;
+      }
+
+      const list = modelGroups.get(entry.normalizedModel) || [];
+      list.push(entry);
+      modelGroups.set(entry.normalizedModel, list);
+    }
+
+    const distinctResolvedModels =
+      modelGroups.size;
+
+    let keptResolvedCount = 0;
+
+    for (const [normalizedModel, group] of modelGroups) {
+      const brands =
+        new Set(
+          group
+            .map(entry => String(entry.brand || "").toLowerCase())
+            .filter(Boolean)
+        );
+
+      /*
+        Same model text under two different brands is not the same
+        product ("Nikon F" vs "Canon F-1" style collisions).
+      */
+      if (brands.size > 1) {
+        keptResolvedCount += group.length;
+        continue;
+      }
+
+      const modelCount =
+        getSellerStatedSingleUnitCount({
+          anchors:
+            buildSingleUnitModelAnchors(normalizedModel),
+          family,
+          texts: allSellerTexts
+        });
+
+      /*
+        "2 cameras" with both detected as the same model: the
+        family count covers this model once every other distinct
+        model in the family has taken one unit.
+      */
+      const familyShare =
+        Number.isFinite(familyCount) && familyCount > 1
+          ? Math.max(1, familyCount - (distinctResolvedModels - 1))
+          : 1;
+
+      const allowed =
+        Math.max(1, modelCount, familyShare);
+
+      if (group.length <= allowed) {
+        keptResolvedCount += group.length;
+
+        if (group.length > 1) {
+          console.log(
+            "[SINGLE-UNIT GUARD] Keeping multiple identical products: seller explicitly states that many.",
+            {
+              family,
+              model: normalizedModel,
+              sellerStatedCount:
+                Number.isFinite(allowed) ? allowed : "plural",
+              productIds: group.map(entry => entry.productId)
+            }
+          );
+        }
+
+        continue;
+      }
+
+      const ranked = [...group].sort(rank);
+      const kept = ranked.slice(0, allowed);
+      keptResolvedCount += kept.length;
+
+      for (const duplicate of ranked.slice(allowed)) {
+        removedIds.add(duplicate.productId);
+
+        removals.push({
+          productId: duplicate.productId,
+          productType: duplicate.productType,
+          suppressedAsLikelyDuplicate: true,
+          suppressedBy: "single-unit-identical-model",
+          reason:
+            `Same model "${describe(duplicate)}" as ${kept
+              .map(entry => entry.productId)
+              .join(", ")}; the seller does not explicitly state more than ` +
+            `${allowed} of this product, so this is treated as the same physical item.`,
+          possibleDuplicateOf:
+            kept.map(entry => entry.productId),
+          evidence: {
+            family,
+            model: normalizedModel,
+            sellerStatedCount: allowed,
+            kept: kept.map(entry => ({
+              productId: entry.productId,
+              identity: describe(entry),
+              images: entry.images,
+              maxReadability: entry.maxReadability
+            })),
+            removedImages: duplicate.images,
+            removedMaxReadability: duplicate.maxReadability
+          }
+        });
+      }
+    }
+
+    /*
+      ---------- Phase B: unresolved siblings ----------
+    */
+    const unresolved =
+      members
+        .filter(entry => !entry.resolved)
+        .sort(rank);
+
+    if (!unresolved.length) {
+      continue;
+    }
+
+    if (
+      sellerUsesFamilyPlural({
+        family,
+        texts: titleAndIncluded
+      })
+    ) {
+      console.log(
+        "[SINGLE-UNIT GUARD] Keeping unresolved products: seller uses a plural for this product family.",
+        {
+          family,
+          productIds: unresolved.map(entry => entry.productId)
+        }
+      );
+
+      continue;
+    }
+
+    const sellerListedItems =
+      countSellerListedFamilyItems({
+        familyNoun,
+        resolvedModels:
+          Array.from(modelGroups.keys()),
+        included
+      });
+
+    const familyAllowed =
+      Math.max(
+        1,
+        Number.isFinite(familyCount) ? familyCount : 1,
+        keptResolvedCount,
+        sellerListedItems
+      );
+
+    const unresolvedAllowed =
+      Math.max(0, familyAllowed - keptResolvedCount);
+
+    if (unresolved.length <= unresolvedAllowed) {
+      continue;
+    }
+
+    const keptFamily =
+      members
+        .filter(entry =>
+          !removedIds.has(entry.productId) &&
+          entry.resolved
+        )
+        .concat(unresolved.slice(0, unresolvedAllowed));
+
+    for (const duplicate of unresolved.slice(unresolvedAllowed)) {
+      removedIds.add(duplicate.productId);
+
+      removals.push({
+        productId: duplicate.productId,
+        productType: duplicate.productType,
+        suppressedAsLikelyDuplicate: true,
+        suppressedBy: "single-unit-unresolved-sibling",
+        reason:
+          `No specific model of its own, and the seller does not explicitly ` +
+          `state more than ${familyAllowed} ${family} item(s), which ` +
+          `${keptFamily.map(entry => entry.productId).join(", ") || "another product"} ` +
+          `already account for. Treated as another detection of the same physical item.`,
+        possibleDuplicateOf:
+          keptFamily.map(entry => entry.productId),
+        evidence: {
+          family,
+          sellerStatedFamilyCount:
+            Number.isFinite(familyCount) ? familyCount : "plural",
+          kept: keptFamily.map(entry => ({
+            productId: entry.productId,
+            identity: describe(entry),
+            images: entry.images,
+            maxReadability: entry.maxReadability
+          })),
+          removedImages: duplicate.images,
+          removedMaxReadability: duplicate.maxReadability,
+          removedWasInStep5Output: duplicate.inStep5Output
+        }
+      });
+    }
+  }
+
+  return removals;
+}
+
+/*
+  ============================================================
   SELLER-EXCLUDED LENS REMOVAL
   ============================================================
 
@@ -14549,6 +15485,13 @@ PRODUCT IDENTITY & RECONCILIATION
 - Seller-stated quantities ("2 lenses") matched by 2 gallery IDs → don't add
   more. Add a *_text_* product only if seller evidence establishes a physical
   product beyond what gallery IDs already represent.
+- SINGLE-UNIT RULE: unless the title/description/seller facts EXPLICITLY state
+  more than one of a product ("2x", "two", "pair", "both", "x2", a plural),
+  the seller is selling ONE of it. Never give two productIds the same model
+  because the seller named that model once — an extra gallery ID with no
+  model evidence of its own (low readability, no own OCR) is another photo of
+  the same item; leave its identity fields null rather than copying the
+  other product's identity onto it.
 - Visual-search conflicts for the same product: trust the image with the
   higher modelReadabilityScore for that specific product.
 - DataForSEO establishes a new exact identity only when confidence="high"
@@ -15164,6 +16107,42 @@ const sameFocalDuplicateRemovals =
 for (const removal of sameFocalDuplicateRemovals) {
   console.warn(
     "[SAME-FOCAL DUPLICATE] Merging duplicate lens product:",
+    removal
+  );
+
+  suppressedGalleryProducts.push(
+    removal
+  );
+}
+
+/*
+  Single-unit guard for camera bodies / cameras / flashes / other
+  non-lens products (see identifyDuplicateSingleUnitProducts).
+  Unless the seller explicitly states more than one, one item.
+  Runs on both passes and BEFORE structural recovery, so a dropped
+  duplicate ID is not restored as an unresolved placeholder, never
+  reaches paid visual identification, and is carried into the
+  post-visual pass via suppressedGalleryProducts.
+*/
+const singleUnitDuplicateRemovals =
+  identifyDuplicateSingleUnitProducts({
+    primaryProducts:
+      parsedPrimaryProducts,
+    galleryResults,
+    listingTitle,
+    listingDescription,
+    explicitFacts,
+    alreadySuppressedIds:
+      new Set(
+        suppressedGalleryProducts.map(
+          entry => entry.productId
+        )
+      )
+  });
+
+for (const removal of singleUnitDuplicateRemovals) {
+  console.warn(
+    "[SINGLE-UNIT GUARD] Merging duplicate product:",
     removal
   );
 
