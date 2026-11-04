@@ -1938,6 +1938,39 @@ async function prepareDataForSeoCrops(
   );
 }
 
+
+/*
+  Visual (AI Mode) answers are conversational. Anything that is
+  "UNKNOWN ..." chatter, a question/offer, or multi-sentence prose is
+  NOT a model name. Bad lines become "UNKNOWN"; "" if nothing usable.
+*/
+function sanitizeVisualIdentificationAnswer(value) {
+  const chatter =
+    /\b(let me know|if you(?:'d| would) like|would you like|i can help|i(?:'m| am) (?:not )?(?:able|unable|sure)|i cannot|i can't|please (?:provide|let|share)|help you (?:find|identify)|it appears|it looks like|appears to be)\b/i;
+
+  const lines =
+    String(value || "")
+      .split(/\r?\n/)
+      .map(line => line.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+
+  if (!lines.length) return "";
+
+  const cleaned = lines.map(line =>
+    /^unknown\b/i.test(line) ||
+    line.length > 140 ||
+    /[?!]/.test(line) ||
+    /\.\s+[A-Z]/.test(line) ||
+    chatter.test(line)
+      ? "UNKNOWN"
+      : line
+  );
+
+  return cleaned.every(line => line === "UNKNOWN")
+    ? ""
+    : cleaned.join("\n");
+}
+
 async function runLocalGoogleLensTargets(
   targets
 ) {
@@ -1976,7 +2009,13 @@ async function runLocalGoogleLensTargets(
     results
   );
 
-  return results;
+  return results.map(result => ({
+    ...result,
+    identifiedModel:
+      sanitizeVisualIdentificationAnswer(
+        result?.identifiedModel
+      )
+  }));
 }
 
 /*
@@ -3047,7 +3086,7 @@ function sleep(ms) {
   is a bare <span class="x1lliihq ...">Buy now</span>.
   ============================================================
 */
-function hasMarketplaceBuyNowButton() {
+function findMarketplaceBuyNowButton() {
   const candidates =
     document.querySelectorAll(
       'button, [role="button"], a[role="button"], a, [aria-label], span'
@@ -3055,64 +3094,122 @@ function hasMarketplaceBuyNowButton() {
 
   for (const element of candidates) {
     const label =
-      String(
-        element.getAttribute("aria-label") ||
-        ""
-      )
+      String(element.getAttribute("aria-label") || "")
         .trim()
         .toLowerCase();
 
     const text =
-      String(
-        element.innerText ||
-        element.textContent ||
-        ""
-      )
+      String(element.innerText || element.textContent || "")
         .trim()
         .toLowerCase();
 
+    if (label !== "buy now" && text !== "buy now") {
+      continue;
+    }
+
+    if (!isVisibleMarketplaceElement(element)) {
+      continue;
+    }
+
+    /*
+      Reject look-alikes: text inside an aria-hidden subtree
+      (stale / offscreen panels), disabled controls, and
+      slivers too small to be a real checkout button.
+    */
+    const clickable =
+      element.closest(
+        'button, [role="button"], a[href]'
+      ) || element;
+
     if (
-      label !== "buy now" &&
-      text !== "buy now"
+      element.closest('[aria-hidden="true"]') ||
+      clickable.getAttribute("aria-disabled") === "true" ||
+      clickable.disabled === true
     ) {
       continue;
     }
 
-    if (isVisibleMarketplaceElement(element)) {
-      return true;
+    const rect = clickable.getBoundingClientRect();
+
+    if (rect.width < 40 || rect.height < 20) {
+      continue;
     }
+
+    return clickable;
   }
 
-  return false;
+  return null;
+}
+
+function hasMarketplaceBuyNowButton() {
+  return Boolean(findMarketplaceBuyNowButton());
+}
+
+function getMarketplaceItemIdFromUrl() {
+  const match =
+    window.location.href.match(
+      /\/marketplace\/item\/(\d+)/
+    );
+
+  return match ? match[1] : "";
 }
 
 /*
-  The listing panel renders progressively, so wait for either the
-  Buy now button or evidence that the listing has loaded without
-  one. Returns:
-    true  -> Buy now button found
+  The listing panel renders progressively and the PREVIOUS
+  listing's panel can still be in the DOM right after a click,
+  so a single instant "Buy now found" is not trustworthy.
+  true is only returned when the same button is still present
+  ~800 ms later AND the listing URL id and title did not change
+  in between. Returns:
+    true  -> Buy now button confirmed
     false -> listing loaded and there is no Buy now button
     null  -> could not tell (listing never finished rendering)
 */
 async function waitForMarketplaceBuyNowDecision({
   minWaitMs = 2500,
-  maxWaitMs = 7000
+  maxWaitMs = 7000,
+  confirmDelayMs = 800
 } = {}) {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < maxWaitMs) {
     if (hasMarketplaceBuyNowButton()) {
-      return true;
+      const idBefore = getMarketplaceItemIdFromUrl();
+      const titleBefore =
+        String(getListingTitle() || "").trim();
+
+      await sleep(confirmDelayMs);
+
+      const button = findMarketplaceBuyNowButton();
+
+      if (
+        button &&
+        getMarketplaceItemIdFromUrl() === idBefore &&
+        String(getListingTitle() || "").trim() === titleBefore
+      ) {
+        console.log(
+          "[BUY NOW GATE] Confirmed button:",
+          {
+            tag: button.tagName,
+            role: button.getAttribute("role"),
+            text: String(button.innerText || "").trim().slice(0, 40),
+            itemId: idBefore,
+            title: titleBefore,
+            html: String(button.outerHTML || "").slice(0, 300)
+          }
+        );
+
+        return true;
+      }
+
+      continue;
     }
 
-    const elapsed =
-      Date.now() - startedAt;
+    const elapsed = Date.now() - startedAt;
 
     if (
       elapsed >= minWaitMs &&
-      String(
-        getListingTitle() || ""
-      ).trim()
+      String(getListingTitle() || "").trim()
     ) {
       return false;
     }
@@ -4368,144 +4465,6 @@ function getFacebookMarketplaceItemId(url = window.location.href) {
   }
 }
 
-/*
-  ============================================================
-  LISTING CLAIM LIFECYCLE: reserve -> confirm (done) / release
-
-  claimMarketplaceListingId() only RESERVES a listing. It becomes
-  permanently "processed" when markMarketplaceAutoAnalysisComplete()
-  confirms a real result, and is RELEASED when the analysis fails
-  (error / timeout / no credits). A released listing is also kept out
-  of THIS browser's selection for a short cooldown so a persistent
-  failure cannot make the scanner re-open the same listing in a loop.
-  ============================================================
-*/
-const RELEASED_LISTING_COOLDOWN_KEY =
-  "marketplaceReleasedListingCooldown";
-
-const RELEASED_LISTING_COOLDOWN_MS =
-  15 * 60 * 1000;
-
-async function getRecentlyReleasedListingIds() {
-  try {
-    const stored =
-      await chrome.storage.local.get(
-        RELEASED_LISTING_COOLDOWN_KEY
-      );
-
-    const map =
-      stored[RELEASED_LISTING_COOLDOWN_KEY] || {};
-
-    const now = Date.now();
-
-    return Object.keys(map).filter(
-      id => now - Number(map[id] || 0) < RELEASED_LISTING_COOLDOWN_MS
-    );
-  } catch (error) {
-    return [];
-  }
-}
-
-async function postListingClaimAction(path, listingId) {
-  const response =
-    await fetchLocalServer(
-      path,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ listingId })
-      }
-    );
-
-  const data = await readJsonSafely(response);
-
-  if (!response.ok || data?.error) {
-    throw new Error(
-      data?.error || `${path} failed (${response.status})`
-    );
-  }
-
-  return data;
-}
-
-/** Best effort, retried once, never throws: it must not break the analysis pipeline. */
-async function confirmListingProcessed(listingId) {
-  const id = String(listingId || "").trim();
-
-  if (!id) return;
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      await postListingClaimAction(
-        "/processed-marketplace-listings/complete",
-        id
-      );
-      return;
-    } catch (error) {
-      console.warn(
-        `[LISTING CLAIM] Could not confirm ${id} (attempt ${attempt}):`,
-        error?.message || error
-      );
-      await sleep(500);
-    }
-  }
-}
-
-async function releaseListingClaim(listingId, reason = "") {
-  const id = String(listingId || "").trim();
-
-  if (!id) return;
-
-  try {
-    const stored =
-      await chrome.storage.local.get(
-        RELEASED_LISTING_COOLDOWN_KEY
-      );
-
-    const now = Date.now();
-    const map = {};
-
-    for (const [key, value] of Object.entries(
-      stored[RELEASED_LISTING_COOLDOWN_KEY] || {}
-    )) {
-      if (now - Number(value || 0) < RELEASED_LISTING_COOLDOWN_MS) {
-        map[key] = value;
-      }
-    }
-
-    map[id] = now;
-
-    await chrome.storage.local.set({
-      [RELEASED_LISTING_COOLDOWN_KEY]: map
-    });
-  } catch (error) {
-    /* cooldown is a convenience only */
-  }
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      await postListingClaimAction(
-        "/processed-marketplace-listings/release",
-        id
-      );
-
-      console.warn(
-        "[LISTING CLAIM] Released unanalyzed listing so it is rescanned later:",
-        id,
-        reason
-      );
-
-      return;
-    } catch (error) {
-      console.warn(
-        `[LISTING CLAIM] Could not release ${id} (attempt ${attempt}):`,
-        error?.message || error
-      );
-      await sleep(500);
-    }
-  }
-}
-
 async function getProcessedMarketplaceListingIds(
   candidateListingIds = []
 ) {
@@ -4561,24 +4520,11 @@ async function getProcessedMarketplaceListingIds(
     );
   }
 
-  const serverProcessedIds =
-    Array.isArray(
-      data.processedListingIds
-    )
-      ? data.processedListingIds
-      : [];
-
-  const recentlyReleasedIds =
-    await getRecentlyReleasedListingIds();
-
-  return [
-    ...new Set([
-      ...serverProcessedIds,
-      ...listingIds.filter(id =>
-        recentlyReleasedIds.includes(id)
-      )
-    ])
-  ];
+  return Array.isArray(
+    data.processedListingIds
+  )
+    ? data.processedListingIds
+    : [];
 }
 
 
@@ -6867,11 +6813,6 @@ if (
     "timeout-with-other-job"
   );
 
-  await releaseListingClaim(
-    currentListingId,
-    "stale child abandoned"
-  );
-
 
   console.warn(
     "[MARKETPLACE TAB] Abandoning stale child:",
@@ -6999,11 +6940,6 @@ if (
   */
   await updateSessionListingResult(
     finalTimeoutResult
-  );
-
-  await releaseListingClaim(
-    currentListingId,
-    "analysis timed out after retry"
   );
 
   await clearListingAnalysisRetryCount(
@@ -8214,102 +8150,9 @@ function parsePriceValue(value) {
   call and before pricing). Any detection skips the listing.
   ============================================================
 */
-/*
-  NO-BUY MODEL LIST (extends the original PowerShot skip)
-
-  Add a model family by appending it to one of the arrays below;
-  nothing else needs to change.
-
-  strong: distinctive names. Matched in the listing TITLE (as
-          "<brand> <family>") and in resolved non-lens items.
-  weak:   short/generic names ("AF", "Zoom", "Dial"...) that
-          would collide with lenses and accessories in free
-          text. Matched ONLY against the resolved model name of
-          a non-lens item, and only at the START of the model
-          (e.g. "AF600" matches, "AF-S Nikkor 50mm" is a lens
-          and is never checked).
-*/
-const NO_BUY_MODEL_FAMILIES = {
-  canon: {
-    strong: [
-      "Sure Shot", "IXY", "IXY Digital", "IXUS", "Digital IXUS",
-      "ELPH", "Digital ELPH", "Prima", "Autoboy", "Snappy",
-      "Sprint", "Top Shot", "Photura", "Epoca", "AF35M",
-      "AF35ML", "Canonet", "Autoboy Luna", "Prima Super",
-      "Sure Shot Zoom", "Sure Shot Tele", "Sure Shot Max",
-      "Sure Shot Supreme", "Sure Shot Classic",
-      "Sure Shot Sleek", "Sure Shot Z", "Sure Shot WP-1",
-      "Sure Shot A-1"
-    ],
-    weak: ["Owl", "Demi", "Dial"]
-  },
-  nikon: {
-    strong: [
-      "Coolpix", "One Touch", "Lite Touch", "Zoom Touch",
-      "Fun Touch", "Nice Touch", "Easy Touch", "Action Touch",
-      "Tele Touch", "Nuvis", "Pikaichi", "L35AF", "L35AD",
-      "L35AW AF", "L135AF", "28Ti", "35Ti", "W35"
-    ],
-    weak: ["Mini", "Zoom", "TW", "AF", "EF", "RF", "RD"]
-  }
-};
-
-/*
-  Extra per-brand patterns that are not simple name prefixes.
-  Matched against the normalized model name (start of model) and,
-  prefixed with the brand, against the normalized title.
-*/
-const NO_BUY_EXTRA_MODEL_PATTERNS = {
-  // PowerShot G7 / G7 X (Mark II, III)
-  canon: [/g\s*7\s*x?(?![a-z0-9])/],
-  nikon: []
-};
-
-function normalizeNoBuyText(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-function noBuyFamilyToPattern(family) {
-  return normalizeNoBuyText(family)
-    .split(" ")
-    .map(part => part.replace(/([a-z])(?=\d)|(\d)(?=[a-z])/g, "$1$2 ").split(" ").filter(Boolean).join("\\s*"))
-    .join("\\s*");
-}
-
-const NO_BUY_COMPILED = Object.keys(NO_BUY_MODEL_FAMILIES).map(brand => {
-  const fam = NO_BUY_MODEL_FAMILIES[brand];
-  const strong = fam.strong.map(noBuyFamilyToPattern);
-  const all = strong.concat(fam.weak.map(noBuyFamilyToPattern));
-  const extra = (NO_BUY_EXTRA_MODEL_PATTERNS[brand] || []).map(r => r.source);
-  return {
-    brand,
-    titleRegex: new RegExp(
-      `\\b${brand}\\s+(?:${strong.concat(extra).join("|")})`
-    ),
-    modelRegex: new RegExp(
-      `^(?:${all.concat(extra).join("|")})(?![a-z])`
-    )
-  };
-});
-
-function isLensProductType(productType) {
-  return /\blens\b/i.test(String(productType || ""));
-}
-
 function isCanonPowerShotText(text) {
-  const raw = String(text || "");
-
-  if (/power\s*-?\s*shot/i.test(raw)) {
-    return true;
-  }
-
-  const normalized = normalizeNoBuyText(raw);
-
-  return NO_BUY_COMPILED.some(
-    entry => entry.titleRegex.test(normalized)
+  return /power\s*-?\s*shot/i.test(
+    String(text || "")
   );
 }
 
@@ -8318,41 +8161,12 @@ function findCanonPowerShotPrimaryItems(items) {
     Array.isArray(items)
       ? items
       : []
-  ).filter(item => {
-    const modelText =
-      `${item?.model || ""} ${item?.nonLensIdentity?.modelName || ""}`;
-
-    if (
+  ).filter(
+    item =>
       isCanonPowerShotText(
-        `${item?.brand || ""} ${modelText}`
+        `${item?.brand || ""} ${item?.model || ""} ${item?.nonLensIdentity?.modelName || ""}`
       )
-    ) {
-      return true;
-    }
-
-    // Family-prefix check, non-lens items only.
-    if (isLensProductType(item?.productType)) {
-      return false;
-    }
-
-    const brand = normalizeNoBuyText(item?.brand);
-
-    return NO_BUY_COMPILED.some(entry => {
-      if (!brand.includes(entry.brand)) {
-        return false;
-      }
-
-      return [
-        item?.model,
-        item?.nonLensIdentity?.modelName
-      ].some(value => {
-        const model = normalizeNoBuyText(value)
-          .replace(new RegExp(`^${entry.brand}\\s+`), "");
-
-        return model && entry.modelRegex.test(model);
-      });
-    });
-  });
+  );
 }
 
 function buildCanonPowerShotPassResult({
@@ -8365,7 +8179,7 @@ function buildCanonPowerShotPassResult({
       "Pass",
 
     reason:
-      `Immediate skip: no-buy camera model detected (${detectedFrom}). These listings are not analyzed.`,
+      `Immediate skip: Canon PowerShot detected (${detectedFrom}). PowerShot listings are not analyzed.`,
 
     facebookPrice,
 
@@ -8677,96 +8491,6 @@ function extractFacebookAskingPriceFromOcr(ocrText, title) {
 
     if (next.some(line => afterPriceMarkerPattern.test(line))) {
       return parseAmount(m[1]);
-    }
-  }
-
-  return null;
-}
-
-/*
-  ============================================================
-  SHIPPING FEE FROM LISTING OCR
-
-  Marketplace renders shipping directly under the asking price:
-
-    $214
-    Ships for $14.03
-    Estimated arrival Nov 4 - Nov 7
-
-  or "Free shipping". Other listing tiles on the page can show
-  their own "Ships for" lines, so look first in the few lines that
-  follow the listing's own price line, and only fall back to the
-  first shipping line anywhere in the OCR.
-
-  Returns a number (0 for free shipping) or null when no shipping
-  information is visible.
-  ============================================================
-*/
-function extractShippingFeeFromOcr(ocrText, askingPrice) {
-  const lines =
-    String(ocrText || "")
-      .split("\n")
-      .map(line => line.trim())
-      .filter(Boolean);
-
-  const parseShippingLine = line => {
-    if (/\bfree shipping\b|\bships? (?:for )?free\b/i.test(line)) {
-      return 0;
-    }
-
-    const match =
-      line.match(
-        /\b(?:ships for|shipping(?: fee| cost)?:?|\+)\s*\$\s?([\d,]+(?:\.\d{1,2})?)/i
-      ) ||
-      line.match(
-        /\$\s?([\d,]+(?:\.\d{1,2})?)\s*shipping\b/i
-      );
-
-    if (!match) {
-      return null;
-    }
-
-    const value =
-      Number(match[1].replace(/,/g, ""));
-
-    return Number.isFinite(value) && value >= 0 && value < 1000
-      ? value
-      : null;
-  };
-
-  if (Number.isFinite(Number(askingPrice))) {
-    const priceIndex =
-      lines.findIndex(line => {
-        const match =
-          line.match(/^\$\s?([\d,]+(?:\.\d{1,2})?)/);
-
-        return (
-          match &&
-          Number(match[1].replace(/,/g, "")) ===
-            Number(askingPrice)
-        );
-      });
-
-    if (priceIndex !== -1) {
-      for (
-        let i = priceIndex;
-        i < Math.min(priceIndex + 6, lines.length);
-        i++
-      ) {
-        const fee = parseShippingLine(lines[i]);
-
-        if (fee != null) {
-          return fee;
-        }
-      }
-    }
-  }
-
-  for (const line of lines) {
-    const fee = parseShippingLine(line);
-
-    if (fee != null) {
-      return fee;
     }
   }
 
@@ -9401,18 +9125,6 @@ async function fetchLocalServer(
       "X-Analysis-Run-Id"
     ] =
       analysisRunId;
-
-    const scanSessionId =
-      storedRun[
-        MARKETPLACE_ANALYSIS_RUN_KEY
-      ]?.scanSessionId || "";
-
-    if (scanSessionId) {
-      requestHeaders[
-        "X-Scan-Session-Id"
-      ] =
-        scanSessionId;
-    }
   }
 
   for (
@@ -9529,19 +9241,6 @@ async function fetchLocalServer(
           }
         );
 
-      if (response.headers.get("X-Fatal-Api-Error")) {
-        let fatalReason = "";
-
-        try {
-          fatalReason =
-            JSON.parse(await response.clone().text())?.fatalReason || "";
-        } catch (parseError) {
-          /* reason is optional */
-        }
-
-        await handleFatalApiBlock(fatalReason);
-      }
-
       return response;
 
 } catch (error) {
@@ -9617,116 +9316,6 @@ async function fetchLocalServer(
     `Check that the server is running at ` +
     `${LOCAL_SERVER_BASE_URL}.`
   );
-}
-
-/*
-  ============================================================
-  FATAL API ERROR (no OpenAI credits / bad key)
-
-  The server tags responses with the header X-Fatal-Api-Error when
-  every further call is doomed to fail. fetchLocalServer() sees the
-  header on ANY response, so the scan stops even if a step swallows
-  the error: the in-flight listing is released (rescanned later), the
-  scanner is stopped, and a banner explains what to fix.
-  ============================================================
-*/
-let fatalApiStopInProgress = false;
-const FATAL_API_ERROR_STORAGE_KEY = "marketplaceFatalApiError";
-
-function showFatalApiBanner(message) {
-  try {
-    const existing = document.getElementById("fatal-api-banner");
-
-    if (existing) existing.remove();
-
-    const banner = document.createElement("div");
-    banner.id = "fatal-api-banner";
-    banner.style.cssText =
-      "position:fixed;top:0;left:0;right:0;z-index:2147483647;" +
-      "background:#b00020;color:#fff;font:600 15px/1.4 system-ui,sans-serif;" +
-      "padding:14px 48px 14px 16px;box-shadow:0 2px 12px rgba(0,0,0,.4);";
-    banner.textContent =
-      `SCAN STOPPED: ${message} ` +
-      "The listing being analyzed was released and will be rescanned.";
-
-    const close = document.createElement("button");
-    close.textContent = "×";
-    close.style.cssText =
-      "position:absolute;right:12px;top:8px;background:none;border:0;" +
-      "color:#fff;font-size:24px;cursor:pointer;";
-    close.onclick = () => banner.remove();
-    banner.appendChild(close);
-
-    document.body.appendChild(banner);
-  } catch (error) {
-    /* display only */
-  }
-}
-
-async function handleFatalApiBlock(reason) {
-  if (fatalApiStopInProgress) return;
-
-  fatalApiStopInProgress = true;
-
-  const message =
-    reason || "A required API is unavailable (no credits or invalid key).";
-
-  try {
-    console.error("[FATAL API ERROR] Stopping scan:", message);
-
-    const stored =
-      await chrome.storage.local.get(MARKETPLACE_AUTO_STATE_KEY);
-
-    const state = stored[MARKETPLACE_AUTO_STATE_KEY] || {};
-
-    const listingId =
-      getFacebookMarketplaceItemId(
-        String(window.location.href || "").split("?")[0]
-      ) ||
-      getFacebookMarketplaceItemId(
-        String(state.currentListingUrl || "").split("?")[0]
-      );
-
-    if (listingId) {
-      await releaseListingClaim(listingId, message);
-    }
-
-    await chrome.storage.local.set({
-      [FATAL_API_ERROR_STORAGE_KEY]: {
-        message,
-        at: Date.now()
-      }
-    });
-
-    if (state.running) {
-      await stopMarketplaceAutoAnalyzer({
-        reason: `Stopped automatically: ${message}`
-      });
-    }
-
-    showFatalApiBanner(message);
-  } catch (error) {
-    console.error("[FATAL API ERROR] Could not complete the stop:", error);
-  } finally {
-    setTimeout(() => {
-      fatalApiStopInProgress = false;
-    }, 30000);
-  }
-}
-
-/* Show the banner on every open Facebook tab, not just the one that hit the error. */
-try {
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "local") return;
-
-    const change = changes[FATAL_API_ERROR_STORAGE_KEY];
-
-    if (change?.newValue?.message) {
-      showFatalApiBanner(change.newValue.message);
-    }
-  });
-} catch (error) {
-  /* storage listener is a convenience only */
 }
 
 class LocalServerError extends Error {
@@ -10199,13 +9788,6 @@ async function getOrCreateMarketplaceAnalysisRun() {
 
     listingId,
 
-    /*
-      Groups this listing's server log into the scan session's
-      log file (marketplace-analysis-logs/session_<id>.log).
-    */
-    scanSessionId:
-      await getCurrentScanSessionLogId(),
-
     startedAt:
       Date.now(),
 
@@ -10219,55 +9801,6 @@ async function getOrCreateMarketplaceAnalysisRun() {
   });
 
   return run;
-}
-
-
-/*
-  Session log ID for the server's per-session log file.
-
-  Auto scan running  -> "scan_2026-10-26_09-14-03" (scan start time,
-                        local), shared by every listing in that scan.
-  No auto scan       -> "manual_2026-10-26", one file per day for
-                        listings opened by hand.
-*/
-async function getCurrentScanSessionLogId() {
-  const pad = value => String(value).padStart(2, "0");
-
-  const formatDate = date =>
-    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-
-  const formatTime = date =>
-    `${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
-
-  try {
-    const stored =
-      await chrome.storage.local.get(
-        MARKETPLACE_AUTO_STATE_KEY
-      );
-
-    const state =
-      stored[MARKETPLACE_AUTO_STATE_KEY];
-
-    const startedAt =
-      Number(
-        state?.createdAt ||
-        state?.sessionLog?.startedAt ||
-        0
-      );
-
-    if (state?.running && startedAt) {
-      const date = new Date(startedAt);
-
-      return `scan_${formatDate(date)}_${formatTime(date)}`;
-    }
-  } catch (error) {
-    console.warn(
-      "[ANALYSIS LOG] Could not read scan state for session log ID:",
-      error
-    );
-  }
-
-  return `manual_${formatDate(new Date())}`;
 }
 
 
@@ -10674,10 +10207,62 @@ return (
     );
 
 
-  return String(
-    match?.identifiedModel ||
-    ""
-  ).trim();
+  const answer =
+    String(
+      match?.identifiedModel ||
+      ""
+    ).trim();
+
+  /*
+    A visual answer must not contradict what this product's own
+    OCR / seller text already established. When a listing photographs
+    several lenses together, AI Mode can answer with a DIFFERENT lens
+    (e.g. product has "EFS 18-55mm", answer is "EF-S 10-18mm"). That
+    answer used to become this product's identity, so one lens was
+    valued twice and the other never.
+  */
+  const productFocal =
+    String(
+      product?.lensIdentity?.focalLength ||
+      ""
+    )
+      .toLowerCase()
+      .replace(/\s+/g, "");
+
+  if (
+    answer &&
+    productFocal &&
+    /lens/i.test(
+      String(product?.productType || "")
+    )
+  ) {
+    const answerFocal =
+      (
+        answer.match(
+          /\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*mm/i
+        ) || [""]
+      )[0]
+        .toLowerCase()
+        .replace(/\s+/g, "");
+
+    if (
+      answerFocal &&
+      answerFocal !== productFocal
+    ) {
+      console.warn(
+        "[VISUAL ID GUARD] Rejected visual answer that contradicts the product's own focal length:",
+        {
+          productId,
+          productFocal,
+          answer
+        }
+      );
+
+      return "";
+    }
+  }
+
+  return answer;
 }
 
   /*
@@ -11024,13 +10609,15 @@ function convertPrimaryProductToCompItem(
       const buyNowDecision =
         await waitForMarketplaceBuyNowDecision();
 
-      if (buyNowDecision === false) {
+      if (buyNowDecision === false || buyNowDecision === null) {
         const noBuyNowPassResult = {
           recommendation:
             "Pass",
 
           reason:
-            "Immediate skip: no Buy now button on this listing (shipping mode requires Buy now).",
+            buyNowDecision === null
+              ? "Immediate skip: could not confirm a Buy now button (listing never finished rendering; shipping mode fails closed)."
+              : "Immediate skip: no Buy now button on this listing (shipping mode requires Buy now).",
 
           facebookPrice:
             null,
@@ -11297,27 +10884,6 @@ if (ocrAnchoredPrice != null) {
       ")"
     );
   }
-}
-
-/*
-  Shipping fee for the profit calculation (see
-  extractShippingFeeFromOcr). Raw OCR is used, same as price.
-*/
-const shippingFee =
-  extractShippingFeeFromOcr(
-    listingScreenshotOcrRaw,
-    facebookPrice
-  );
-
-console.log(
-  "[STEP 1A] Shipping fee from OCR:",
-  shippingFee
-);
-
-if (shippingFee == null) {
-  console.warn(
-    "[STEP 1A] No shipping fee visible in listing OCR; profit will be calculated with $0 shipping."
-  );
 }
 
 /*
@@ -13988,16 +13554,6 @@ await chrome.storage.local.set({
 
     facebookPrice,
 
-    shippingFee,
-
-    /*
-      Every primary sellable item in the listing, including ones
-      priced from the database, so the server's $5-per-item
-      adjustment counts all of them.
-    */
-    primaryItemCount:
-      primaryItems.length,
-
     facebookUrl,
 
     imageUrls:
@@ -14410,15 +13966,6 @@ if (!opened) {
     console.error(
       error
     );
-
-    /*
-      Out of credits / bad key: fetchLocalServer already released the
-      listing, stopped the scan and showed the banner. Nothing more to do
-      (and no alert() dialog on top of it).
-    */
-    if (error?.code === "FATAL_API_ERROR") {
-      return;
-    }
 
     const shouldRestartForJson =
       error
@@ -15062,11 +14609,10 @@ function showLotCompPanel(result) {
     <div style="font-size:20px; font-weight:800; margin-bottom:10px;">${escapeHtml(result.recommendation || "Unknown")}</div>
 
     <div><b>Facebook ask:</b> ${result.facebookPrice ? "$" + result.facebookPrice : "Not detected"}</div>
-<div><b>Shipping fee:</b> ${result.shippingFee != null ? "$" + result.shippingFee : "N/A"}</div>
-<div><b>15% negotiated price:</b> ${result.negotiatedPrice35 ? "$" + result.negotiatedPrice35 : "N/A"}</div>
+<div><b>35% negotiated price:</b> ${result.negotiatedPrice35 ? "$" + result.negotiatedPrice35 : "N/A"}</div>
 <div><b>Estimated resale value:</b> ${result.totalExpectedSalePrice != null ? "$" + result.totalExpectedSalePrice : "N/A"}</div>
 <div><b>Profit at ask:</b> ${result.profitAtAsk != null ? "$" + result.profitAtAsk : "N/A"}</div>
-<div><b>Profit at 15% off:</b> ${result.profitAt35 != null ? "$" + result.profitAt35 : "N/A"}</div>
+<div><b>Profit at 35% off:</b> ${result.profitAt35 != null ? "$" + result.profitAt35 : "N/A"}</div>
 <div><b>Max buy price:</b> ${result.maxBuyPrice != null ? "$" + result.maxBuyPrice : "N/A"}</div>
 
     <hr style="margin:10px 0;" />
@@ -15325,29 +14871,6 @@ async function markMarketplaceAutoAnalysisComplete(
       await clearMalformedJsonRetryCount(listingId);
     }
   }
-
-/*
-  The listing's claim is only a reservation until here.
-  A real result makes it permanent; an "Error" result (analysis
-  did not actually happen) releases it so it is scanned again.
-*/
-{
-  const claimListingId =
-    getFacebookMarketplaceItemId(
-      String(window.location.href || "").split("?")[0]
-    );
-
-  if (claimListingId) {
-    if (finalResult?.recommendation === "Error") {
-      await releaseListingClaim(
-        claimListingId,
-        finalResult?.reason || "analysis error"
-      );
-    } else {
-      await confirmListingProcessed(claimListingId);
-    }
-  }
-}
 
 if (!state?.running) return;
 
@@ -16576,13 +16099,6 @@ button.onclick =
           failedAt:
             Date.now()
         });
-
-        await releaseListingClaim(
-          getFacebookMarketplaceItemId(
-            String(window.location.href || "").split("?")[0]
-          ),
-          "unhandled analysis failure"
-        );
 
         await releaseMarketplaceFinishLock();
 

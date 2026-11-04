@@ -21541,6 +21541,7 @@ const SCAM_DETECTION_ENABLED = true;
   ============================================================
 
   Profit = total estimated resale of primary items
+         - 15% x total estimated resale of primary items
          + $5 x number of primary items
          - shipping fee
          - purchase price
@@ -21555,6 +21556,7 @@ const SCAM_DETECTION_ENABLED = true;
 const LOT_MIN_PROFIT = 35;
 const LOT_PER_ITEM_ADJUSTMENT = 5;
 const LOT_PURCHASE_FEE_RATE = 0.1025;
+const LOT_RESALE_DEDUCTION_RATE = 0.15;
 const LOT_NEGOTIATION_DISCOUNT = 0.15;
 
 function roundMoney(value) {
@@ -21572,9 +21574,12 @@ function calculateLotProfit({
   const price = Number(purchasePrice) || 0;
   const itemAdjustment =
     LOT_PER_ITEM_ADJUSTMENT * (Number(primaryItemCount) || 0);
+  const resaleDeduction =
+    LOT_RESALE_DEDUCTION_RATE * resale;
 
   return roundMoney(
-    resale +
+    resale -
+    resaleDeduction +
     itemAdjustment -
     shipping -
     price -
@@ -21591,10 +21596,13 @@ function calculateLotMaxBuyPrice({
   const shipping = Number(shippingFee) || 0;
   const itemAdjustment =
     LOT_PER_ITEM_ADJUSTMENT * (Number(primaryItemCount) || 0);
+  const resaleDeduction =
+    LOT_RESALE_DEDUCTION_RATE * resale;
 
   return roundMoney(
     (
-      resale +
+      resale -
+      resaleDeduction +
       itemAdjustment -
       shipping * (1 + LOT_PURCHASE_FEE_RATE) -
       LOT_MIN_PROFIT
@@ -21653,7 +21661,8 @@ function makeLotDecision({
       recommendation: "Buy Now",
       reason:
         `Estimated profit at asking price is $${profitAtAsk} ` +
-        `(after shipping, the ${LOT_PURCHASE_FEE_RATE * 100}% fee and ` +
+        `(after shipping, the ${LOT_PURCHASE_FEE_RATE * 100}% fee, ` +
+        `the ${LOT_RESALE_DEDUCTION_RATE * 100}% resale deduction and ` +
         `the $${LOT_PER_ITEM_ADJUSTMENT}/item adjustment), clearing ` +
         `the $${LOT_MIN_PROFIT} target.`,
       scamFlag: false,
@@ -21876,6 +21885,11 @@ reason:
       {
         totalExpectedSalePrice,
         primaryItemCount,
+        resaleDeduction:
+          roundMoney(
+            LOT_RESALE_DEDUCTION_RATE *
+            totalExpectedSalePrice
+          ),
         perItemAdjustment:
           LOT_PER_ITEM_ADJUSTMENT * primaryItemCount,
         shippingFee,
