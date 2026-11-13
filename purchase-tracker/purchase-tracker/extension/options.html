@@ -11,6 +11,7 @@
   h2 { font-size: 1rem; margin: 2rem 0 .5rem; padding-top: 1rem; border-top: 1px solid var(--line); }
   p.hint { color: var(--b); margin: .1rem 0 .8rem; }
   label { display: block; font-weight: 600; margin-top: .8rem; }
+  label input[type=checkbox] { margin-right: .4rem; }
   input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: .5rem .6rem; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
   button { font: inherit; padding: .45rem .9rem; margin: .6rem .5rem 0 0; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
   button.primary { background: #1f4fd8; color: #fff; border-color: #1f4fd8; }
@@ -22,7 +23,7 @@
 </head>
 <body>
 <h1>Purchase Tracker</h1>
-<p class="hint">Every 3 hours while Chrome is open, checks Facebook order details and USPS tracking pages for items in your Purchased tab. Eligible items are moved to eBay inventory by Google Apps Script.</p>
+<p class="hint">Every 3 hours while Chrome is open, checks Facebook order status (tracking + seller), Meta Pay / Marketplace notifications (cancellations) and USPS tracking pages for items in your Purchased tab. Eligible items are moved to eBay inventory by Google Apps Script.</p>
 
 <h2>Connection</h2>
 <label for="apiUrl">Apps Script Web App URL</label>
@@ -40,12 +41,30 @@
 <button id="refresh">Refresh status</button>
 <pre id="status">…</pre>
 
+<h2>Cancellation signals</h2>
+<p class="hint">Each run (only while you have active purchases) also reads your Meta Pay wallet and Facebook Marketplace notifications to catch Canceled / Refunded / Expired orders. Meta Pay rows show the <em>seller's name</em>, so they are matched to purchases by the Seller column, verified by purchase date and amount.</p>
+<label><input type="checkbox" id="scanMetaPay"> Scan Meta Pay wallet (accountscenter.facebook.com)</label>
+<label><input type="checkbox" id="scanNotifications"> Scan Marketplace notifications</label>
+<button id="saveSignals">Save signal settings</button>
+<span id="signalMsg" role="status"></span>
+
 <h2>Probe a Facebook listing</h2>
-<p class="hint">Verifies the Order Details extraction on a purchase you actually made. Opens the page in a background tab, shows exactly what was found, and sends nothing to your sheet. Run this on a few real orders (awaiting shipment, shipped, canceled) before trusting the automation.</p>
+<p class="hint">Verifies the "View Order" → "Order status" extraction (status, tracking number, seller) on a purchase you actually made. Opens the page in a background tab, shows exactly what was found, and sends nothing to your sheet. Run this on a few real orders (awaiting shipment, shipped, delivered, canceled) before trusting the automation.</p>
 <label for="probeInput">Listing URL or ID</label>
 <input id="probeInput" type="text" placeholder="https://www.facebook.com/marketplace/item/1234567890/">
-<button id="probe">Probe</button>
+<button id="probe">Probe order</button>
+<button id="probeSeller">Probe seller only</button>
 <pre id="probeOut">Output appears here. The text preview may contain your address — it stays on this screen.</pre>
+
+<h2>Probe Meta Pay wallet</h2>
+<p class="hint">Opens your Meta Pay wallet in a background tab and lists the transactions it could read (seller, status, date, amount), plus a read-only preview of which Purchased rows the backend <em>would</em> update. Nothing is written. If Meta asks for your password, this reports REAUTH_REQUIRED — open the wallet once by hand.</p>
+<button id="probeMetaPay">Probe Meta Pay</button>
+<pre id="probeMetaPayOut">Output appears here.</pre>
+
+<h2>Probe Marketplace notifications</h2>
+<p class="hint">Reads Marketplace notifications and lists the order events it recognised (canceled / refunded / expired / delivered …), plus a read-only preview of matching Purchased rows. Nothing is written.</p>
+<button id="probeNotifications">Probe notifications</button>
+<pre id="probeNotificationsOut">Output appears here.</pre>
 
 <h2>Probe a USPS tracking number</h2>
 <p class="hint">Opens tools.usps.com/tracking in a background tab, types the number in, submits, and shows what was read. Nothing is sent to your sheet.</p>

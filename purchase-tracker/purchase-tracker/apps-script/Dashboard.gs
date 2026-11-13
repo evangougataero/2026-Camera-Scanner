@@ -70,12 +70,18 @@ function dashRow_(rec, nowMs, cfg) {
 
   // ---- attention issues (only CURRENT, actionable problems) ----
   var issues = [];
+  var seller = str_(rec['Seller']);
+  var cancelSignal = str_(rec['Cancel Signal']);
   if (!canceled) {
+    // A cancellation/refund signal that could not be applied automatically (already shipped/delivered, in inventory,
+    // or only a loose notification match). Leftover "Possible: …" values from an older version are ignored.
+    if (/^Review:/.test(cancelSignal)) issues.push({ p: 1, msg: 'Check Order — ' + cancelSignal.replace(/^Review:\s*/, '') });
     if (overdue) {
       var detail = !tracking ? 'no tracking number yet'
         : (stage ? ('USPS: ' + (str_(rec['USPS Status (raw)']) || stage)) : 'USPS status not retrieved yet');
-      issues.push({ p: 2, msg: 'OVERDUE — Contact Seller · ' + days + ' days without verified carrier acceptance (' + detail + ')' });
+      issues.push({ p: 2, msg: 'OVERDUE — Contact Seller' + (seller ? ' (' + seller + ')' : '') + ' · ' + days + ' days without verified carrier acceptance (' + detail + ')' });
     }
+    if (!delivered && /delay/i.test(str_(rec['Meta Pay Status']))) issues.push({ p: 4, msg: 'Check Order — Meta Pay: ' + str_(rec['Meta Pay Status']) });
     if (cost === '') {
       var fbTotal = parseMoney_(rec['FB Order Total (raw)']);
       issues.push({ p: 3, msg: 'Enter Purchase Cost' + (fbTotal !== '' ? ' (Facebook order total: $' + fbTotal.toFixed(2) + ')' : '') });
@@ -91,8 +97,12 @@ function dashRow_(rec, nowMs, cfg) {
   issues.sort(function (a, b) { return a.p - b.p; });
 
   var attention;
-  if (canceled) attention = 'Canceled — no action needed';
-  else if (issues.length) attention = issues[0].msg + (issues.length > 1 ? ' (+' + (issues.length - 1) + ' more)' : '');
+  if (canceled) {
+    // What happened and where it was seen, e.g. "Refunded (Meta Pay) — no action needed"; plain text when unknown.
+    var m = cancelSignal.match(/^(Canceled|Refunded|Expired) — ([^(]+?)\s*(?:\(.*\))?$/);
+    var refund = m && m[1] !== 'Refunded' && str_(rec['Refund Received']).toUpperCase() === 'Y' ? ', refund received' : '';
+    attention = m ? (m[1] + ' (' + m[2] + refund + ') — no action needed') : 'Canceled — no action needed';
+  } else if (issues.length) attention = issues[0].msg + (issues.length > 1 ? ' (+' + (issues.length - 1) + ' more)' : '');
   else attention = NO_ACTION;
 
   var group;

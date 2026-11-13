@@ -249,6 +249,9 @@ function onScannerEdit(e) {
 // ===========================================================================
 function reconcile() {
   withLock_(function () {
+    // New backend columns (Seller, Meta Pay Status, …) are appended automatically after a code update — never moved/renamed.
+    try { var added = ensureBackendColumns_(); if (added.length) log_('', 'COLUMNS_ADDED', added.join(', ')); }
+    catch (e) { log_('', 'COLUMNS_ADD_FAILED', e && e.message); }
     syncFromScanner_([]);
     transferEligible_();
     syncInventoryStatus_();
@@ -283,6 +286,8 @@ function doPost(e) {
       case 'getUspsWork': return json_(apiGetUspsWork_(body));
       case 'submitUspsResult': return json_(withLock_(function () { return apiSubmitUsps_(body); }, 60000));
       case 'submitFbResult': return json_(withLock_(function () { return apiSubmitFb_(body); }, 30000));
+      case 'submitSignals': return json_(withLock_(function () { return apiSubmitSignals_(body); }, 60000));
+      case 'previewSignals': return json_(apiPreviewSignals_(body));
       case 'reportIssue':
         log_('', 'EXTENSION_ISSUE', (body.code || '') + ' ' + (body.message || ''));
         return json_({ ok: true });
@@ -293,6 +298,22 @@ function doPost(e) {
   }
 }
 
+/**
+ * Settings added after the first release. Read with a default so an OLDER Config.gs (without these keys) keeps working;
+ * you never need to edit Config.gs for them (add a key there only to override the default).
+ */
+var CONFIG_DEFAULTS = {
+  FB_SELLER_RECHECK_MINUTES: 360,      // seller-name backfill: retry a row at most this often...
+  SELLER_MAX_ATTEMPTS: 3,              // ...and at most this many times
+  META_PAY_DAYS_BEFORE: 6,             // Meta Pay wallet date may be up to 6 days BEFORE "Purchased At" (you mark Y after paying)
+  META_PAY_DAYS_AFTER: 2               // ...or up to 2 days after it
+};
+function cfgVal_(key) { return (typeof CONFIG !== 'undefined' && CONFIG[key] !== undefined && CONFIG[key] !== null) ? CONFIG[key] : CONFIG_DEFAULTS[key]; }
+
+function workItem_(r, mode) {
+  return { purchaseId: String(r['Purchase ID']), listingId: String(r['Listing ID']), url: str_(r['Facebook URL']), orderId: str_(r['FB Order ID']), mode: mode };
+}
+
 function apiGetWork_(body) {
   var rd = readPurchased_();
   var now = Date.now();
@@ -300,28 +321,104 @@ function apiGetWork_(body) {
   var cfg = body.force
     ? { FB_RECHECK_MINUTES: 0, FB_TRACKING_RECHECK_MINUTES: 0, FB_ERROR_BACKOFF_AFTER: 1e9, FB_ERROR_BACKOFF_MINUTES: 0 }
     : CONFIG;
-  var items = rd.records.filter(function (r) { return isFbCheckDue_(r, now, cfg); })
-    .slice(0, limit)
-    .map(function (r) { return { purchaseId: String(r['Purchase ID']), listingId: String(r['Listing ID']), url: str_(r['Facebook URL']), orderId: str_(r['FB Order ID']) }; });
-  return { ok: true, items: items };
+  var sellerCfg = { FB_RECHECK_MINUTES: cfg.FB_RECHECK_MINUTES, FB_TRACKING_RECHECK_MINUTES: cfg.FB_TRACKING_RECHECK_MINUTES,
+                    FB_SELLER_RECHECK_MINUTES: body.force ? 0 : cfgVal_('FB_SELLER_RECHECK_MINUTES'), SELLER_MAX_ATTEMPTS: cfgVal_('SELLER_MAX_ATTEMPTS') };
+  var items = rd.records.filter(function (r) { return isFbCheckDue_(r, now, cfg); }).slice(0, limit).map(function (r) { return workItem_(r, 'order'); });
+  // Seller backfill for rows the order checks no longer visit; kept separate from `items` (= order monitoring) and only
+  // filling whatever room the batch limit leaves.
+  var sellerItems = rd.records.filter(function (r) { return isSellerBackfillDue_(r, now, sellerCfg); })
+    .slice(0, Math.max(0, limit - items.length)).map(function (r) { return workItem_(r, 'seller'); });
+  return { ok: true, items: items, sellerItems: sellerItems, signals: wantsSignals_(rd.records) };
 }
 
 function apiSubmitFb_(body) {
   var rd = readPurchased_();
   var rec = rd.records.filter(function (r) { return String(r['Purchase ID']) === String(body.purchaseId); })[0];
   if (!rec) return { ok: false, error: 'UNKNOWN_PURCHASE_ID' };
-  if (isTerminalStatus_(rec['Purchase Status'])) return { ok: true, ignored: 'terminal' };
   var res = body.result || {};
+  var ts0 = nowStr_();
+  if (res.mode === 'seller') {                              // seller backfill: never touches status / tracking / error count
+    if (rec['Purchase Status'] === PURCHASE_STATUS.VOIDED) return { ok: true, ignored: 'voided' };
+    var sp = applySellerResult_(rec, res, ts0);
+    updateRecord_(rec['Purchase ID'], sp);
+    log_(rec['Purchase ID'], sp['Seller'] ? 'SELLER_FOUND' : 'SELLER_NOT_FOUND', sp['Seller'] || (res.error || 'no seller on page'));
+    return { ok: true, seller: sp['Seller'] || str_(rec['Seller']) };
+  }
+  if (isTerminalStatus_(rec['Purchase Status'])) {
+    var fill = sellerPatch_(rec, res);                      // a canceled row still gets its seller (used for Meta Pay refunds)
+    if (Object.keys(fill).length) { updateRecord_(rec['Purchase ID'], fill); log_(rec['Purchase ID'], 'SELLER_FOUND', fill['Seller'] || ''); }
+    return { ok: true, ignored: 'terminal' };
+  }
   if (!res.ok && isSystemicFbError_(res.error)) {          // login wall etc. must not count against the listing
     log_(rec['Purchase ID'], 'FB_SYSTEMIC', res.error);
     return { ok: true, ignored: 'systemic' };
   }
-  var ts = nowStr_();
+  var ts = ts0;
   var patch = applyFbResult_(rec, res, ts);
   updateRecord_(rec['Purchase ID'], patch);
   log_(rec['Purchase ID'], res.ok ? 'FB_CHECKED' : 'FB_CHECK_FAILED',
-       res.ok ? ((patch['Purchase Status'] || rec['Purchase Status']) + ' | ' + (res.fbStatusRaw || '') + (res.trackingNumber ? ' | tracking found' : '')) : res.error);
+       (res.ok ? ((patch['Purchase Status'] || rec['Purchase Status']) + ' | ' + (res.fbStatusRaw || '') + (res.trackingNumber ? ' | tracking ' + res.trackingNumber : ' | no tracking yet'))
+               : (res.error + (res.detail ? ' (' + String(res.detail).slice(0, 200) + ')' : ''))) +
+       (patch['Seller'] ? ' | seller ' + patch['Seller'] : ''));
+  if (res.ok && fbSaysDelivered_(Object.assign({}, rec, patch))) { transferEligible_(); syncInventoryStatus_(); }   // FB-delivered => inventory now
   return { ok: true, status: patch['Purchase Status'] || rec['Purchase Status'] };
+}
+
+// ===========================================================================
+// Feature 5 (sheet side): Meta Pay wallet + Marketplace notifications
+// ===========================================================================
+/** Plans the updates for one signal payload {source:'metapay'|'notifications', transactions|notifications}. Pure planning; no writes. */
+function planSignals_(result, records, ts) {
+  var src = result && result.source;
+  if (src === 'metapay') {
+    return planMetaPayUpdates_(result.transactions || [], records, ts, { daysBefore: cfgVal_('META_PAY_DAYS_BEFORE'), daysAfter: cfgVal_('META_PAY_DAYS_AFTER') });
+  }
+  if (src === 'notifications') return planNotificationUpdates_(result.notifications || [], records, ts);
+  return null;
+}
+
+function apiSubmitSignals_(body) {
+  var result = body.result || {};
+  var rd = readPurchased_();
+  var ts = nowStr_();
+  var plan = planSignals_(result, rd.records, ts);
+  if (!plan) return { ok: false, error: 'UNKNOWN_SIGNAL_SOURCE' };
+  plan.updates.forEach(function (u) {
+    updateRecord_(u.purchaseId, u.patch);
+    log_(u.purchaseId, u.event, u.detail);
+  });
+  var label = result.source === 'metapay' ? 'META_PAY_SCAN' : 'NOTIFICATIONS_SCAN';
+  var count = result.source === 'metapay' ? (result.transactions || []).length : (result.notifications || []).length;
+  log_('', label, count + ' read, ' + plan.updates.length + ' row(s) updated' +
+    (plan.ambiguous.length ? ', ' + plan.ambiguous.length + ' ambiguous (not applied): ' + plan.ambiguous.map(function (a) { return a.purchaseIds.join('/'); }).join('; ') : '') +
+    (result.source === 'metapay' ? unmatchedCancelSummary_(plan.unmatched) : ''));
+  var moved = plan.updates.length ? transferEligible_() : 0;      // Meta Pay "Delivered" can make a purchase transfer-eligible
+  if (plan.updates.length) syncInventoryStatus_();
+  return { ok: true, updated: plan.updates.length, ambiguous: plan.ambiguous.length, transferred: moved };
+}
+
+/** Canceled/refunded/expired wallet rows that matched nothing (usually: the purchase has no Seller yet) — listed in the log. */
+function unmatchedCancelSummary_(unmatched) {
+  var list = (unmatched || []).filter(function (t) { return CANCEL_KIND_LABEL[metaPayKind_(t.status)]; })
+    .map(function (t) { return t.status + ' ' + t.seller + ' ' + (t.date || '') + ' ' + fmtMoney_(parseMoney_(t.amount)); });
+  return list.length ? ' | unmatched cancellations: ' + list.slice(0, 8).join('; ') : '';
+}
+
+/** Read-only: what a signal payload WOULD change (used by the extension Probe buttons). */
+function apiPreviewSignals_(body) {
+  var rd = readPurchased_();
+  var plan = planSignals_(body.result || {}, rd.records, nowStr_());
+  if (!plan) return { ok: false, error: 'UNKNOWN_SIGNAL_SOURCE' };
+  return {
+    ok: true,
+    updates: plan.updates.map(function (u) {
+      var rec = rd.records.filter(function (r) { return str_(r['Purchase ID']) === u.purchaseId; })[0] || {};
+      return { purchaseId: u.purchaseId, product: str_(rec['Product']), seller: str_(rec['Seller']), event: u.event,
+               changes: Object.keys(u.patch).filter(function (k) { return k !== 'Notes'; }).reduce(function (o, k) { o[k] = u.patch[k]; return o; }, {}) };
+    }),
+    ambiguous: plan.ambiguous,
+    unmatched: (plan.unmatched || []).length
+  };
 }
 
 function apiGetUspsWork_(body) {

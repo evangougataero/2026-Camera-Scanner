@@ -4,11 +4,13 @@ const send = (msg) => chrome.runtime.sendMessage(msg);
 async function load() {
   const { pt_settings: s } = await chrome.storage.local.get('pt_settings');
   if (s) { $('apiUrl').value = s.apiUrl || ''; $('apiToken').value = s.apiToken || ''; }
+  $('scanMetaPay').checked = !s || s.scanMetaPay !== false;            // both default ON
+  $('scanNotifications').checked = !s || s.scanNotifications !== false;
   await refresh();
 }
 
-function msg(text, ok) {
-  const el = $('connMsg');
+function msg(text, ok, id) {
+  const el = $(id || 'connMsg');
   el.textContent = text;
   el.className = ok ? 'ok' : 'bad';
 }
@@ -25,11 +27,11 @@ async function refresh() {
   const lines = [
     'Last run started : ' + when(st.lastRunStartedAt),
     'Last run finished: ' + when(st.lastRunFinishedAt) + (st.lastRunOutcome ? '  (' + st.lastRunOutcome + ')' : ''),
-    'In progress      : ' + (r.queue ? (r.queue.index + '/' + r.queue.items.length + ' listings') : 'no'),
+    'In progress      : ' + (r.queue ? (r.queue.index + '/' + r.queue.items.length + ' items') : 'no'),
     'Unsent results   : ' + (r.outbox || 0),
     'Last error       : ' + (st.lastError || '—'),
     '',
-    ...(st.log || []).slice(-25)
+    ...(st.log || []).slice(-30)
   ];
   $('status').textContent = lines.join('\n');
 }
@@ -38,8 +40,14 @@ $('save').onclick = async () => {
   const apiUrl = $('apiUrl').value.trim(), apiToken = $('apiToken').value.trim();
   if (!/^https:\/\/script\.google\.com\/(a\/[^/]+\/)?macros\/s\/[^/]+\/exec$/.test(apiUrl)) return msg('URL must look like https://script.google.com/macros/s/…/exec', false);
   if (!apiToken) return msg('Token is required', false);
-  await chrome.storage.local.set({ pt_settings: { apiUrl, apiToken } });
+  const { pt_settings: prev } = await chrome.storage.local.get('pt_settings');
+  await chrome.storage.local.set({ pt_settings: Object.assign({}, prev || {}, { apiUrl, apiToken }) });   // keep the signal settings
   msg('Saved', true);
+};
+
+$('saveSignals').onclick = async () => {
+  const r = await send({ type: 'pt:saveSignalPrefs', scanMetaPay: $('scanMetaPay').checked, scanNotifications: $('scanNotifications').checked });
+  msg(r && r.ok ? 'Saved' : ((r && r.error) || 'Failed'), !!(r && r.ok), 'signalMsg');
 };
 
 $('ping').onclick = (e) => busy(e.target, async () => {
@@ -52,17 +60,18 @@ $('run').onclick = (e) => busy(e.target, async () => { await send({ type: 'pt:ru
 $('force').onclick = (e) => busy(e.target, async () => { await send({ type: 'pt:runNow', force: true }); await refresh(); });
 $('refresh').onclick = refresh;
 
-$('probe').onclick = (e) => busy(e.target, async () => {
-  $('probeOut').textContent = 'Opening listing in a background tab… (up to ~90 s)';
-  const r = await send({ type: 'pt:probe', input: $('probeInput').value });
-  $('probeOut').textContent = JSON.stringify(r, null, 2);
-});
-
-$('probeUsps').onclick = (e) => busy(e.target, async () => {
-  $('probeUspsOut').textContent = 'Opening USPS in a background tab… (up to ~90 s)';
-  const r = await send({ type: 'pt:probeUsps', input: $('probeUspsInput').value });
-  $('probeUspsOut').textContent = JSON.stringify(r, null, 2);
-});
+const probe = (btnId, outId, type, wait, input) => {
+  $(btnId).onclick = (e) => busy(e.target, async () => {
+    $(outId).textContent = wait;
+    const r = await send(Object.assign({ type }, input ? { input: $(input).value } : {}));
+    $(outId).textContent = JSON.stringify(r, null, 2);
+  });
+};
+probe('probe', 'probeOut', 'pt:probe', 'Opening listing in a background tab… (up to ~2 min)', 'probeInput');
+probe('probeSeller', 'probeOut', 'pt:probeSeller', 'Opening listing in a background tab… (up to ~2 min)', 'probeInput');
+probe('probeUsps', 'probeUspsOut', 'pt:probeUsps', 'Opening USPS in a background tab… (up to ~90 s)', 'probeUspsInput');
+probe('probeMetaPay', 'probeMetaPayOut', 'pt:probeMetaPay', 'Opening Meta Pay wallet in a background tab… (up to ~90 s)');
+probe('probeNotifications', 'probeNotificationsOut', 'pt:probeNotifications', 'Opening Marketplace notifications in a background tab… (up to ~2 min)');
 
 setInterval(() => { if (!document.hidden) refresh().catch(() => {}); }, 10000);
 load();

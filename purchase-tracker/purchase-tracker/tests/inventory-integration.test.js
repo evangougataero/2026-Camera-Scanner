@@ -153,9 +153,16 @@ test('manual eBay columns start empty (checkbox unchecked) and are NEVER touched
   const snapshot = JSON.stringify(w.inv.rowObj(row));
   w.accept(P1, 'Departed USPS Regional Facility');
   w.accept(P1, 'Delivered, Front Door/Porch');                                             // stage changes: status refresh
+  // Cost changes: Item Cost refresh. The cost is edited where it lives — the Main scanner sheet (its paid-price column
+  // wins over the Purchased tab by design, see planCostUpdates_). Editing ONLY the Purchased cell while Main still says
+  // $120 is reverted to $120 on the next reconcile; that was this test's old (stale) setup, now asserted explicitly.
   const hm = w.run('headerMap_')(w.pur, 1);
-  w.pur.put(2, hm['Purchase Cost'], 150);                                                  // cost changes: Item Cost refresh
+  w.pur.put(2, hm['Purchase Cost'], 150);
+  w.run('reconcile()');
+  assert.equal(w.records()[0]['Purchase Cost'], 120);                                      // scanner value wins
+  w.main.put(2, COST, 150);
   w.run('reconcile()'); w.run('reconcile()');
+  assert.equal(w.records()[0]['Purchase Cost'], 150);
   const after = w.inv.rowObj(row);
   ['Listed on eBay?', 'Total Sale Price', 'eBay Fees', 'Shipping Label Cost', 'Sale Date', 'Product', 'Estimated Resale', 'Purchase ID', 'Item Key'].forEach((h) => {
     assert.equal(after[h], JSON.parse(snapshot)[h], h);
