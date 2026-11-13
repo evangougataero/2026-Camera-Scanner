@@ -1,6 +1,6 @@
 /**
  * signals-extractor.js — two self-contained page functions (serialized by chrome.scripting.executeScript({func})).
- * Both rely on globalThis.PTSignals (parse-signals.js, injected first). They only READ the page (plus scrolling and
+ * Both rely on globalThis.PTSignals (parse-signals.js) and globalThis.PTGuard (login-guard.js), injected first. They only READ the page (plus scrolling and
  * "See more" buttons to load older rows). Login walls, checkpoints and Meta "re-enter your password" prompts are
  * reported (LOGIN_REQUIRED / CHECKPOINT / REAUTH_REQUIRED) and never bypassed.
  *
@@ -9,8 +9,8 @@
  */
 async function PT_metaPayInPage(opts) {
   opts = opts || {};
-  const S = globalThis.PTSignals;
-  if (!S) return { ok: false, error: 'PARSER_NOT_INJECTED' };
+  const S = globalThis.PTSignals, G = globalThis.PTGuard;
+  if (!S || !G) return { ok: false, error: 'PARSER_NOT_INJECTED' };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
   const bodyText = () => (document.body && document.body.innerText) || '';
@@ -19,23 +19,25 @@ async function PT_metaPayInPage(opts) {
   const fail = (error, detail) => Object.assign({ ok: false, error, detail: detail || '', url: location.href },
     opts.probe ? { probe: { textPreview: bodyText().slice(0, 3000), url: location.href, visibility: document.visibilityState } } : {});
 
+  // Login walls: URL pathname, or a VISIBLE login form/password with no signed-in UI (login-guard.js). A visible password
+  // prompt on a signed-in page, or Meta's "re-enter your password" wording, is REAUTH_REQUIRED. Returns {code, detail} | null.
   const blocker = () => {
-    const u = location.href, t = bodyText().slice(0, 4000);
-    if (/\/checkpoint|two_step_verification/i.test(u)) return 'CHECKPOINT';
-    if (/\/login|login\.php/i.test(u) || document.querySelector('form[action*="/login"]')) return 'LOGIN_REQUIRED';
-    const pw = Array.from(document.querySelectorAll('input[type="password"], input[name="pass"]')).some(visible);
-    if (pw || /re-?enter (your )?password|enter your password|confirm (it.s|that it.s) you|for your security, (please )?(re-?enter|confirm)/i.test(t)) return 'REAUTH_REQUIRED';
-    if (/confirm you.?re human|captcha|suspicious activity|temporarily blocked/i.test(t)) return 'CHECKPOINT';
+    const t = bodyText().slice(0, 4000), g = G.inspect(document, location);
+    const why = (via) => G.describe(location.href, document.title + ' | ' + t.slice(0, 300), via);
+    const reauthText = /re-?enter (your )?password|enter your password|confirm (it.s|that it.s) you|for your security, (please )?(re-?enter|confirm)/i.test(t);
+    if (g.code && (g.via === 'url' || !reauthText)) return { code: g.code, detail: g.detail };
+    if (g.passwordVisible || reauthText) return { code: 'REAUTH_REQUIRED', detail: why(g.passwordVisible ? 'visible-password' : 'text') };
+    if (/confirm you.?re human|captcha|suspicious activity|temporarily blocked/i.test(t)) return { code: 'CHECKPOINT', detail: why('text') };
     return null;
   };
 
   await waitFor(() => bodyText().length > 100, 20000);
   let b = blocker();
-  if (b) return fail(b);
+  if (b) return fail(b.code, b.detail);
   const rows = () => S.parseMetaPayText(bodyText(), Date.now());
   await waitFor(() => rows().length > 0 || blocker(), 20000);
   b = blocker();
-  if (b) return fail(b);
+  if (b) return fail(b.code, b.detail);
   if (!rows().length) return fail('META_PAY_NO_TRANSACTIONS', 'no "name / status / date / amount" rows found');
 
   // Load older rows: scroll the page and any scrollable list, and press a "See more"-style button (max a few times).
@@ -59,8 +61,8 @@ async function PT_metaPayInPage(opts) {
 
 async function PT_notificationsInPage(opts) {
   opts = opts || {};
-  const S = globalThis.PTSignals;
-  if (!S) return { ok: false, error: 'PARSER_NOT_INJECTED' };
+  const S = globalThis.PTSignals, G = globalThis.PTGuard;
+  if (!S || !G) return { ok: false, error: 'PARSER_NOT_INJECTED' };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
   const bodyText = () => (document.body && document.body.innerText) || '';
@@ -69,17 +71,19 @@ async function PT_notificationsInPage(opts) {
   const fail = (error, detail) => Object.assign({ ok: false, error, detail: detail || '', url: location.href },
     opts.probe ? { probe: { textPreview: bodyText().slice(0, 3000), url: location.href, visibility: document.visibilityState } } : {});
 
+  // Login walls: URL pathname, or a VISIBLE login form/password with no signed-in UI (login-guard.js). Hidden login nodes
+  // that Facebook keeps in the DOM of signed-in pages must not count. Returns {code, detail} | null.
   const blocker = () => {
-    const u = location.href;
-    if (/\/checkpoint|two_step_verification|\/recover/i.test(u)) return 'CHECKPOINT';
-    if (/\/login/i.test(u) || document.querySelector('input[name="pass"], form[action*="/login"]')) return 'LOGIN_REQUIRED';
-    if (/confirm you.?re human|security check|captcha|suspicious activity|temporarily blocked|we suspect automated/i.test(bodyText().slice(0, 3000))) return 'CHECKPOINT';
+    const g = G.inspect(document, location);
+    if (g.code) return { code: g.code, detail: g.detail };
+    const t = bodyText().slice(0, 3000);
+    if (/confirm you.?re human|security check|captcha|suspicious activity|temporarily blocked|we suspect automated/i.test(t)) return { code: 'CHECKPOINT', detail: G.describe(location.href, document.title + ' | ' + t.slice(0, 300), 'text') };
     return null;
   };
 
   await waitFor(() => bodyText().length > 200, 20000);
   const b = blocker();
-  if (b) return fail(b);
+  if (b) return fail(b.code, b.detail);
   if (/(this (page|content) (isn.t|is not) available|content isn.t available|page not found)/i.test(bodyText().slice(0, 3000))) return fail('NOTIFICATIONS_UNAVAILABLE', 'page not available');
 
   const root = () => document.querySelector('[role="main"]') || document.body;

@@ -208,7 +208,7 @@ test('label-only and canceled purchases never create inventory rows', () => {
   w.accept(P1, 'Shipping Label Created, USPS Awaiting Item');
   w.run('reconcile()');
   assert.equal(w.mine().length, 0);
-  w.post({ action: 'submitFbResult', purchaseId: P1, result: { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true } });     // View Order gone => Canceled
+  w.post({ action: 'submitFbResult', purchaseId: P1, result: { ok: true, canceled: true, outcome: 'canceled', fbStatusRaw: 'Canceled' } });     // order page says Canceled
   assert.equal(w.records()[0]['Purchase Status'], 'Canceled');
   w.run('reconcile()');
   assert.equal(w.mine().length, 0);

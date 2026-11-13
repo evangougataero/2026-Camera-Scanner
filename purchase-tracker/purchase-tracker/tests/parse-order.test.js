@@ -84,3 +84,14 @@ test('REAL Facebook buyer_order_status page (delivered order) parses correctly',
   assert.equal(r.fbStatusRaw, 'Delivered | Your order was delivered. | Order Confirmed');
   assert.doesNotMatch(r.fbStatusRaw, /Paulina/);
 });
+
+test('listingStateFromText: Sold / Pending badges on a LISTING page; the order dialog seller line does not count', () => {
+  assert.equal(P.listingStateFromText('Nikon D80 body\nSold\n$180\nShips for $12'), 'sold');
+  assert.equal(P.listingStateFromText('Nikon D5300 kit\n$320 · Pending\nDetails'), 'pending');
+  assert.equal(P.listingStateFromText('Pending · $320'), 'pending');
+  assert.equal(P.listingStateFromText('This listing has been marked as sold.'), 'sold');
+  assert.equal(P.listingStateFromText('Sale pending'), 'pending');
+  assert.equal(P.listingStateFromText('Item is sold and shipped by Olga Serdinskaya'), '');
+  assert.equal(P.listingStateFromText('Canon EOS 760D\n$225 $240 · Out of Stock\nSold by a trusted seller with lots of reviews over the years'), '');
+  assert.equal(P.listingStateFromText(''), '');
+});

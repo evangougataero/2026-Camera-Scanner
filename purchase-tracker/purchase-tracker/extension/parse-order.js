@@ -163,6 +163,25 @@
     return hits >= 2;
   }
 
+  /**
+   * Buyer-visible state of a LISTING page (not an order view): 'sold' | 'pending' | ''.
+   * Facebook marks a listing you bought as "Sold" or "Pending" (a badge line, "Marked as sold", "Sale pending"). Both mean
+   * the order is ACTIVE: a missing View Order button on such a page is never evidence of a cancellation.
+   * "Item is sold and shipped by …" (the seller line of an order dialog) does not count.
+   */
+  function listingStateFromText(text) {
+    var lines = String(text || '').split(/\n+/).map(norm).filter(Boolean).slice(0, 200);
+    for (var i = 0; i < lines.length; i++) {
+      var l = lines[i];
+      if (l.length > 120 || /sold and shipped by/i.test(l)) continue;
+      if (/^(sold|pending|sale pending)$/i.test(l) || /^(sold|pending)\s*[·•|]/i.test(l) || /[·•|]\s*(sold|pending)$/i.test(l) ||
+          /\b(marked as|listing is|item is|item has been|listing has been) (sold|pending)\b/i.test(l)) {
+        return /pending/i.test(l) ? 'pending' : 'sold';
+      }
+    }
+    return '';
+  }
+
   // ---- Main entry -----------------------------------------------------------
 
   /**
@@ -246,7 +265,8 @@
     parseOrderText: parseOrderText, findUspsNumbers: findUspsNumbers, trackingFromHref: trackingFromHref,
     isCanceledLine: isCanceledLine, isStatusLine: isStatusLine, normalizeUsps: normalizeUsps,
     outcomeOfLine: outcomeOfLine, parseSeller: parseSeller, parseItemTitle: parseItemTitle,
-    isNameLike: isNameLike, cleanName: cleanName, cleanTitle: cleanTitle, looksLikeOrderView: looksLikeOrderView
+    isNameLike: isNameLike, cleanName: cleanName, cleanTitle: cleanTitle, looksLikeOrderView: looksLikeOrderView,
+    listingStateFromText: listingStateFromText
   };
   root.PTParse = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

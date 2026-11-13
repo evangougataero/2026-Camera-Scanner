@@ -406,7 +406,7 @@ function isSystemicFbError_(code) { return code === 'LOGIN_REQUIRED' || code ===
  * Turns an extension result into a patch. NEVER emits blanks, never downgrades.
  * res: {ok, error, detail, fbStatusRaw, canceled, trackingNumber, carrier, orderId, orderTotal}
  */
-/** An order may be auto-canceled from a missing View Order button only while nothing proves it shipped. */
+/** An indirect signal (Meta Pay, notifications) may auto-cancel an order only while nothing proves it shipped. */
 function canAutoCancel_(rec) {
   return !isTerminalStatus_(rec['Purchase Status']) && str_(rec['USPS Accepted At']) === '' &&
          rec['USPS Stage'] !== STAGE.DELIVERED && !fbSaysDelivered_(rec);
@@ -417,14 +417,13 @@ function applyFbResult_(rec, res, ts) {
   p['Last FB Check'] = ts;
   if (!res || res.ok !== true) {
     var code = (res && res.error) || 'UNKNOWN_ERROR';
-    // SIMPLE RULE: the listing page loaded normally (logged in, real listing, fully rendered) but has no View Order
-    // button => the order is gone => Canceled. Page-load failures, login walls, CAPTCHAs, removed listings and
-    // extraction failures never reach this branch (the extension only sets pageHealthy when the page is genuinely fine).
-    if (code === 'ORDER_DETAILS_NOT_FOUND' && res && res.pageHealthy === true && canAutoCancel_(rec)) {
-      p['Purchase Status'] = PURCHASE_STATUS.CANCELED;
-      p['FB Error Count'] = 0;
-      p['Cancel Signal'] = 'Canceled — Facebook listing: View Order button missing';
-      p['Notes'] = appendNote_(rec['Notes'], ts, 'Canceled: View Order button missing on a listing page that loaded normally');
+    // A missing View Order button NEVER cancels on its own, even on a page that loaded normally (pageHealthy) — it
+    // wrongly canceled a "Sold" Nikon D80 and a "Pending" D5300. Cancellation needs explicit evidence: the order page
+    // saying canceled/refunded/expired, a Meta Pay Canceled/Refunded/Expired match, or a cancel notification.
+    // A listing that shows "Sold" / "Pending" is an ACTIVE order: status unchanged, not counted as an error.
+    if (code === 'ORDER_DETAILS_NOT_FOUND' && res && (res.listingState === 'sold' || res.listingState === 'pending')) {
+      p['Notes'] = appendNote_(rec['Notes'], ts, 'View Order button not found; listing shows ' +
+        (res.listingState === 'sold' ? 'Sold' : 'Pending') + ' — order still active (unchanged)');
       return p;
     }
     p['FB Error Count'] = (parseInt(rec['FB Error Count'], 10) || 0) + 1;
@@ -763,7 +762,9 @@ function fmtMoney_(v) { return v === '' || v === undefined || v === null ? '' : 
  *     (you mark Y in the scanner after paying, so the wallet date is usually the same day or earlier);
  *   - a partial name match additionally needs the exact amount (to the cent) or the same day;
  *   - candidates are scored (name, exact amount, date distance) and assigned one-to-one, best first;
- *     a tie between two rows (or two transactions) is reported as ambiguous and NOTHING is changed for it.
+ *     a tie between two rows (or two transactions) is reported as ambiguous and NOTHING is changed for it;
+ *   - a row with a BLANK Seller can still be matched by a transaction the name match left over: exact amount (to the
+ *     cent) + wallet date inside the same window, and only when exactly one blank-Seller row and one transaction fit.
  * Canceled / Refunded / Expired -> cancelPatch_ (strict). Every matched row gets 'Meta Pay Status' ("Delivered · 2026-11-03 · $262.84").
  * Returns {updates:[{purchaseId, patch, event, detail}], unmatched:[tx], ambiguous:[{tx, purchaseIds}]}.
  */
@@ -806,16 +807,49 @@ function planMetaPayUpdates_(transactions, records, ts, cfg) {
     assigned.push(pr);
   });
 
+  // Fallback for rows whose Seller is still BLANK (seller not captured yet): a transaction left over by the name match
+  // may take such a row on exact amount (to the cent, vs Purchase Cost) + wallet date inside the same window — only when
+  // that transaction fits exactly ONE blank-Seller row and that row fits exactly ONE such transaction. Otherwise nothing.
+  var blankRecs = (records || []).filter(function (r) { return isSignalCandidate_(r) && !str_(r['Seller']); });
+  var blankFits = [];
+  txs.forEach(function (tx, ti) {
+    if (txUsed[ti] || ambiguousTx[ti]) return;
+    var amt = parseMoney_(tx.amount);
+    if (amt === '') return;
+    blankRecs.forEach(function (rec, bi) {
+      var cost = parseMoney_(rec['Purchase Cost']);
+      if (cost === '' || Math.round(cost * 100) !== Math.round(amt * 100)) return;
+      var d = walletDayOffset_(tx.date, rec['Purchased At']);
+      if (d === null || d < -before - 0.5 || d > after + 0.5) return;
+      blankFits.push({ ti: ti, bi: bi });
+    });
+  });
+  var blankAssigned = [];
+  blankFits.forEach(function (f) {
+    var forTx = blankFits.filter(function (o) { return o.ti === f.ti; });
+    var forRec = blankFits.filter(function (o) { return o.bi === f.bi; });
+    if (forTx.length === 1 && forRec.length === 1) {
+      txUsed[f.ti] = true;
+      blankAssigned.push({ ti: f.ti, rec: blankRecs[f.bi] });
+    } else {                                                                  // a tie either way: change nothing, log it
+      ambiguousTx[f.ti] = forTx.concat(forRec).map(function (o) { return str_(blankRecs[o.bi]['Purchase ID']); })
+        .filter(function (id, i, a) { return a.indexOf(id) === i; });
+    }
+  });
+
+  var matches = assigned.map(function (pr) { return { tx: txs[pr.ti], rec: recs[pr.ri], via: '' }; })
+    .concat(blankAssigned.map(function (b) { return { tx: txs[b.ti], rec: b.rec, via: 'amount+date (row has no Seller)' }; }));
+
   var updates = [];
-  assigned.forEach(function (pr) {
-    var tx = txs[pr.ti], rec = recs[pr.ri];
+  matches.forEach(function (m) {
+    var tx = m.tx, rec = m.rec;
     var kind = metaPayKind_(tx.status);
     var amount = parseMoney_(tx.amount);
     var label = str_(tx.status) + (str_(tx.date) ? ' · ' + str_(tx.date) : '') + (amount !== '' ? ' · ' + fmtMoney_(amount) : '');
     var p = {};
     if (str_(rec['Meta Pay Status']) !== label) p['Meta Pay Status'] = label;
     if (CANCEL_KIND_LABEL[kind]) {
-      var cp = cancelPatch_(rec, kind, 'Meta Pay', label + ', seller ' + str_(tx.seller), ts, true);
+      var cp = cancelPatch_(rec, kind, 'Meta Pay', label + ', seller ' + str_(tx.seller) + (m.via ? ', matched by ' + m.via : ''), ts, true);
       for (var k in cp) p[k] = cp[k];
     } else if (kind === 'delivered' && !isTerminalStatus_(rec['Purchase Status'])) {
       var merged = {}, x;
@@ -826,7 +860,7 @@ function planMetaPayUpdates_(transactions, records, ts, cfg) {
     }
     if (Object.keys(p).length) {
       updates.push({ purchaseId: str_(rec['Purchase ID']), patch: p, event: p['Purchase Status'] === PURCHASE_STATUS.CANCELED ? 'META_PAY_CANCELED' : 'META_PAY_STATUS',
-                     detail: label + ' | ' + str_(tx.seller) });
+                     detail: label + ' | ' + str_(tx.seller) + (m.via ? ' | matched by ' + m.via : '') });
     }
   });
   var unmatched = txs.filter(function (t, i) { return !txUsed[i] && !ambiguousTx[i]; });

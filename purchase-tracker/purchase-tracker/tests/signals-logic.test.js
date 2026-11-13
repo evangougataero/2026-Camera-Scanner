@@ -55,8 +55,8 @@ test('Facebook order page: expired / refunded / canceled outcomes => Canceled + 
   assert.equal(r['Purchase Status'], 'Canceled'); assert.equal(r['Refund Received'], 'Y');
   const c = g.applyFbResult_(rec(), { ok: true, canceled: true }, 'ts');                       // older extension: no outcome field
   assert.equal(c['Purchase Status'], 'Canceled'); assert.match(c['Cancel Signal'], /^Canceled — Facebook order status/);
-  const healthy = g.applyFbResult_(rec(), { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true }, 'ts');
-  assert.equal(healthy['Cancel Signal'], 'Canceled — Facebook listing: View Order button missing');
+  const healthy = g.applyFbResult_(rec(), { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true }, 'ts');      // button missing alone: never a cancel
+  assert.equal(healthy['Purchase Status'], undefined); assert.equal(healthy['Cancel Signal'], undefined);
 });
 
 test('Meta Pay "Delivered" counts as Facebook-confirmed delivery (status + transfer eligibility)', () => {
@@ -134,11 +134,45 @@ test('ambiguous ties change NOTHING; out-of-window dates and weak partial names 
   assert.equal(plan([tx({ seller: 'Olga P Serdinskaya', status: 'Canceled', date: '2026-10-31' })], [rec()]).updates.length, 1);   // exact amount verifies it
 });
 
-test('rows without a Seller, test rows, voided rows and out-of-scope rows are never matched; unchanged rows produce no update', () => {
-  assert.equal(plan([tx({ status: 'Canceled' })], [rec({ Seller: '' })]).updates.length, 0);
+test('test rows, voided rows and out-of-scope rows are never matched; unchanged rows produce no update', () => {
   assert.equal(plan([tx({ status: 'Canceled' })], [rec({ 'Purchase ID': 'TEST-1' })]).updates.length, 0);
   assert.equal(plan([tx({ status: 'Canceled' })], [rec({ 'Purchase Status': 'Voided' })]).updates.length, 0);
   assert.equal(plan([tx()], [rec({ 'Meta Pay Status': 'Delivered · 2026-11-03 · $262.84', 'Purchase Status': 'Delivered' })]).updates.length, 0);
+});
+
+test('blank Seller: matched by EXACT amount (cents) + date window when exactly one row fits; Seller column is not invented', () => {
+  const blank = (o) => rec(Object.assign({ Seller: '' }, o));
+  const r = plan([tx({ seller: 'Kelsey Moran', status: 'Canceled', date: '2026-11-02' })], [blank()]);
+  assert.equal(r.updates.length, 1);
+  const p = r.updates[0].patch;
+  assert.equal(p['Purchase Status'], 'Canceled'); assert.match(p['Cancel Signal'], /^Canceled — Meta Pay \(.*matched by amount\+date/);
+  assert.equal(p['Seller'], undefined);
+  assert.match(r.updates[0].detail, /matched by amount\+date \(row has no Seller\)/);
+  // a non-cancel status only records Meta Pay Status (D80: "May be delayed" never cancels)
+  const d = plan([tx({ seller: 'Kelsey Moran', status: 'May be delayed' })], [blank()]).updates[0].patch;
+  assert.equal(d['Purchase Status'], undefined); assert.equal(d['Meta Pay Status'], 'May be delayed · 2026-11-03 · $262.84');
+});
+
+test('blank Seller: no match when the amount is a cent off, the date is outside the window, or more than one candidate fits', () => {
+  const blank = (o) => rec(Object.assign({ Seller: '' }, o));
+  const canc = (o) => tx(Object.assign({ seller: 'Kelsey Moran', status: 'Canceled' }, o));
+  assert.equal(plan([canc({ amount: 262.83 })], [blank()]).updates.length, 0);
+  assert.equal(plan([canc({ date: '2026-10-27' })], [blank()]).updates.length, 0);                     // 7 days before
+  assert.equal(plan([canc({ date: '2026-11-06' })], [blank()]).updates.length, 0);                     // 3 days after
+  assert.equal(plan([canc({ date: '' })], [blank()]).updates.length, 0);                               // date unknown
+  assert.equal(plan([canc()], [blank({ 'Purchase Cost': '' })]).updates.length, 0);                    // cost unknown
+  const two = plan([canc()], [blank({ 'Purchase ID': '1-1' }), blank({ 'Purchase ID': '2-1', 'Purchased At': at(2026, 11, 2) })]);
+  assert.equal(two.updates.length, 0);
+  assert.deepEqual(Array.from(two.ambiguous[0].purchaseIds).sort(), ['1-1', '2-1']);
+  const twoTx = plan([canc(), canc({ seller: 'Sam Lee', date: '2026-11-02' })], [blank()]);           // one row, two fitting transactions
+  assert.equal(twoTx.updates.length, 0);
+  assert.equal(twoTx.ambiguous.length, 2);
+});
+
+test('blank Seller fallback never steals a transaction the name match already claimed', () => {
+  const r = plan([tx({ status: 'Canceled' })], [rec({ 'Purchase ID': 'NAMED' }), rec({ 'Purchase ID': 'BLANK', Seller: '' })]);
+  assert.deepEqual(Array.from(r.updates, (u) => u.purchaseId), ['NAMED']);
+  assert.equal(r.unmatched.length, 0); assert.equal(r.ambiguous.length, 0);
 });
 
 test('a Meta Pay cancellation after USPS acceptance is flagged for review, not applied', () => {

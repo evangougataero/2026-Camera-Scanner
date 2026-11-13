@@ -61,7 +61,7 @@ Flow: Main scanner sheet (`Purchased? = Y`) → **Purchased** tab (backend) → 
 ## Canceled / Refunded / Expired
 `Purchase Status` stays the single terminal value **`Canceled`** (so work lists, transfers and dashboard counters behave as before);
 **what** happened is recorded in `Cancel Signal` (`Refunded — Meta Pay (…)`, `Expired — Facebook order status (…)`,
-`Canceled — Facebook listing: View Order button missing`, …) and `Refund Received = Y` for refunds. The dashboard's Attention column shows
+`Canceled — Facebook order status (…)`, …) and `Refund Received = Y` for refunds. The dashboard's Attention column shows
 it, e.g. `Refunded (Meta Pay) — no action needed`. Sources, strongest first:
 1. **Facebook Order status dialog** headline `Canceled` / `Expired` / `Refunded`.
 2. **Meta Pay wallet** (shows the **seller's name**, not the listing): matched by the `Seller` column, verified by date
@@ -72,11 +72,13 @@ it, e.g. `Refunded (Meta Pay) — no action needed`. Sources, strongest first:
 3. **Marketplace notifications** naming the listing (linked listing ID or the full Facebook listing title). A notice older than the purchase,
    a cancellation *request*, or a re-bought listing with an unknown notice time never acts. A loose word-only match is recorded as
    `Review: possibly …` (dashboard alert), never applied.
-4. **Healthy listing page with no View Order button** (unchanged rule).
+4. A **missing View Order button never cancels on its own**, even on a page that loaded normally. A listing showing **Sold** or
+   **Pending** is an active order: status unchanged, not counted as an FB error. Without either it is an ordinary FB check failure.
 
 Safety: Meta Pay and notifications never cancel a purchase USPS has accepted, Facebook says was delivered, or that is already in Inventory —
 they set `Cancel Signal = Review: …` with a note and a **Check Order** alert instead. Facebook's own order page cancels anything not yet in
-Inventory (as before). Wallet cancellations that match no row (usually: the row has no Seller yet) are listed in the `META_PAY_SCAN` log line.
+Inventory (as before). A row with a **blank Seller** can still be matched by a leftover wallet transaction on exact amount (cents) + date window, but only
+when exactly one row and one transaction fit. Wallet transactions that still match no row are listed in the `META_PAY_SCAN` log line.
 Signals are scanned once per run only while some purchase could still be canceled; each can be switched off on the Options page.
 
 Optional `Config.gs` overrides (not required): `FB_SELLER_RECHECK_MINUTES` (360), `SELLER_MAX_ATTEMPTS` (3), `META_PAY_DAYS_BEFORE` (6), `META_PAY_DAYS_AFTER` (2).

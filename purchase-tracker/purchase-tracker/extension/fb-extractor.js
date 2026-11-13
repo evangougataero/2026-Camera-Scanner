@@ -1,7 +1,7 @@
 /**
  * fb-extractor.js — PT_extractInPage(opts) is serialized by chrome.scripting.executeScript({func}),
- * so it MUST be fully self-contained (no closures). It relies on globalThis.PTParse, which
- * background.js injects first via executeScript({files:['parse-order.js']}).
+ * so it MUST be fully self-contained (no closures). It relies on globalThis.PTParse + globalThis.PTGuard, which
+ * background.js injects first via executeScript({files:['login-guard.js', 'parse-order.js']}).
  *
  * VERIFIED UI SHAPE (buyer's listing page, Nov 2026): a "View Order" button opens an "Order status" DIALOG containing
  *   <item title> / $225.00 · Quantity: 1 / Delivered / Your order was delivered. / Nov 9, 2026 /
@@ -25,8 +25,8 @@
  */
 async function PT_extractInPage(opts) {
   opts = opts || {};
-  const P = globalThis.PTParse;
-  if (!P) return { ok: false, error: 'PARSER_NOT_INJECTED' };
+  const P = globalThis.PTParse, G = globalThis.PTGuard;
+  if (!P || !G) return { ok: false, error: 'PARSER_NOT_INJECTED' };
   const mode = opts.mode === 'seller' ? 'seller' : 'order';
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -115,12 +115,15 @@ async function PT_extractInPage(opts) {
     return m && !/^marketplace$/i.test(m[1]) ? P.cleanTitle(m[1]).slice(0, 200) : '';
   };
 
+  /**
+   * {code, detail} | null. Login walls via login-guard.js: URL pathname, or a VISIBLE login form/password with no signed-in
+   * UI. Hidden login nodes Facebook keeps in the DOM of signed-in pages must not count. Never bypassed.
+   */
   const blocker = () => {
-    const u = location.href;
-    if (/\/checkpoint|two_step_verification|\/recover/i.test(u)) return 'CHECKPOINT';
-    if (/\/login/i.test(u) || document.querySelector('input[name="pass"], form[action*="/login"]')) return 'LOGIN_REQUIRED';
-    const t = bodyText().slice(0, 3000).toLowerCase();
-    if (/confirm you.?re human|security check|captcha|suspicious activity|temporarily blocked|we suspect automated/.test(t)) return 'CHECKPOINT';
+    const g = G.inspect(document, location);
+    if (g.code) return { code: g.code, detail: g.detail };
+    const t = bodyText().slice(0, 3000);
+    if (/confirm you.?re human|security check|captcha|suspicious activity|temporarily blocked|we suspect automated/i.test(t)) return { code: 'CHECKPOINT', detail: G.describe(location.href, document.title + ' | ' + t.slice(0, 300), 'text') };
     return null;
   };
   const env = () => ({ visibility: document.visibilityState, bodyLength: bodyText().length, dialogs: dialogs().length });
@@ -191,7 +194,7 @@ async function PT_extractInPage(opts) {
   // ----- phase 'read': an order page (or an order dialog) is already there -----
   if (opts.phase === 'read') {
     const b = blocker();
-    if (b) return fail(b);
+    if (b) return fail(b.code, b.detail);
     const found = await waitFor(() => orderDialog(null) || (P.looksLikeOrderView(bodyText()) ? document.body : null), 15000);
     if (!found) return fail('ORDER_TEXT_NOT_FOUND', 'controls: ' + controlLabels().slice(0, 25).join(' / ').slice(0, 300), Object.assign({ env: env() }, diag()));
     return await readOrderView(found, {});
@@ -200,7 +203,7 @@ async function PT_extractInPage(opts) {
   // ----- phase 'click': listing page -----
   await waitFor(() => bodyText().length > 200, 15000);
   const b0 = blocker();
-  if (b0) return fail(b0);
+  if (b0) return fail(b0.code, b0.detail);
 
   // Seller + title from the listing page itself (also works when the order is gone).
   await waitFor(() => listingSeller(), 5000);
@@ -214,21 +217,25 @@ async function PT_extractInPage(opts) {
   const already = orderDialog(null);
   if (already) return await readOrderView(already, ctx);
 
-  const ctrl = await waitFor(() => findControl(RE_ORDER), 25000);   // generous: a late-rendering button must not be mistaken for a cancellation
+  const buttonWaitMs = opts.buttonWaitMs == null ? 25000 : opts.buttonWaitMs;
+  const ctrl = await waitFor(() => findControl(RE_ORDER), buttonWaitMs);   // generous: a late-rendering button must not be mistaken for anything
   if (!ctrl) {
     const extra = { seller: ctx.seller, itemTitle: ctx.title, env: env() };
     if (/(this (listing|content) (isn.t|is not) available|content isn.t available)/i.test(bodyText().slice(0, 4000))) {
       return fail('LISTING_UNAVAILABLE', 'page says listing/content unavailable', Object.assign(extra, diag()));
     }
     if (mode === 'seller') return fail('SELLER_NOT_FOUND', 'no seller section and no View Order button', Object.assign(extra, diag()));
-    // Is the page genuinely healthy (logged in, a real fully-loaded listing page, no login/checkpoint)? Only then does a
-    // missing View Order button mean the order is gone; the backend then marks the purchase Canceled.
+    // A missing View Order button is NEVER a cancellation on its own (it canceled a "Sold" Nikon D80 and a "Pending" D5300).
+    // Report what the listing itself says: "Sold" / "Pending" = an ACTIVE order, which the backend leaves unchanged.
+    // pageHealthy (logged in, a real fully-loaded listing page, no login/checkpoint) is diagnostic only.
     const labels = controlLabels();
     const loggedInUi = labels.some((t) => /^(account|notifications|messenger|your profile|menu)/i.test(t) || /unread/i.test(t));
     const pageHealthy = !blocker() && document.readyState === 'complete' && bodyText().length >= 500 &&
       /\/marketplace\/item\//.test(location.pathname) && loggedInUi && !!(ctx.title || ctx.seller);
-    return fail('ORDER_DETAILS_NOT_FOUND', 'controls: ' + labels.slice(0, 25).join(' / ').slice(0, 300) + ' | ' + JSON.stringify(env()),
-      Object.assign({ pageHealthy: pageHealthy }, extra, diag()));
+    const listingState = P.listingStateFromText(listingRoot().innerText || '');
+    return fail('ORDER_DETAILS_NOT_FOUND', (listingState ? 'listing shows ' + listingState + '; ' : '') + 'controls: ' +
+      labels.slice(0, 25).join(' / ').slice(0, 300) + ' | ' + JSON.stringify(env()),
+      Object.assign({ pageHealthy: pageHealthy, listingState: listingState }, extra, diag()));
   }
 
   // Real link to another Facebook page => let the background tab navigate there, then run phase 'read'.

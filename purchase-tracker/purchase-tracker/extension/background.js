@@ -17,7 +17,7 @@
  *   - each step first arms a watchdog alarm, so a worker killed mid-step resumes the same item (max 3 tries).
  * A heartbeat + storage lock prevents duplicate concurrent runs.
  */
-importScripts('parse-order.js', 'fb-extractor.js', 'parse-usps.js', 'usps-extractor.js', 'parse-signals.js', 'signals-extractor.js');
+importScripts('login-guard.js', 'parse-order.js', 'fb-extractor.js', 'parse-usps.js', 'usps-extractor.js', 'parse-signals.js', 'signals-extractor.js');
 
 const ALARM_RUN = 'pt-run';
 const ALARM_STEP = 'pt-step';
@@ -203,8 +203,31 @@ async function inTab(url, body) {
   });
 }
 
+const isWall = (r) => !!r && !r.ok && (r.error === 'LOGIN_REQUIRED' || r.error === 'CHECKPOINT');
+const WALL_RECHECK_MS = 5000;
+
+/** Login wall / checkpoint from the tab's URL (PATHNAME only — "login" inside a query string does not count). */
+async function tabWall(tabId) {
+  const cur = await chrome.tabs.get(tabId);
+  const code = PTGuard.pathBlocker(cur.url || '');
+  return code ? { ok: false, error: code, url: cur.url, detail: PTGuard.describe(cur.url, cur.title || '', 'url') } : null;
+}
+
+/**
+ * A LOGIN_REQUIRED / CHECKPOINT is re-verified ONCE (fresh tab after a few seconds) before it is reported: a page that
+ * was still hydrating, or a transient redirect, must not stop a run. A wall seen twice is real and is reported (never bypassed).
+ */
+async function reverifyWall(check) {
+  const first = await check();
+  if (!isWall(first)) return first;
+  await sleep(WALL_RECHECK_MS);
+  const second = await check();
+  if (isWall(second)) return Object.assign(second, { reverified: true, firstDetail: first.detail || '' });
+  return Object.assign(second || { ok: false, error: 'NO_RESULT' }, { recoveredFrom: first.error + (first.detail ? ' (' + String(first.detail).slice(0, 200) + ')' : '') });
+}
+
 async function runExtractor(tabId, opts) {
-  await chrome.scripting.executeScript({ target: { tabId }, files: ['parse-order.js'] });
+  await chrome.scripting.executeScript({ target: { tabId }, files: ['login-guard.js', 'parse-order.js'] });
   const [r] = await withTimeout(chrome.scripting.executeScript({ target: { tabId }, func: PT_extractInPage, args: [opts] }), SCRIPT_TIMEOUT_MS, 'SCRIPT_TIMEOUT');
   return r && r.result;
 }
@@ -215,9 +238,9 @@ async function checkListing(item, opts) {
   if (!url) return { ok: false, error: 'BAD_URL', detail: 'no usable Facebook listing URL' };
   const mode = item.mode === 'seller' ? 'seller' : 'order';
   const probe = !!opts.probe;
-  return inTab(url, async (tabId) => {
-    const cur = await chrome.tabs.get(tabId);
-    if (/\/login|\/checkpoint/i.test(cur.url || '')) return { ok: false, error: /checkpoint/i.test(cur.url) ? 'CHECKPOINT' : 'LOGIN_REQUIRED' };
+  return reverifyWall(() => inTab(url, async (tabId) => {
+    const wall = await tabWall(tabId);
+    if (wall) return wall;
     let res = await runPhase(tabId, runExtractor, { phase: 'click', mode, probe }, { phase: 'read', mode, probe });
     if (res && res.nav) {
       const fromListing = { seller: res.seller, itemTitle: res.itemTitle };
@@ -228,7 +251,7 @@ async function checkListing(item, opts) {
       if (res) { if (!res.seller) res.seller = fromListing.seller; if (!res.itemTitle) res.itemTitle = fromListing.itemTitle; }
     }
     return res || { ok: false, error: 'NO_RESULT' };
-  });
+  }));
 }
 
 async function runUsps(tabId, opts) {
@@ -248,30 +271,30 @@ async function checkUsps(item, opts) {
 }
 
 async function runSignalsFn(tabId, func, opts) {
-  await chrome.scripting.executeScript({ target: { tabId }, files: ['parse-signals.js'] });
+  await chrome.scripting.executeScript({ target: { tabId }, files: ['login-guard.js', 'parse-signals.js'] });
   const [r] = await withTimeout(chrome.scripting.executeScript({ target: { tabId }, func, args: [opts] }), SCRIPT_TIMEOUT_MS, 'SCRIPT_TIMEOUT');
   return r && r.result;
 }
 
 async function checkMetaPay(opts) {
   const probe = !!(opts && opts.probe);
-  return inTab(META_PAY_URL, async (tabId) => {
-    const cur = await chrome.tabs.get(tabId);
-    if (/\/login|\/checkpoint/i.test(cur.url || '')) return { ok: false, error: /checkpoint/i.test(cur.url) ? 'CHECKPOINT' : 'LOGIN_REQUIRED', url: cur.url };
+  return reverifyWall(() => inTab(META_PAY_URL, async (tabId) => {
+    const wall = await tabWall(tabId);
+    if (wall) return wall;
     return (await runPhase(tabId, (t, o) => runSignalsFn(t, PT_metaPayInPage, o), { probe }, { probe })) || { ok: false, error: 'NO_RESULT' };
-  });
+  }));
 }
 
 async function checkNotifications(opts) {
   const probe = !!(opts && opts.probe);
   let last = null;
   for (const url of NOTIFICATION_URLS) {                    // Marketplace notifications first, then all notifications
-    last = await inTab(url, async (tabId) => {
-      const cur = await chrome.tabs.get(tabId);
-      if (/\/login|\/checkpoint/i.test(cur.url || '')) return { ok: false, error: /checkpoint/i.test(cur.url) ? 'CHECKPOINT' : 'LOGIN_REQUIRED' };
+    last = await reverifyWall(() => inTab(url, async (tabId) => {
+      const wall = await tabWall(tabId);
+      if (wall) return wall;
       return (await runPhase(tabId, (t, o) => runSignalsFn(t, PT_notificationsInPage, o), { probe }, { probe })) || { ok: false, error: 'NO_RESULT' };
-    });
-    if (last && (last.ok || last.error === 'LOGIN_REQUIRED' || last.error === 'CHECKPOINT')) return Object.assign(last, { source: url });
+    }));
+    if (last && (last.ok || isWall(last))) return Object.assign(last, { source: url });       // a CONFIRMED wall: no point trying the next page
   }
   return last || { ok: false, error: 'NO_RESULT' };
 }
@@ -286,8 +309,26 @@ async function finishRun(q, outcome) {
   await patchState({ lastRunFinishedAt: Date.now(), lastRunOutcome: outcome, lastRunStats: stats });
   await log('run ' + outcome + ' — ok:' + (stats.ok || 0) + ' errors:' + (stats.errors || 0) + ' canceled:' + (stats.canceled || 0) + ' tracking:' + (stats.tracking || 0) +
     ' sellers:' + (stats.sellers || 0) + ' usps:' + (stats.usps || 0) + ' signals:' + (stats.signals || 0));
-  await chrome.action.setBadgeText({ text: q.issue ? '!' : '' });
-  if (q.issue) await chrome.action.setBadgeBackgroundColor({ color: '#b3261e' });
+  const kinds = issueKindsOf(q);
+  await patchState({ badgeIssues: kinds });
+  await setBadge(kinds);
+}
+
+/** Kinds ('fb' | 'usps' | 'metapay' | 'notifications') that raised an issue in this run (older queues only had a boolean). */
+function issueKindsOf(q) { return (q.issueKinds && q.issueKinds.length) ? q.issueKinds.slice() : (q.issue ? ['unknown'] : []); }
+function flagIssue(q, kind) { q.issue = true; q.issueKinds = q.issueKinds || []; if (q.issueKinds.indexOf(kind) === -1) q.issueKinds.push(kind); }
+async function setBadge(kinds) {
+  await chrome.action.setBadgeText({ text: kinds.length ? '!' : '' });
+  if (kinds.length) await chrome.action.setBadgeBackgroundColor({ color: '#b3261e' });
+}
+/** A manual probe of one kind succeeded: that kind's issue is resolved — clear the red badge if nothing else is outstanding. */
+async function clearIssueAfterProbe(kind) {
+  const st = (await getLocal(K.state)) || {};
+  const before = st.badgeIssues || [];
+  const after = before.filter((k) => k !== kind && k !== 'unknown');
+  if (after.length !== before.length) await log('probe ' + kind + ' succeeded — issue cleared' + (after.length ? ' (still open: ' + after.join(', ') + ')' : ''));
+  await patchState({ badgeIssues: after });
+  await setBadge(after);
 }
 
 async function startRun(reason, force) {
@@ -299,15 +340,17 @@ async function startRun(reason, force) {
   const s = await settings();
   try {
     await flushOutbox();
+    // Order of work: Facebook order/seller checks FIRST (the data that matters most), then USPS, then the Meta Pay /
+    // notifications signal pages LAST — a problem on a signal page can never cost the order checks of a run.
     const fb = await api('getWork', { limit: BATCH_LIMIT, force: !!force });
-    if (fb.signals) {                                        // backend has purchases a cancellation could still affect
-      if (s.scanMetaPay !== false) items.push({ kind: 'metapay', purchaseId: 'META_PAY' });
-      if (s.scanNotifications !== false) items.push({ kind: 'notifications', purchaseId: 'NOTIFICATIONS' });
-    }
     (fb.items || []).forEach((i) => items.push(Object.assign({ kind: 'fb' }, i)));
     (fb.sellerItems || []).forEach((i) => items.push(Object.assign({ kind: 'fb', mode: 'seller' }, i)));
     const us = await api('getUspsWork', { limit: BATCH_LIMIT, force: !!force });
     (us.items || []).forEach((i) => items.push(Object.assign({ kind: 'usps' }, i)));
+    if (fb.signals) {                                        // backend has purchases a cancellation could still affect
+      if (s.scanMetaPay !== false) items.push({ kind: 'metapay', purchaseId: 'META_PAY' });
+      if (s.scanNotifications !== false) items.push({ kind: 'notifications', purchaseId: 'NOTIFICATIONS' });
+    }
   } catch (e) {
     await patchState({ lastError: e.message, lastErrorAt: Date.now() });
     await log('getWork failed: ' + e.message);
@@ -320,7 +363,7 @@ async function startRun(reason, force) {
     await chrome.action.setBadgeText({ text: '' });
     return { items: 0 };
   }
-  await setLocal({ [K.queue]: { runId: String(Date.now()), reason, startedAt: Date.now(), heartbeat: Date.now(), index: 0, tries: 0, items, issue: false,
+  await setLocal({ [K.queue]: { runId: String(Date.now()), reason, startedAt: Date.now(), heartbeat: Date.now(), index: 0, tries: 0, items, issue: false, issueKinds: [],
     stats: { ok: 0, errors: 0, canceled: 0, tracking: 0, sellers: 0, usps: 0, signals: 0 } } });
   const n = (k) => items.filter((i) => i.kind === k).length;
   await log('run started (' + reason + '): ' + n('fb') + ' Facebook (' + items.filter((i) => i.kind === 'fb' && i.mode === 'seller').length + ' seller-only), ' +
@@ -334,16 +377,25 @@ function dropRemaining(q, kinds) {
   q.items = q.items.filter((it, i) => i <= q.index || kinds.indexOf(it.kind) === -1);
 }
 
+/** Dropped after a wall on an actual ORDER page (kind 'fb'). A wall on a signal page never drops order checks. */
 const FB_KINDS = ['fb', 'notifications'];
+
+/** " — <how · path · snippet>" suffix for LOGIN_REQUIRED / CHECKPOINT / REAUTH reports, so false alarms are diagnosable. */
+function wallDetail(res) {
+  if (!res) return '';
+  const d = res.detail ? String(res.detail).slice(0, 260) : (res.url ? PTGuard.describe(res.url, '', '') : '');
+  return (d ? ' — ' + d : '') + (res.reverified ? ' (seen twice)' : '');
+}
 
 async function handleSignals(q, item, res) {
   const label = item.kind === 'metapay' ? 'Meta Pay' : 'Notifications';
   if (!res.ok) {
     if (res.error === 'LOGIN_REQUIRED' || res.error === 'CHECKPOINT' || res.error === 'REAUTH_REQUIRED') {
-      try { await api('reportIssue', { code: res.error, message: label + ' ' + res.error + (res.error === 'REAUTH_REQUIRED' ? ' — Meta asked for your password; open the wallet page once by hand' : '') }); } catch (e) { /* offline */ }
-      q.issue = true;
-      await log('STOPPED ' + label + ': ' + res.error + ' — resolve it manually in Chrome (never bypassed)');
-      if (item.kind === 'notifications' && res.error !== 'REAUTH_REQUIRED') dropRemaining(q, FB_KINDS);
+      // Reported and flagged, never bypassed — but the run goes on: signal pages run last and never stop order checks.
+      const why = wallDetail(res);
+      try { await api('reportIssue', { code: res.error, message: label + ' ' + res.error + (res.error === 'REAUTH_REQUIRED' ? ' — Meta asked for your password; open the wallet page once by hand' : '') + why }); } catch (e) { /* offline */ }
+      flagIssue(q, item.kind);
+      await log('STOPPED ' + label + ': ' + res.error + why + ' — resolve it manually in Chrome (never bypassed)');
     } else {
       await log(label + ': error ' + res.error + (res.detail ? ' (' + String(res.detail).slice(0, 120) + ')' : ''));
     }
@@ -391,10 +443,11 @@ async function processStep() {
       await handleSignals(q, item, res);
     } else if (systemic) {
       // Never try to get past it: skip the rest of THIS kind, tell the user and the sheet (not counted against the item).
-      try { await api('reportIssue', { code: res.error, message: (kind === 'usps' ? 'USPS' : 'Facebook') + ' ' + res.error + ' on ' + item.purchaseId }); } catch (e) { /* offline */ }
-      await log('STOPPED ' + kind.toUpperCase() + ': ' + res.error + (kind === 'usps' ? ' — USPS served a bot check; open tools.usps.com manually and retry later' : ' — open facebook.com and resolve it manually'));
+      const why = kind === 'fb' ? wallDetail(res) : '';
+      try { await api('reportIssue', { code: res.error, message: (kind === 'usps' ? 'USPS' : 'Facebook') + ' ' + res.error + ' on ' + item.purchaseId + why }); } catch (e) { /* offline */ }
+      await log('STOPPED ' + kind.toUpperCase() + ': ' + res.error + why + (kind === 'usps' ? ' — USPS served a bot check; open tools.usps.com manually and retry later' : ' — open facebook.com and resolve it manually'));
       dropRemaining(q, kind === 'usps' ? ['usps'] : FB_KINDS);
-      q.issue = true;
+      flagIssue(q, kind);
     } else if (kind === 'usps') {
       await queueResult('submitUspsResult', item.purchaseId, { ok: !!res.ok, error: res.error, detail: res.detail, notFound: !!res.notFound,
         trackingNumber: res.trackingNumber || item.trackingNumber, status: res.status, summary: res.summary, history: res.history, expectedDelivery: res.expectedDelivery });
@@ -403,13 +456,13 @@ async function processStep() {
     } else {
       const clean = { ok: !!res.ok, mode: item.mode === 'seller' ? 'seller' : 'order', error: res.error, detail: res.detail, fbStatusRaw: res.fbStatusRaw,
                       canceled: !!res.canceled, outcome: res.outcome || '', trackingNumber: res.trackingNumber, carrier: res.carrier,
-                      orderId: res.orderId, orderTotal: res.orderTotal, pageHealthy: !!res.pageHealthy,
+                      orderId: res.orderId, orderTotal: res.orderTotal, pageHealthy: !!res.pageHealthy, listingState: res.listingState || '',
                       seller: res.seller || '', itemTitle: res.itemTitle || '', orderView: !!res.orderView };
       await queueResult('submitFbResult', item.purchaseId, clean);          // saved before moving on
       if (res.ok) { q.stats.ok++; if (res.canceled) q.stats.canceled++; if (res.trackingNumber) q.stats.tracking++; } else q.stats.errors++;
       if (res.seller) q.stats.sellers++;
       await log(item.purchaseId + ' FB' + (clean.mode === 'seller' ? ' (seller)' : '') + ': ' +
-        (res.ok ? ('ok' + (res.outcome ? ' ' + res.outcome.toUpperCase() : res.canceled ? ' CANCELED' : '') + (res.trackingNumber ? ' tracking' : '') + (res.seller ? ' seller' : '')) : ('error ' + res.error + (res.seller ? ' (seller captured)' : ''))));
+        (res.ok ? ('ok' + (res.outcome ? ' ' + res.outcome.toUpperCase() : res.canceled ? ' CANCELED' : '') + (res.trackingNumber ? ' tracking' : '') + (res.seller ? ' seller' : '')) : ('error ' + res.error + (res.listingState ? ' (listing ' + res.listingState + ' — order active)' : '') + (res.seller ? ' (seller captured)' : ''))));
     }
 
     q.index++;
@@ -466,21 +519,25 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
       case 'pt:probeSeller': {
         const id = (String(msg.input || '').match(/(\d{6,25})/) || [])[1];
         if (!id) return { error: 'Enter a listing URL or ID' };
-        return await checkListing({ url: '', listingId: id, mode: msg.type === 'pt:probeSeller' ? 'seller' : 'order' }, { probe: true });
+        const r = await checkListing({ url: '', listingId: id, mode: msg.type === 'pt:probeSeller' ? 'seller' : 'order' }, { probe: true });
+        if (r && (r.ok || r.pageHealthy)) await clearIssueAfterProbe('fb');          // signed in and the page is readable
+        return r;
       }
       case 'pt:probeUsps': {
         const n = String(msg.input || '').replace(/\s/g, '');
         if (!/^[A-Za-z0-9]{10,34}$/.test(n)) return { error: 'Enter a tracking number' };
-        return await checkUsps({ trackingNumber: n }, { probe: true });
+        const r = await checkUsps({ trackingNumber: n }, { probe: true });
+        if (r && r.ok) await clearIssueAfterProbe('usps');
+        return r;
       }
       case 'pt:probeMetaPay': {
         const r = await checkMetaPay({ probe: true });
-        if (r && r.ok) r.wouldChange = await preview('metapay', { transactions: r.transactions });
+        if (r && r.ok) { await clearIssueAfterProbe('metapay'); r.wouldChange = await preview('metapay', { transactions: r.transactions }); }
         return r;
       }
       case 'pt:probeNotifications': {
         const r = await checkNotifications({ probe: true });
-        if (r && r.ok) r.wouldChange = await preview('notifications', { notifications: r.notifications });
+        if (r && r.ok) { await clearIssueAfterProbe('notifications'); r.wouldChange = await preview('notifications', { notifications: r.notifications }); }
         return r;
       }
       case 'pt:saveSignalPrefs': {

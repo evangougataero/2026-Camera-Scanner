@@ -41,7 +41,7 @@ function listingPage(opts) {
 function orderDialog(lines) { return h('div', { role: 'dialog' }, lines.join('\n')); }
 
 const run = (body, opts) => {
-  const ctx = pageContext(body, { files: ['parse-order.js', 'fb-extractor.js'] });
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-order.js', 'fb-extractor.js'] });
   return ctx.PT_extractInPage(Object.assign({ phase: 'click' }, opts || {}));
 };
 
@@ -99,16 +99,88 @@ test('canceled / expired orders are reported with their outcome', async () => {
 
 test('read phase on an order page (no dialog) parses the page body', async () => {
   const body = h('body', {}, '', [h('div', { role: 'main' }, ORDER_LINES.join('\n'))]);
-  const ctx = pageContext(body, { files: ['parse-order.js', 'fb-extractor.js'], url: 'https://www.facebook.com/marketplace/buyer_order_status/?id=123456789012' });
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-order.js', 'fb-extractor.js'], url: 'https://www.facebook.com/marketplace/buyer_order_status/?id=123456789012' });
   const r = await ctx.PT_extractInPage({ phase: 'read' });
   assert.equal(r.ok, true); assert.equal(r.trackingNumber, '9334610579700004096766'); assert.equal(r.orderId, '123456789012');
 });
 
 test('login wall is reported, never bypassed', async () => {
   const body = h('body', {}, 'Log in to Facebook '.repeat(20), [h('form', { action: '/login/device-based/' }, '', [h('input', { name: 'pass' })])]);
-  const ctx = pageContext(body, { files: ['parse-order.js', 'fb-extractor.js'], url: 'https://www.facebook.com/login/?next=x' });
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-order.js', 'fb-extractor.js'], url: 'https://www.facebook.com/login/?next=x' });
   const r = await ctx.PT_extractInPage({ phase: 'click' });
   assert.equal(r.ok, false); assert.equal(r.error, 'LOGIN_REQUIRED');
+});
+
+// ---------------------------------------------------------------- login false positives (FIX A)
+const FB_FILES = ['login-guard.js', 'parse-order.js', 'fb-extractor.js'];
+const hiddenLogin = () => { const f = h('form', { action: '/login/device-based/regular/login/' }, '', [h('input', { name: 'pass', type: 'password' })]); f.hidden = true; return f; };
+
+test('signed-in listing page with a HIDDEN login form / password field in the DOM is NOT a login wall', async () => {
+  const body = listingPage({ onClick: (b) => setTimeout(() => b.append(orderDialog(ORDER_LINES)), 100) });
+  body.append(hiddenLogin());
+  const r = await run(body);
+  assert.equal(r.ok, true, r.error); assert.equal(r.trackingNumber, '9334610579700004096766');
+});
+
+test('a VISIBLE password field on a page that still shows signed-in nav (Messenger / Your profile) is NOT a login wall', async () => {
+  const body = listingPage({ onClick: (b) => setTimeout(() => b.append(orderDialog(ORDER_LINES)), 100) });
+  body.append(h('div', {}, 'Confirm', [h('input', { type: 'password' })]));
+  const r = await run(body);
+  assert.equal(r.ok, true, r.error);
+});
+
+test('"login" only in the query string is not a login wall; a visible login form with no signed-in UI is (with path + snippet)', async () => {
+  const body = listingPage({ onClick: (b) => setTimeout(() => b.append(orderDialog(ORDER_LINES)), 100) });
+  const ctx = pageContext(body, { files: FB_FILES, url: 'https://www.facebook.com/marketplace/item/1288988733112094/?next=%2Flogin%2F&ref=login' });
+  const ok = await ctx.PT_extractInPage({ phase: 'click' });
+  assert.equal(ok.ok, true, ok.error);
+
+  const wall = h('body', {}, 'See more on Facebook '.repeat(15), [h('form', { action: '/login/device-based/regular/login/' }, 'Log in to Facebook\nEmail or phone number\nPassword\nLog in',
+    [h('input', { name: 'email' }), h('input', { name: 'pass', type: 'password' })])]);
+  const ctx2 = pageContext(wall, { files: FB_FILES, url: 'https://www.facebook.com/marketplace/item/1288988733112094/', title: 'Facebook' });
+  const r = await ctx2.PT_extractInPage({ phase: 'click' });
+  assert.equal(r.ok, false); assert.equal(r.error, 'LOGIN_REQUIRED');
+  assert.match(r.detail, /^via visible-password · path=\/marketplace\/item\/1288988733112094\/ · "Facebook \| Log in to Facebook/);
+  assert.ok(r.detail.length <= 220);
+});
+
+test('PTGuard: pathname-only URL rule, checkpoint paths, privacy-trimmed snippets', () => {
+  const ctx = pageContext(h('body', {}, 'x'), { files: ['login-guard.js'] });
+  const G = ctx.PTGuard;
+  assert.equal(G.pathBlocker('https://www.facebook.com/login/?next=x'), 'LOGIN_REQUIRED');
+  assert.equal(G.pathBlocker('https://www.facebook.com/login.php'), 'LOGIN_REQUIRED');
+  assert.equal(G.pathBlocker('https://www.facebook.com/checkpoint/1501092823525282/'), 'CHECKPOINT');
+  assert.equal(G.pathBlocker('https://www.facebook.com/marketplace/notifications/?ref=login'), null);
+  assert.equal(G.pathBlocker('https://www.facebook.com/marketplace/item/1/?next=/checkpoint/'), null);
+  assert.equal(G.pathBlocker('https://www.facebook.com/marketplace/item/loginhelper/'), null);
+  assert.equal(G.snippet('mail me at a.b@example.com, id 100004123456789 ' + 'x'.repeat(300)).length, 150);
+  assert.match(G.snippet('mail me at a.b@example.com, id 100004123456789'), /\[email\].*\[#\]/);
+});
+
+test('notifications page with hidden login nodes (signed in) is read normally', async () => {
+  const body = h('body', {}, '', [
+    h('div', { role: 'banner' }, '', [h('div', { role: 'button', 'aria-label': 'Account controls and settings' })]),
+    h('div', { role: 'main' }, 'Marketplace notifications\n' + 'Older\n'.repeat(40), [
+      h('a', { href: '/marketplace/item/7777777777777777/', role: 'row' }, 'Kelsey canceled your order for Fuji X-T3. 3h')]),
+    hiddenLogin()]);
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-signals.js', 'signals-extractor.js'], url: 'https://www.facebook.com/marketplace/notifications/' });
+  const r = await ctx.PT_notificationsInPage({ maxRounds: 1 });
+  assert.equal(r.ok, true, r.error + ' ' + r.detail);
+});
+
+// ---------------------------------------------------------------- View Order missing (FIX B)
+const SOLD_LINE = (state) => h('div', {}, state);
+test('no View Order button: the extractor reports what the listing shows (Sold / Pending / nothing) — never a cancel by itself', async () => {
+  for (const [line, want] of [['Sold', 'sold'], ['Pending', 'pending'], ['', '']]) {
+    const body = listingPage({ noButton: true });
+    if (line) body.children[2].children.splice(1, 0, Object.assign(SOLD_LINE(line), { parent: body.children[2] }));
+    const r = await run(body, { buttonWaitMs: 300 });
+    assert.equal(r.ok, false); assert.equal(r.error, 'ORDER_DETAILS_NOT_FOUND');
+    assert.equal(r.listingState, want, line);
+    assert.equal(r.seller, 'Olga Serdinskaya');
+    assert.equal(r.canceled, undefined);
+    if (want) assert.match(r.detail, new RegExp('^listing shows ' + want));
+  }
 });
 
 test('page functions are self-contained (serializable): without the parser they fail cleanly', async () => {
@@ -127,7 +199,7 @@ const WALLET = ['All', 'Money transfer', 'Orders', 'Donations', 'Games', 'Others
 
 test('Meta Pay page function reads wallet rows', async () => {
   const body = h('body', {}, '', [h('div', { role: 'main' }, '', WALLET.map((l) => h('div', {}, l)))]);
-  const ctx = pageContext(body, { files: ['parse-signals.js', 'signals-extractor.js'], url: 'https://accountscenter.facebook.com/meta_pay_wallet/' });
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-signals.js', 'signals-extractor.js'], url: 'https://accountscenter.facebook.com/meta_pay_wallet/' });
   const r = await ctx.PT_metaPayInPage({ maxRounds: 1 });
   assert.equal(r.ok, true);
   assert.deepEqual(Array.from(r.transactions, (t) => t.seller + '|' + t.status + '|' + t.date + '|' + t.amount),
@@ -136,7 +208,7 @@ test('Meta Pay page function reads wallet rows', async () => {
 
 test('Meta Pay password prompt => REAUTH_REQUIRED (never bypassed)', async () => {
   const body = h('body', {}, 'Re-enter your password to continue. For your security, please confirm it is you. '.repeat(3), [h('input', { type: 'password' })]);
-  const ctx = pageContext(body, { files: ['parse-signals.js', 'signals-extractor.js'], url: 'https://accountscenter.facebook.com/meta_pay_wallet/' });
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-signals.js', 'signals-extractor.js'], url: 'https://accountscenter.facebook.com/meta_pay_wallet/' });
   const r = await ctx.PT_metaPayInPage({});
   assert.equal(r.ok, false); assert.equal(r.error, 'REAUTH_REQUIRED');
 });
@@ -148,7 +220,7 @@ test('notifications page function returns order events with linked listing IDs',
     h('a', { href: '/marketplace/item/6666666666666666/', role: 'row' }, 'Price drop: Sony A7 III is now $900 · 2d'),
     h('a', { href: '/marketplace/item/7777777777777777/', role: 'row' }, 'Kelsey wants to cancel your order for Fuji X-T3. 3h')
   ])]);
-  const ctx = pageContext(body, { files: ['parse-signals.js', 'signals-extractor.js'], url: 'https://www.facebook.com/marketplace/notifications/' });
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-signals.js', 'signals-extractor.js'], url: 'https://www.facebook.com/marketplace/notifications/' });
   const r = await ctx.PT_notificationsInPage({ maxRounds: 1 });
   assert.equal(r.ok, true);
   const canc = r.notifications.filter((n) => n.kind === 'canceled');

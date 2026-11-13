@@ -210,11 +210,11 @@ test('Facebook-confirmed delivery shows Delivered on the dashboard and transfers
   assert.equal(w.post({ action: 'getUspsWork', force: true }).items.length, 0);             // monitoring stopped
 });
 
-test('CANCELLATION: View Order missing on a healthy page => Canceled on the dashboard; no Possible/Refunded states', () => {
+test('CANCELLATION: the Facebook order page saying Canceled => Canceled on the dashboard; no Possible/Refunded states', () => {
   const w = world();
   w.run('setupPurchaseDashboard()');
   w.buy(2, ID1, 1650); w.buy(3, ID2, 800);
-  w.fb(P1, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true });
+  w.fb(P1, { ok: true, canceled: true, outcome: 'canceled', fbStatusRaw: 'Canceled | Your order was canceled.' });
   w.run('refreshPurchaseDashboard()');
   const r = w.dashRows().find((x) => x['Purchase ID'] === P1);
   assert.equal(r['Order Status'], 'Canceled'); assert.equal(r['Purchase Cost'], 1650); assert.equal(r['Needs Attention'], '');
@@ -230,11 +230,16 @@ test('CANCELLATION: nothing that merely looks like a failure cancels an order', 
   w.run('setupPurchaseDashboard()');
   w.buy(2, ID1, 1650);
   [{ ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: false }, { ok: false, error: 'PAGE_LOAD_TIMEOUT' }, { ok: false, error: 'LOGIN_REQUIRED' },
-   { ok: false, error: 'CHECKPOINT' }, { ok: false, error: 'LISTING_UNAVAILABLE' }, { ok: false, error: 'TAB_CLOSED' }].forEach((res) => w.fb(P1, res));
+   { ok: false, error: 'CHECKPOINT' }, { ok: false, error: 'LISTING_UNAVAILABLE' }, { ok: false, error: 'TAB_CLOSED' },
+   { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true }, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true, listingState: 'sold' },
+   { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true, listingState: 'pending' }].forEach((res) => w.fb(P1, res));
   w.run('refreshPurchaseDashboard()');
   assert.equal(w.dashRows()[0]['Order Status'], 'Purchased');
   w.fb(P1, { ok: true, fbStatusRaw: 'Order Confirmed' });
-  w.fb(P1, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true });             // only a healthy page + no button cancels
+  w.fb(P1, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true });             // a missing View Order button alone never cancels
+  w.run('refreshPurchaseDashboard()');
+  assert.notEqual(w.dashRows()[0]['Order Status'], 'Canceled');
+  w.fb(P1, { ok: true, canceled: true, outcome: 'refunded', fbStatusRaw: 'Refunded' });       // explicit evidence does
   w.run('refreshPurchaseDashboard()');
   assert.equal(w.dashRows()[0]['Order Status'], 'Canceled');
 });
@@ -247,7 +252,7 @@ test('a canceled purchase that is already in Inventory keeps its Inventory rows 
   w.usps(P1, { status: 'USPS in possession of item', history: ['USPS in possession of item'] });
   const inv = w.snapshot(w.inv);
   w.fb(P1, { ok: true, canceled: true });
-  w.fb(P1, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true });              // accepted by USPS: never auto-canceled
+  w.fb(P1, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true });              // never a cancellation
   w.run('refreshPurchaseDashboard()');
   assert.equal(w.snapshot(w.inv), inv);
   assert.equal(w.dashRows()[0]['Inventory'], '✓ In Inventory');

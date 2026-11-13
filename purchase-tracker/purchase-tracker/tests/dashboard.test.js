@@ -112,14 +112,26 @@ test('Facebook delivery also sets the stored Purchase Status (monitoring stops) 
 // ---------------------------------------------------------------- cancellation rule (backend)
 const miss = { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true };
 
-test('View Order missing on a HEALTHY page => Canceled (no "possible" step, no earlier-sighting requirement)', () => {
+test('View Order missing NEVER cancels on its own, even on a page that loaded normally', () => {
   const p = g.applyFbResult_(rec({}), miss, '2026-10-28 11:00');
-  assert.equal(p['Purchase Status'], 'Canceled'); assert.match(p['Notes'], /Canceled: View Order button missing/); assert.equal(p['FB Error Count'], 0);
-  assert.equal(g.applyFbResult_(rec({ 'Purchase Status': 'Tracking Available', 'Tracking Number': '940' }), miss, 'ts')['Purchase Status'], 'Canceled');
+  assert.equal(p['Purchase Status'], undefined); assert.equal(p['Cancel Signal'], undefined); assert.equal(p['FB Error Count'], 1);
+  assert.match(p['Notes'], /FB check failed: ORDER_DETAILS_NOT_FOUND/);
+  assert.equal(g.applyFbResult_(rec({ 'Purchase Status': 'Tracking Available', 'Tracking Number': '940' }), miss, 'ts')['Purchase Status'], undefined);
+});
+
+test('View Order missing on a listing that shows Sold (Nikon D80) or Pending (D5300) => active order, unchanged, not an error', () => {
+  [['sold', 'Sold'], ['pending', 'Pending']].forEach(([state, label]) => {
+    const p = g.applyFbResult_(rec({ 'FB Error Count': 2 }), Object.assign({ listingState: state, seller: 'Kim Vo' }, miss), '2026-11-13 11:00');
+    assert.equal(p['Purchase Status'], undefined); assert.equal(p['Cancel Signal'], undefined); assert.equal(p['FB Error Count'], undefined);
+    assert.match(p['Notes'], new RegExp('listing shows ' + label + ' — order still active'));
+    assert.equal(p['Seller'], 'Kim Vo');                                                        // seller still captured
+  });
+  // explicit evidence from the order page still cancels
+  assert.equal(g.applyFbResult_(rec({}), { ok: true, canceled: true, outcome: 'refunded', fbStatusRaw: 'Refunded' }, 'ts')['Purchase Status'], 'Canceled');
 });
 
 test('NOT canceled when the page did not load properly: timeouts, login wall, CAPTCHA, removed listing, extraction failure', () => {
-  [{ ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: false }, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND' },
+  [{ ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: false }, { ok: false, error: 'ORDER_DETAILS_NOT_FOUND' }, miss,
    { ok: false, error: 'PAGE_LOAD_TIMEOUT' }, { ok: false, error: 'LOGIN_REQUIRED' }, { ok: false, error: 'CHECKPOINT' },
    { ok: false, error: 'LISTING_UNAVAILABLE', pageHealthy: true }, { ok: false, error: 'EXTENSION_ERROR' }, { ok: false, error: 'ORDER_TEXT_NOT_FOUND', pageHealthy: true }
   ].forEach((res) => {

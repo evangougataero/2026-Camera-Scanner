@@ -216,13 +216,43 @@ test('notification scan: a cancellation naming the listing cancels it; unknown s
 test('a canceled row still receives its seller from an order-mode check (needed to match a later Meta Pay refund)', () => {
   const w = world();
   w.buy(4, 290.40);
-  w.post({ action: 'submitFbResult', purchaseId: PN, result: { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true } });
+  w.post({ action: 'submitFbResult', purchaseId: PN, result: { ok: true, canceled: true, outcome: 'canceled', fbStatusRaw: 'Canceled' } });
   assert.equal(w.rec(PN)['Purchase Status'], 'Canceled');
   w.post({ action: 'submitFbResult', purchaseId: PN, result: { ok: false, error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true, seller: 'Nathan Stickler' } });
   assert.equal(w.rec(PN)['Seller'], 'Nathan Stickler');
   const t = S.parseMetaPayText('Nathan Stickler\nRefunded\nNov 3, 2026\n$290.40', w.clock.now);
   w.post({ action: 'submitSignals', result: { source: 'metapay', ok: true, transactions: t } });
   assert.equal(w.rec(PN)['Refund Received'], 'Y'); assert.match(w.rec(PN)['Cancel Signal'], /^Refunded — Meta Pay/);
+});
+
+test('FIX B end-to-end: "Sold" D80 (Meta Pay May be delayed) and "Pending" D5300 (Meta Pay Confirmed) stay active; no View Order button never cancels', () => {
+  const w = world();
+  w.buy(4, 290.40); w.buy(5, 250);
+  const miss = (seller, listingState) => ({ ok: false, mode: 'order', error: 'ORDER_DETAILS_NOT_FOUND', pageHealthy: true, listingState, seller });
+  w.post({ action: 'submitFbResult', purchaseId: PN, result: miss('Nathan Stickler', 'sold') });
+  w.post({ action: 'submitFbResult', purchaseId: PS, result: miss('Kim Vo', 'pending') });
+  w.post({ action: 'submitFbResult', purchaseId: PS, result: miss('Kim Vo', '') });                    // even with no Sold/Pending marker
+  const t = S.parseMetaPayText('Nathan Stickler\nMay be delayed\nNov 3, 2026\n$290.40\nKim Vo\nConfirmed\nNov 3, 2026\n$250.00', w.clock.now);
+  w.post({ action: 'submitSignals', result: { source: 'metapay', ok: true, transactions: t } });
+  for (const pid of [PN, PS]) {
+    assert.equal(w.rec(pid)['Purchase Status'], 'Purchased', pid);
+    assert.equal(w.rec(pid)['Cancel Signal'], '', pid);
+  }
+  assert.match(w.rec(PN)['Meta Pay Status'], /^May be delayed/); assert.match(w.rec(PS)['Meta Pay Status'], /^Confirmed/);
+  assert.match(w.rec(PN)['Notes'], /listing shows Sold — order still active/);
+  assert.equal(Number(w.rec(PN)['FB Error Count'] || 0), 0);
+  assert.equal(w.post({ action: 'getWork', force: true }).items.filter((i) => i.purchaseId === PN || i.purchaseId === PS).length, 2);   // still monitored
+});
+
+test('Meta Pay refund matches a row with a BLANK Seller by exact amount + date (one candidate only)', () => {
+  const w = world();
+  w.buy(2, 262.84); w.buy(4, 290.40);                                                                 // no Facebook check yet: Seller blank on both
+  const t = S.parseMetaPayText('Olga Serdinskaya\nRefunded\nNov 3, 2026\n$262.84', w.clock.now);
+  w.post({ action: 'submitSignals', result: { source: 'metapay', ok: true, transactions: t } });
+  assert.equal(w.rec(PC)['Purchase Status'], 'Canceled'); assert.equal(w.rec(PC)['Refund Received'], 'Y');
+  assert.match(w.rec(PC)['Cancel Signal'], /^Refunded — Meta Pay .*matched by amount\+date/);
+  assert.equal(w.rec(PC)['Seller'], '');
+  assert.equal(w.rec(PN)['Purchase Status'], 'Purchased');
 });
 
 // ---------------------------------------------------------------- extension wiring
