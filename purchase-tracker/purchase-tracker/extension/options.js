@@ -6,6 +6,7 @@ async function load() {
   if (s) { $('apiUrl').value = s.apiUrl || ''; $('apiToken').value = s.apiToken || ''; }
   $('scanMetaPay').checked = !s || s.scanMetaPay !== false;            // both default ON
   $('scanNotifications').checked = !s || s.scanNotifications !== false;
+  $('fallbackListing').checked = !s || s.fallbackListing !== false;
   await refresh();
 }
 
@@ -46,7 +47,8 @@ $('save').onclick = async () => {
 };
 
 $('saveSignals').onclick = async () => {
-  const r = await send({ type: 'pt:saveSignalPrefs', scanMetaPay: $('scanMetaPay').checked, scanNotifications: $('scanNotifications').checked });
+  const r = await send({ type: 'pt:saveSignalPrefs', scanMetaPay: $('scanMetaPay').checked, scanNotifications: $('scanNotifications').checked,
+    fallbackListing: $('fallbackListing').checked });
   msg(r && r.ok ? 'Saved' : ((r && r.error) || 'Failed'), !!(r && r.ok), 'signalMsg');
 };
 
@@ -67,6 +69,7 @@ const probe = (btnId, outId, type, wait, input) => {
     $(outId).textContent = JSON.stringify(r, null, 2);
   });
 };
+probe('probeOrders', 'probeOrdersOut', 'pt:probeOrders', 'Opening your Purchased orders page in a background tab… (up to ~4 min)');
 probe('probe', 'probeOut', 'pt:probe', 'Opening listing in a background tab… (up to ~2 min)', 'probeInput');
 probe('probeSeller', 'probeOut', 'pt:probeSeller', 'Opening listing in a background tab… (up to ~2 min)', 'probeInput');
 probe('probeUsps', 'probeUspsOut', 'pt:probeUsps', 'Opening USPS in a background tab… (up to ~90 s)', 'probeUspsInput');

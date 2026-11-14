@@ -1,5 +1,8 @@
 /**
- * fb-extractor.js — PT_extractInPage(opts) is serialized by chrome.scripting.executeScript({func}),
+ * fb-extractor.js — FALLBACK ONLY since 1.3.0: the run reads the "Purchased orders" page (orders-extractor.js) and only
+ * purchases not found there come here. A missing View Order button is reported as a failed check, NEVER as a cancellation.
+ *
+ * PT_extractInPage(opts) is serialized by chrome.scripting.executeScript({func}),
  * so it MUST be fully self-contained (no closures). It relies on globalThis.PTParse + globalThis.PTGuard, which
  * background.js injects first via executeScript({files:['login-guard.js', 'parse-order.js']}).
  *

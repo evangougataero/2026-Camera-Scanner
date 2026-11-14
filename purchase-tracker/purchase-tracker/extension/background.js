@@ -1,13 +1,17 @@
 /**
  * Purchase Tracker — MV3 service worker.
  *
- * Job: every 180 minutes, ask the Apps Script web app what is due:
- *   - Cancellation/status signals (once per run, if the backend has active purchases):
- *       Meta Pay wallet (accountscenter.facebook.com/meta_pay_wallet/) and Facebook Marketplace notifications.
- *   - Facebook order checks: open the listing in a BACKGROUND tab (active:false), open "View Order" -> "Order status",
- *     read status / tracking / seller. "Seller" checks only backfill the seller name (no status changes).
- *   - USPS checks: open https://tools.usps.com/tracking/<number> in a background tab and read the result.
- * Each result is posted back and the tab closed. All spreadsheet logic lives in Apps Script.
+ * Job: every 180 minutes, ask the Apps Script web app what is due, then (in this order):
+ *   1. Facebook "Purchased orders" page (https://www.facebook.com/marketplace/you/orders/) — ONE visit per run replaces
+ *      the old per-listing checks: read every order card (status, title, date), open the "Order status" dialog of each
+ *      card that could belong to a tracked purchase (status, estimated arrival, carrier + tracking, timeline, seller,
+ *      price, IDs), match orders to Purchased rows (ID > seller+price > title+date; ties change nothing) and post one
+ *      result per matched row through the existing submitFbResult endpoint.
+ *      A purchase NOT FOUND on the page is never canceled: it is logged and (unless switched off on the Options page)
+ *      its listing page is read the old way as a fallback, which itself never cancels without explicit evidence.
+ *   2. USPS checks: https://tools.usps.com/tracking/<number> in a background tab (including numbers the orders page just found).
+ *   3. Secondary confirmation signals (only while the backend has active purchases): Meta Pay wallet + Marketplace notifications.
+ * Every page is opened in a BACKGROUND tab (active:false); each result is posted back and the tab closed. All spreadsheet logic lives in Apps Script.
  * No Facebook/USPS APIs, no credentials. Bot checks / login walls / password prompts are reported, never bypassed.
  *
  * MV3 service workers die after ~30 s without extension activity, so:
@@ -17,7 +21,8 @@
  *   - each step first arms a watchdog alarm, so a worker killed mid-step resumes the same item (max 3 tries).
  * A heartbeat + storage lock prevents duplicate concurrent runs.
  */
-importScripts('login-guard.js', 'parse-order.js', 'fb-extractor.js', 'parse-usps.js', 'usps-extractor.js', 'parse-signals.js', 'signals-extractor.js');
+importScripts('login-guard.js', 'parse-order.js', 'parse-orders.js', 'orders-extractor.js', 'fb-extractor.js', 'parse-usps.js', 'usps-extractor.js',
+  'parse-signals.js', 'signals-extractor.js');
 
 const ALARM_RUN = 'pt-run';
 const ALARM_STEP = 'pt-step';
@@ -33,7 +38,10 @@ const BATCH_LIMIT = 15;
 const OUTBOX_MAX = 50;
 
 const META_PAY_URL = 'https://accountscenter.facebook.com/meta_pay_wallet/?referrer=accounts_center_home';
-const NOTIFICATION_URLS = ['https://www.facebook.com/marketplace/notifications/', 'https://www.facebook.com/notifications/'];
+const ORDERS_URL = 'https://www.facebook.com/marketplace/you/orders/';
+const ORDERS_SCRIPT_TIMEOUT_MS = 270000;    // cards + up to ~25 dialogs
+const ORDERS_DEFAULT_LOOKBACK_DAYS = 60;    // how far back to scroll when no purchase date is known (probe without backend)
+const NOTIFICATION_URLS =['https://www.facebook.com/marketplace/notifications/', 'https://www.facebook.com/notifications/'];
 
 const K = { settings: 'pt_settings', queue: 'pt_queue', state: 'pt_state', outbox: 'pt_outbox', stepLock: 'pt_stepLock', openTab: 'pt_openTab' };
 let stepping = false;                       // in-memory guard on top of the storage lock
@@ -254,6 +262,52 @@ async function checkListing(item, opts) {
   }));
 }
 
+// ---------------------------------------------------------------- Facebook "Purchased orders" page
+/** Work items from getWork -> the fields the matcher needs (older backends send fewer fields: matching then relies on IDs/titles). */
+function matchItem(w) {
+  return { purchaseId: String(w.purchaseId), listingId: String(w.listingId || ''), orderId: String(w.orderId || ''), seller: w.seller || '',
+           cost: w.cost === undefined ? '' : w.cost, ask: w.ask === undefined ? '' : w.ask, purchasedAt: w.purchasedAt || '',
+           fbTitle: w.fbTitle || '', product: w.product || '', trackingNumber: w.trackingNumber || '', mode: w.mode === 'seller' ? 'seller' : 'order' };
+}
+
+function isoDaysAgo(days) { return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10); }
+
+async function runOrders(tabId, opts) {
+  await chrome.scripting.executeScript({ target: { tabId }, files: ['login-guard.js', 'parse-order.js', 'parse-orders.js'] });
+  const [r] = await withTimeout(chrome.scripting.executeScript({ target: { tabId }, func: PT_ordersInPage, args: [opts] }), ORDERS_SCRIPT_TIMEOUT_MS, 'SCRIPT_TIMEOUT');
+  return r && r.result;
+}
+
+/**
+ * One visit to the orders page (same code for scheduled runs and the "Probe orders page" button; only `probe` differs).
+ * If opening a card navigates the tab away (the injected script dies), the tab is sent back to the list and the read
+ * RESUMES (the page function keeps its progress in sessionStorage), max 3 attempts. Login walls are re-verified once
+ * (reverifyWall) and never bypassed.
+ */
+async function checkOrdersPage(work, opts) {
+  opts = opts || {};
+  const items = (work || []).map(matchItem);
+  const earliest = PTOrders.earliestNeeded(items) || isoDaysAgo(ORDERS_DEFAULT_LOOKBACK_DAYS);
+  const pageOpts = Object.assign({ items, earliest, probe: !!opts.probe, openAll: !!opts.probe }, opts.pageOpts || {});
+  return reverifyWall(() => inTab(ORDERS_URL, async (tabId) => {
+    const wall = await tabWall(tabId);
+    if (wall) return wall;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await runOrders(tabId, Object.assign({}, pageOpts, { resume: attempt > 0 }));
+        if (r) return Object.assign(r, attempt ? { resumed: attempt } : {});
+      } catch (e) { if (!isContextLost(e)) throw e; }
+      await chrome.tabs.update(tabId, { url: ORDERS_URL });                             // back to the list, still a background tab
+      await sleep(1500);
+      await waitForStable(tabId, PAGE_TIMEOUT_MS);
+      const again = await tabWall(tabId);
+      if (again) return again;
+      await sleep(2500);
+    }
+    return { ok: false, error: 'CONTEXT_LOST', detail: 'the orders page kept navigating away' };
+  }));
+}
+
 async function runUsps(tabId, opts) {
   await chrome.scripting.executeScript({ target: { tabId }, files: ['parse-usps.js'] });
   const [r] = await withTimeout(chrome.scripting.executeScript({ target: { tabId }, func: PT_uspsInPage, args: [opts] }), SCRIPT_TIMEOUT_MS, 'SCRIPT_TIMEOUT');
@@ -333,7 +387,7 @@ async function finishRun(q, outcome) {
   await chrome.alarms.clear(ALARM_STEP);
   await patchState({ lastRunFinishedAt: Date.now(), lastRunOutcome: outcome, lastRunStats: stats });
   await log('run ' + outcome + ' — ok:' + (stats.ok || 0) + ' errors:' + (stats.errors || 0) + ' canceled:' + (stats.canceled || 0) + ' tracking:' + (stats.tracking || 0) +
-    ' sellers:' + (stats.sellers || 0) + ' usps:' + (stats.usps || 0) + ' signals:' + (stats.signals || 0));
+    ' sellers:' + (stats.sellers || 0) + ' usps:' + (stats.usps || 0) + ' signals:' + (stats.signals || 0) + ' not-on-orders-page:' + (stats.notFound || 0));
   const kinds = issueKindsOf(q);
   await patchState({ badgeIssues: kinds });
   await setBadge(kinds);
@@ -365,11 +419,13 @@ async function startRun(reason, force) {
   const s = await settings();
   try {
     await flushOutbox();
-    // Order of work: Facebook order/seller checks FIRST (the data that matters most), then USPS, then the Meta Pay /
-    // notifications signal pages LAST — a problem on a signal page can never cost the order checks of a run.
+    // Order of work: the Facebook orders page FIRST (the data that matters most; one visit covers every due purchase,
+    // order checks and seller backfill alike), then USPS, then the Meta Pay / notifications signal pages LAST — a problem
+    // on a signal page can never cost the order checks of a run.
     const fb = await api('getWork', { limit: BATCH_LIMIT, force: !!force });
-    (fb.items || []).forEach((i) => items.push(Object.assign({ kind: 'fb' }, i)));
-    (fb.sellerItems || []).forEach((i) => items.push(Object.assign({ kind: 'fb', mode: 'seller' }, i)));
+    const work = (fb.items || []).map((i) => Object.assign({}, i, { mode: 'order' }))
+      .concat((fb.sellerItems || []).map((i) => Object.assign({}, i, { mode: 'seller' })));
+    if (work.length) items.push({ kind: 'orders', purchaseId: 'ORDERS_PAGE', work });
     const us = await api('getUspsWork', { limit: BATCH_LIMIT, force: !!force });
     (us.items || []).forEach((i) => items.push(Object.assign({ kind: 'usps' }, i)));
     if (fb.signals) {                                        // backend has purchases a cancellation could still affect
@@ -389,9 +445,10 @@ async function startRun(reason, force) {
     return { items: 0 };
   }
   await setLocal({ [K.queue]: { runId: String(Date.now()), reason, startedAt: Date.now(), heartbeat: Date.now(), index: 0, tries: 0, items, issue: false, issueKinds: [],
-    stats: { ok: 0, errors: 0, canceled: 0, tracking: 0, sellers: 0, usps: 0, signals: 0 } } });
+    stats: { ok: 0, errors: 0, canceled: 0, tracking: 0, sellers: 0, usps: 0, signals: 0, notFound: 0 } } });
   const n = (k) => items.filter((i) => i.kind === k).length;
-  await log('run started (' + reason + '): ' + n('fb') + ' Facebook (' + items.filter((i) => i.kind === 'fb' && i.mode === 'seller').length + ' seller-only), ' +
+  const ow = (items.find((i) => i.kind === 'orders') || {}).work || [];
+  await log('run started (' + reason + '): orders page for ' + ow.length + ' purchase(s) (' + ow.filter((w) => w.mode === 'seller').length + ' seller-only), ' +
     n('usps') + ' USPS, ' + (n('metapay') + n('notifications')) + ' signal page(s)');
   await processStep();
   return { items: items.length };
@@ -402,8 +459,58 @@ function dropRemaining(q, kinds) {
   q.items = q.items.filter((it, i) => i <= q.index || kinds.indexOf(it.kind) === -1);
 }
 
-/** Dropped after a wall on an actual ORDER page (kind 'fb'). A wall on a signal page never drops order checks. */
-const FB_KINDS = ['fb', 'notifications'];
+/** Dropped after a wall on a Facebook ORDER page (orders page or listing fallback). A wall on a signal page never drops order checks. */
+const FB_KINDS = ['orders', 'fb', 'notifications'];
+
+/** Inserts items right after the current one (fallback listing checks) or before the signal pages (new USPS checks). */
+function insertNext(q, list) { q.items.splice(q.index + 1, 0, ...list); }
+function insertBeforeSignals(q, list) {
+  let at = q.items.findIndex((it, i) => i > q.index && (it.kind === 'metapay' || it.kind === 'notifications'));
+  if (at === -1) at = q.items.length;
+  q.items.splice(at, 0, ...list);
+}
+
+/**
+ * Orders-page result -> one submitFbResult per matched purchase (existing endpoint and payload shape, plus a few extra
+ * fields old backends ignore). Not-found and ambiguous purchases are only LOGGED (never canceled, nothing sent for them);
+ * they get the old listing-page check as a fallback unless the user switched it off.
+ */
+async function handleOrders(q, item, res) {
+  const work = item.work || [];
+  const s = await settings();
+  const fallbackOn = s.fallbackListing !== false;
+  let fallback = [];
+  if (!res.ok) {
+    q.stats.errors++;
+    await log('Orders page: error ' + res.error + (res.detail ? ' (' + String(res.detail).slice(0, 240) + ')' : '') +
+      (fallbackOn && work.length ? ' — checking ' + work.length + ' listing page(s) instead' : ''));
+    fallback = work;
+  } else {
+    const plan = PTOrders.planOrderResults(res.orders || [], work.map(matchItem));
+    await log('Orders page: ' + (res.cardsSeen || 0) + ' order card(s), ' + (res.dialogsOpened || 0) + ' dialog(s) read, ' + (res.scrolls || 0) + ' scroll(s) (' +
+      (res.stopReason || '') + '); matched ' + plan.submissions.length + ', ambiguous ' + plan.ambiguous.length + ', not found ' + plan.notFound.length);
+    for (const sub of plan.submissions) {
+      await queueResult('submitFbResult', sub.purchaseId, sub.result);                    // saved before moving on
+      q.stats.ok++;
+      if (sub.result.canceled) q.stats.canceled++;
+      if (sub.result.trackingNumber) q.stats.tracking++;
+      if (sub.result.seller) q.stats.sellers++;
+      await log(sub.purchaseId + ' FB orders page' + (sub.mode === 'seller' ? ' (seller)' : '') + ' [' + sub.via + ']: ' + PTOrders.describeOrder(sub.order));
+    }
+    for (const a of plan.ambiguous) {
+      await log('Orders page: AMBIGUOUS "' + String(a.title).slice(0, 60) + '" ' + (a.orderDate || '') + ' fits ' + a.purchaseIds.join(' / ') + ' (' + a.via + ') — nothing changed');
+    }
+    const amb = {};
+    plan.ambiguous.forEach((a) => a.purchaseIds.forEach((id) => { amb[id] = true; }));
+    q.stats.notFound = (q.stats.notFound || 0) + plan.notFound.length;
+    for (const id of plan.notFound) await log(id + ' not found on orders page — unchanged' + (fallbackOn ? '; checking its listing page instead' : ''));
+    fallback = work.filter((w) => plan.notFound.indexOf(String(w.purchaseId)) !== -1 || amb[String(w.purchaseId)]);
+    const newUsps = plan.newUspsTracking.filter((t) => !q.items.some((it) => it.kind === 'usps' && it.purchaseId === t.purchaseId))
+      .map((t) => ({ kind: 'usps', purchaseId: t.purchaseId, trackingNumber: t.trackingNumber }));
+    if (newUsps.length) insertBeforeSignals(q, newUsps);
+  }
+  if (fallbackOn && fallback.length) insertNext(q, fallback.map((w) => Object.assign({ kind: 'fb' }, w)));
+}
 
 /** " — <how · path · snippet>" suffix for LOGIN_REQUIRED / CHECKPOINT / REAUTH reports, so false alarms are diagnosable. */
 function wallDetail(res) {
@@ -458,21 +565,26 @@ async function processStep() {
         res = kind === 'usps' ? await checkUsps(item)
           : kind === 'metapay' ? await checkMetaPay()
           : kind === 'notifications' ? await checkNotifications()
+          : kind === 'orders' ? await checkOrdersPage(item.work)
           : await checkListing(item);
       } catch (e) { res = { ok: false, error: 'EXTENSION_ERROR', detail: String(e.message || e) }; }
     }
     res = res || { ok: false, error: 'NO_RESULT' };
 
-    const systemic = !res.ok && ((kind === 'fb' && (res.error === 'LOGIN_REQUIRED' || res.error === 'CHECKPOINT')) || (kind === 'usps' && res.error === 'USPS_BLOCKED'));
+    const fbKind = kind === 'fb' || kind === 'orders';
+    const systemic = !res.ok && ((fbKind && (res.error === 'LOGIN_REQUIRED' || res.error === 'CHECKPOINT')) || (kind === 'usps' && res.error === 'USPS_BLOCKED'));
     if (kind === 'metapay' || kind === 'notifications') {
       await handleSignals(q, item, res);
     } else if (systemic) {
       // Never try to get past it: skip the rest of THIS kind, tell the user and the sheet (not counted against the item).
-      const why = kind === 'fb' ? wallDetail(res) : '';
-      try { await api('reportIssue', { code: res.error, message: (kind === 'usps' ? 'USPS' : 'Facebook') + ' ' + res.error + ' on ' + item.purchaseId + why }); } catch (e) { /* offline */ }
-      await log('STOPPED ' + kind.toUpperCase() + ': ' + res.error + why + (kind === 'usps' ? ' — USPS served a bot check; open tools.usps.com manually and retry later' : ' — open facebook.com and resolve it manually'));
+      const why = fbKind ? wallDetail(res) : '';
+      const where = kind === 'orders' ? ' on the orders page' : ' on ' + item.purchaseId;
+      try { await api('reportIssue', { code: res.error, message: (kind === 'usps' ? 'USPS' : 'Facebook') + ' ' + res.error + where + why }); } catch (e) { /* offline */ }
+      await log('STOPPED ' + (fbKind ? 'FB' : kind.toUpperCase()) + ': ' + res.error + why + (kind === 'usps' ? ' — USPS served a bot check; open tools.usps.com manually and retry later' : ' — open facebook.com and resolve it manually'));
       dropRemaining(q, kind === 'usps' ? ['usps'] : FB_KINDS);
-      flagIssue(q, kind);
+      flagIssue(q, fbKind ? 'fb' : kind);
+    } else if (kind === 'orders') {
+      await handleOrders(q, item, res);
     } else if (kind === 'usps') {
       await queueResult('submitUspsResult', item.purchaseId, { ok: !!res.ok, error: res.error, detail: res.detail, notFound: !!res.notFound,
         trackingNumber: res.trackingNumber || item.trackingNumber, status: res.status, summary: res.summary, history: res.history, expectedDelivery: res.expectedDelivery });
@@ -534,6 +646,42 @@ async function preview(source, payload) {
   catch (e) { return { error: 'preview unavailable: ' + e.message }; }
 }
 
+/**
+ * "Probe orders page": the SAME page read as a run (every card's dialog is opened), matched against the purchases the
+ * backend would hand out right now (getWork force — read-only), plus the backend's read-only preview of the patches.
+ * Nothing is submitted. Without a backend connection it still shows the cards and dialogs.
+ */
+async function probeOrders() {
+  let work = [], workNote = '';
+  try {
+    const fb = await api('getWork', { limit: BATCH_LIMIT, force: true });
+    work = (fb.items || []).map((i) => Object.assign({}, i, { mode: 'order' })).concat((fb.sellerItems || []).map((i) => Object.assign({}, i, { mode: 'seller' })));
+  } catch (e) { workNote = 'backend not reachable (' + e.message + ') — showing the page only, no matching'; }
+  const r = await checkOrdersPage(work, { probe: true });
+  if (!r || !r.ok) return r || { ok: false, error: 'NO_RESULT' };
+  await clearIssueAfterProbe('fb');
+  const items = work.map(matchItem);
+  const plan = PTOrders.planOrderResults(r.orders || [], items);
+  const product = (id) => (work.find((w) => String(w.purchaseId) === String(id)) || {}).product || '';
+  let wouldChange;
+  if (plan.submissions.length) {
+    try { wouldChange = await api('previewFbResults', { results: plan.submissions.map((s) => ({ purchaseId: s.purchaseId, result: s.result })) }); }
+    catch (e) { wouldChange = { error: 'preview unavailable: ' + e.message + (/UNKNOWN_ACTION/.test(e.message) ? ' (update/redeploy the Apps Script)' : '') }; }
+  }
+  return {
+    ok: true, url: r.url, cardsSeen: r.cardsSeen, dialogsOpened: r.dialogsOpened, scrolls: r.scrolls, stopReason: r.stopReason, earliest: r.earliest,
+    workNote: workNote || (work.length + ' tracked purchase(s) from the backend'),
+    orders: (r.orders || []).map((o) => Object.assign({ summary: PTOrders.describeOrder(o) }, o)),
+    matches: plan.submissions.map((s) => ({ purchaseId: s.purchaseId, product: product(s.purchaseId), via: s.via, mode: s.mode, order: PTOrders.describeOrder(s.order),
+      wouldSend: { fbStatusRaw: s.result.fbStatusRaw, purchaseStatus: s.result.purchaseStatus, canceled: s.result.canceled, outcome: s.result.outcome,
+        trackingNumber: s.result.trackingNumber, carrier: s.result.carrier, seller: s.result.seller, orderId: s.result.orderId, estimatedDelivery: s.result.estimatedDelivery } })),
+    ambiguous: plan.ambiguous,
+    notFound: plan.notFound.map((id) => ({ purchaseId: id, product: product(id), note: 'not found on orders page — unchanged (never canceled)' })),
+    wouldChange,
+    probe: r.probe
+  };
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, send) => {
   (async () => {
     if (sender.id !== chrome.runtime.id) return { error: 'FOREIGN_SENDER' };
@@ -548,6 +696,7 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
         if (r && (r.ok || r.pageHealthy)) await clearIssueAfterProbe('fb');          // signed in and the page is readable
         return r;
       }
+      case 'pt:probeOrders': return await probeOrders();
       case 'pt:probeUsps': {
         const n = String(msg.input || '').replace(/\s/g, '');
         if (!/^[A-Za-z0-9]{10,34}$/.test(n)) return { error: 'Enter a tracking number' };
@@ -567,7 +716,8 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
       }
       case 'pt:saveSignalPrefs': {
         const s = await settings();
-        await setLocal({ [K.settings]: Object.assign(s, { scanMetaPay: !!msg.scanMetaPay, scanNotifications: !!msg.scanNotifications }) });
+        await setLocal({ [K.settings]: Object.assign(s, { scanMetaPay: !!msg.scanMetaPay, scanNotifications: !!msg.scanNotifications },
+          msg.fallbackListing === undefined ? {} : { fallbackListing: !!msg.fallbackListing }) });
         return { ok: true };
       }
       case 'pt:status': return { state: (await getLocal(K.state)) || {}, queue: await getLocal(K.queue), outbox: ((await getLocal(K.outbox)) || []).length, settings: await settings() };

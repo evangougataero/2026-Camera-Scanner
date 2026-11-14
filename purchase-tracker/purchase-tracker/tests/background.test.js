@@ -6,66 +6,15 @@
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
-
-const EXT = path.join(__dirname, '..', 'extension');
-
-function worker(pageResults, backend) {
-  const store = {}, alarms = {}, calls = [], listeners = {}, badge = { text: '' };
-  const ev = (name) => ({ addListener: (fn) => { (listeners[name] = listeners[name] || []).push(fn); }, removeListener: () => {} });
-  const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
-  const chrome = {
-    runtime: { id: 'me', onInstalled: ev('installed'), onStartup: ev('startup'), onMessage: ev('message'), getPlatformInfo: (cb) => cb && cb({}), openOptionsPage() {} },
-    storage: { local: {
-      get: async (k) => ({ [k]: clone(store[k]) }),
-      set: async (o) => { Object.keys(o).forEach((k) => { store[k] = clone(o[k]); }); },
-      remove: async (k) => { delete store[k]; }
-    } },
-    alarms: { create: async (n, o) => { alarms[n] = o; }, get: async (n) => alarms[n], clear: async (n) => { delete alarms[n]; }, onAlarm: ev('alarm') },
-    action: { setBadgeText: async (o) => { badge.text = o.text; }, setBadgeBackgroundColor: async () => {}, onClicked: ev('click') },
-    tabs: {
-      create: async (o) => { calls.push({ tab: o.url }); return { id: 7, url: o.url }; },
-      update: async () => ({}), remove: async () => {}, reload: async (id) => { calls.push({ reload: id }); },
-      get: async () => ({ id: 7, status: 'complete', url: 'https://www.facebook.com/marketplace/item/1/' }),
-      onUpdated: ev('updated')
-    },
-    scripting: {
-      executeScript: async (o) => {
-        if (o.files) return [];
-        const r = pageResults[o.func.name];
-        if (r instanceof Error) throw r;
-        return [{ result: typeof r === 'function' ? r(o.args[0]) : r }];
-      }
-    }
-  };
-  const fetch = async (url, o) => {
-    const body = JSON.parse(o.body);
-    calls.push({ api: body.action, body });
-    const out = (backend[body.action] || (() => ({ ok: true })))(body);
-    return { text: async () => JSON.stringify(out) };
-  };
-  const ctx = {
-    chrome, fetch, console: { log() {} }, URL, JSON, Math, Date, Object, Array, String, RegExp, Number, Promise, Error, AbortController,
-    setTimeout: (fn) => setTimeout(fn, 0), clearTimeout, setInterval: () => 0, clearInterval: () => {}
-  };
-  ctx.importScripts = (...files) => files.forEach((f) => vm.runInContext(fs.readFileSync(path.join(EXT, f), 'utf8'), ctx, { filename: f }));
-  vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync(path.join(EXT, 'background.js'), 'utf8'), ctx, { filename: 'background.js' });
-  store.pt_settings = { apiUrl: 'https://script.google.com/macros/s/abc/exec', apiToken: 't' };
-  const message = (msg) => new Promise((resolve) => listeners.message[0](msg, { id: 'me' }, resolve));
-  return { ctx, store, alarms, calls, badge, message, run: (code) => vm.runInContext(code, ctx) };
-}
+const { worker, drain, ORDERS_C1 } = require('./fake-worker');
 
 const ORDER_OK = { ok: true, orderView: true, fbStatusRaw: 'Delivered | Your order was delivered.', trackingNumber: '9334610579700004096766', carrier: 'USPS', seller: 'Olga Serdinskaya', itemTitle: 'Canon EOS 760D' };
 
-async function drain(w, max) {
-  for (let i = 0; i < (max || 20) && w.store.pt_queue; i++) await w.run('processStep()');
-}
 
-test('a run processes order checks first, then seller-only checks, then USPS, then the signal pages; every result reaches the right backend action', async () => {
-  const w = worker({ PT_extractInPage: (o) => (o.mode === 'seller' ? { ok: true, mode: 'seller', seller: 'Nathan Stickler' } : ORDER_OK),
+test('orders page unreadable: listing-page fallback for every due purchase (orders, then seller-only), then USPS, then the signal pages', async () => {
+  // The orders page could not be read at all (layout not recognised): every due purchase falls back to its listing page.
+  const w = worker({ PT_ordersInPage: { ok: false, error: 'ORDERS_NOT_FOUND', detail: 'no order cards' },
+                     PT_extractInPage: (o) => (o.mode === 'seller' ? { ok: true, mode: 'seller', seller: 'Nathan Stickler' } : ORDER_OK),
                      PT_metaPayInPage: { ok: true, transactions: [{ seller: 'Olga Serdinskaya', status: 'Delivered', date: '2026-11-03', amount: 262.84 }] },
                      PT_notificationsInPage: { ok: true, notifications: [], scanned: 4 } }, {
     getWork: () => ({ ok: true, signals: true, items: [{ purchaseId: 'C-1', listingId: '1288988733112094', url: '', mode: 'order' }],
@@ -75,7 +24,8 @@ test('a run processes order checks first, then seller-only checks, then USPS, th
   await w.run("startRun('test')");
   await drain(w);
   const order = w.calls.filter((c) => c.tab).map((c) => c.tab);
-  assert.deepEqual(order, ['https://www.facebook.com/marketplace/item/1288988733112094/', 'https://www.facebook.com/marketplace/item/5555555555555555/',
+  assert.deepEqual(order, ['https://www.facebook.com/marketplace/you/orders/',
+    'https://www.facebook.com/marketplace/item/1288988733112094/', 'https://www.facebook.com/marketplace/item/5555555555555555/',
     'https://tools.usps.com/tracking/9334610579700004096766',
     'https://accountscenter.facebook.com/meta_pay_wallet/?referrer=accounts_center_home', 'https://www.facebook.com/marketplace/notifications/']);
   const posts = w.calls.filter((c) => c.api && /^submit/.test(c.api));
@@ -108,7 +58,7 @@ test('each step arms a watchdog alarm first; after 3 worker restarts on one item
 });
 
 test('Meta Pay password prompt: reported to the sheet, badge raised, Facebook order checks still run', async () => {
-  const w = worker({ PT_metaPayInPage: { ok: false, error: 'REAUTH_REQUIRED' }, PT_notificationsInPage: { ok: true, notifications: [] }, PT_extractInPage: ORDER_OK }, {
+  const w = worker({ PT_metaPayInPage: { ok: false, error: 'REAUTH_REQUIRED' }, PT_notificationsInPage: { ok: true, notifications: [] }, PT_ordersInPage: ORDERS_C1 }, {
     getWork: () => ({ ok: true, signals: true, items: [{ purchaseId: 'C-1', listingId: '1288988733112094' }] }),
     getUspsWork: () => ({ ok: true, items: [] })
   });
@@ -121,7 +71,7 @@ test('Meta Pay password prompt: reported to the sheet, badge raised, Facebook or
 });
 
 test('a (confirmed) login wall on the notifications page is reported but never costs the order checks (never bypassed)', async () => {
-  const w = worker({ PT_notificationsInPage: { ok: false, error: 'LOGIN_REQUIRED', detail: 'via visible-password · path=/marketplace/notifications/ · "Log in"' }, PT_extractInPage: ORDER_OK }, {
+  const w = worker({ PT_notificationsInPage: { ok: false, error: 'LOGIN_REQUIRED', detail: 'via visible-password · path=/marketplace/notifications/ · "Log in"' }, PT_ordersInPage: ORDERS_C1 }, {
     getWork: () => ({ ok: true, signals: true, items: [{ purchaseId: 'C-1', listingId: '1288988733112094' }] }),
     getUspsWork: () => ({ ok: true, items: [{ purchaseId: 'C-1', trackingNumber: '9334610579700004096766' }] })
   });
@@ -142,7 +92,7 @@ test('a (confirmed) login wall on the notifications page is reported but never c
 test('a LOGIN_REQUIRED that does not survive the re-check is not reported; the run continues normally', async () => {
   let n = 0;
   const w = worker({ PT_notificationsInPage: () => (++n === 1 ? { ok: false, error: 'LOGIN_REQUIRED', detail: 'path=/marketplace/notifications/' } : { ok: true, notifications: [], scanned: 3 }),
-                     PT_extractInPage: ORDER_OK }, {
+                     PT_ordersInPage: ORDERS_C1 }, {
     getWork: () => ({ ok: true, signals: true, items: [{ purchaseId: 'C-1', listingId: '1288988733112094' }] }),
     getUspsWork: () => ({ ok: true, items: [] })
   });
@@ -155,8 +105,8 @@ test('a LOGIN_REQUIRED that does not survive the re-check is not reported; the r
   assert.equal(w.badge.text, '');
 });
 
-test('a confirmed login wall on an ORDER page stops the remaining Facebook checks (never bypassed); USPS + Meta Pay still run', async () => {
-  const w = worker({ PT_extractInPage: { ok: false, error: 'LOGIN_REQUIRED', detail: 'via login-form · path=/marketplace/item/1288988733112094/ · "Log in to Facebook"' },
+test('a confirmed login wall on a LISTING (fallback) page stops the remaining Facebook checks (never bypassed); USPS + Meta Pay still run', async () => {
+  const w = worker({ PT_ordersInPage: { ok: false, error: 'ORDERS_NOT_FOUND' }, PT_extractInPage: { ok: false, error: 'LOGIN_REQUIRED', detail: 'via login-form · path=/marketplace/item/1288988733112094/ · "Log in to Facebook"' },
                      PT_metaPayInPage: { ok: true, transactions: [] }, PT_notificationsInPage: { ok: true, notifications: [] } }, {
     getWork: () => ({ ok: true, signals: true, items: [{ purchaseId: 'C-1', listingId: '1288988733112094' }, { purchaseId: 'D-1', listingId: '2288988733112094' }] }),
     getUspsWork: () => ({ ok: true, items: [{ purchaseId: 'C-1', trackingNumber: '9334610579700004096766' }] })
@@ -176,7 +126,7 @@ test('a confirmed login wall on an ORDER page stops the remaining Facebook check
 });
 
 test('a tab URL with "login" only in its query string is not a login wall', async () => {
-  const w = worker({ PT_extractInPage: ORDER_OK }, {
+  const w = worker({ PT_ordersInPage: ORDERS_C1 }, {
     getWork: () => ({ ok: true, signals: false, items: [{ purchaseId: 'C-1', listingId: '1288988733112094' }] }),
     getUspsWork: () => ({ ok: true, items: [] })
   });
@@ -187,7 +137,7 @@ test('a tab URL with "login" only in its query string is not a login wall', asyn
   assert.equal(sent.body.result.ok, true);
   assert.ok(!w.calls.some((c) => c.api === 'reportIssue'));
   // ...while a real login URL is still reported (pathname check), with the path in the detail
-  const w2 = worker({ PT_extractInPage: ORDER_OK }, {
+  const w2 = worker({ PT_ordersInPage: ORDERS_C1 }, {
     getWork: () => ({ ok: true, signals: false, items: [{ purchaseId: 'C-1', listingId: '1288988733112094' }] }),
     getUspsWork: () => ({ ok: true, items: [] })
   });

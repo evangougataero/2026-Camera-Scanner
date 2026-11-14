@@ -405,6 +405,7 @@ function isSystemicFbError_(code) { return code === 'LOGIN_REQUIRED' || code ===
 /**
  * Turns an extension result into a patch. NEVER emits blanks, never downgrades.
  * res: {ok, error, detail, fbStatusRaw, canceled, trackingNumber, carrier, orderId, orderTotal}
+ *      + optional (orders page, Nov 2026): source 'orders-page', estimatedDelivery 'yyyy-MM-dd'. Extra fields are ignored.
  */
 /** An indirect signal (Meta Pay, notifications) may auto-cancel an order only while nothing proves it shipped. */
 function canAutoCancel_(rec) {
@@ -437,6 +438,9 @@ function applyFbResult_(rec, res, ts) {
   if (str_(res.fbStatusRaw)) p['FB Status (raw)'] = str_(res.fbStatusRaw).slice(0, 300);
   if (str_(res.orderId) && !str_(rec['FB Order ID'])) p['FB Order ID'] = str_(res.orderId);
   if (str_(res.orderTotal)) p['FB Order Total (raw)'] = str_(res.orderTotal);
+  // Facebook's "Estimated Arrival" (orders page, Nov 2026) only fills a BLANK Estimated Delivery: USPS's own date wins.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str_(res.estimatedDelivery)) && !str_(rec['Estimated Delivery'])) p['Estimated Delivery'] = str_(res.estimatedDelivery);
+  var fbSource = res.source === 'orders-page' ? 'Facebook orders page' : 'Facebook order status';
 
   if (str_(res.trackingNumber)) {
     if (!str_(rec['Tracking Number'])) {
@@ -454,10 +458,10 @@ function applyFbResult_(rec, res, ts) {
     var kind = CANCEL_KIND_LABEL[res.outcome] ? res.outcome : 'canceled';
     if (str_(rec['Transferred to eBay?']).toUpperCase() === 'Y') {
       p['Notes'] = appendNote_(p['Notes'] || rec['Notes'], ts, 'Facebook reports ' + CANCEL_KIND_LABEL[kind].toUpperCase() + ' after eBay transfer — review inventory manually');
-      p['Cancel Signal'] = 'Review: ' + CANCEL_KIND_LABEL[kind] + ' — Facebook order status';
+      p['Cancel Signal'] = 'Review: ' + CANCEL_KIND_LABEL[kind] + ' — ' + fbSource;
     } else {
       p['Purchase Status'] = PURCHASE_STATUS.CANCELED;
-      p['Cancel Signal'] = CANCEL_KIND_LABEL[kind] + ' — Facebook order status' + (str_(res.fbStatusRaw) ? ' (' + str_(res.fbStatusRaw).split(' | ')[0] + ')' : '');
+      p['Cancel Signal'] = CANCEL_KIND_LABEL[kind] + ' — ' + fbSource + (str_(res.fbStatusRaw) ? ' (' + str_(res.fbStatusRaw).split(' | ')[0] + ')' : '');
       if (kind === 'refunded') p['Refund Received'] = 'Y';
     }
   }

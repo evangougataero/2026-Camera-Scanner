@@ -23,7 +23,7 @@
 </head>
 <body>
 <h1>Purchase Tracker</h1>
-<p class="hint">Every 3 hours while Chrome is open, checks Facebook order status (tracking + seller), Meta Pay / Marketplace notifications (cancellations) and USPS tracking pages for items in your Purchased tab. Eligible items are moved to eBay inventory by Google Apps Script.</p>
+<p class="hint">Every 3 hours while Chrome is open, reads your Facebook <em>Purchased orders</em> page once (status, tracking, seller), then USPS tracking pages, then Meta Pay / Marketplace notifications (secondary confirmation) for items in your Purchased tab. Eligible items are moved to eBay inventory by Google Apps Script.</p>
 
 <h2>Connection</h2>
 <label for="apiUrl">Apps Script Web App URL</label>
@@ -35,21 +35,27 @@
 <span id="connMsg" role="status"></span>
 
 <h2>Run</h2>
-<p class="hint">"Run now" only checks listings that are due. "Force check all" ignores the recheck interval (still one at a time, 30 s apart).</p>
+<p class="hint">"Run now" only checks purchases that are due. "Force check all" ignores the recheck interval. Facebook is read in one visit to the orders page; USPS and signal pages follow one at a time, 30 s apart.</p>
 <button id="run">Run now</button>
 <button id="force">Force check all</button>
 <button id="refresh">Refresh status</button>
 <pre id="status">…</pre>
 
-<h2>Cancellation signals</h2>
+<h2>Secondary signals &amp; fallback</h2>
 <p class="hint">Each run (only while you have active purchases) also reads your Meta Pay wallet and Facebook Marketplace notifications to catch Canceled / Refunded / Expired orders. Meta Pay rows show the <em>seller's name</em>, so they are matched to purchases by the Seller column, verified by purchase date and amount.</p>
 <label><input type="checkbox" id="scanMetaPay"> Scan Meta Pay wallet (accountscenter.facebook.com)</label>
 <label><input type="checkbox" id="scanNotifications"> Scan Marketplace notifications</label>
-<button id="saveSignals">Save signal settings</button>
+<label><input type="checkbox" id="fallbackListing"> If a purchase is not found on the orders page, check its listing page instead (never cancels)</label>
+<button id="saveSignals">Save settings</button>
 <span id="signalMsg" role="status"></span>
 
-<h2>Probe a Facebook listing</h2>
-<p class="hint">Verifies the "View Order" → "Order status" extraction (status, tracking number, seller) on a purchase you actually made. Opens the page in a background tab, shows exactly what was found, and sends nothing to your sheet. Run this on a few real orders (awaiting shipment, shipped, delivered, canceled) before trusting the automation.</p>
+<h2>Probe orders page</h2>
+<p class="hint">Opens <code>facebook.com/marketplace/you/orders</code> in a background tab, reads every order card (status, title, date), opens each card's "Order status" dialog (status, estimated arrival, carrier + tracking number, timeline, seller, price) and shows which Purchased rows each order would match (by ID, seller + price, or title + date), plus a read-only preview of what the backend <em>would</em> change. Nothing is written. Purchases not found on the page are listed as such — they are never canceled. Takes up to ~4 min with many orders.</p>
+<button id="probeOrders">Probe orders page</button>
+<pre id="probeOrdersOut">Output appears here.</pre>
+
+<h2>Probe a Facebook listing (fallback)</h2>
+<p class="hint">The old per-listing read ("View Order" → "Order status"), now only used for purchases the orders page did not show. Opens the listing in a background tab, shows what was found, and sends nothing to your sheet.</p>
 <label for="probeInput">Listing URL or ID</label>
 <input id="probeInput" type="text" placeholder="https://www.facebook.com/marketplace/item/1234567890/">
 <button id="probe">Probe order</button>

@@ -288,6 +288,7 @@ function doPost(e) {
       case 'submitFbResult': return json_(withLock_(function () { return apiSubmitFb_(body); }, 30000));
       case 'submitSignals': return json_(withLock_(function () { return apiSubmitSignals_(body); }, 60000));
       case 'previewSignals': return json_(apiPreviewSignals_(body));
+      case 'previewFbResults': return json_(apiPreviewFbResults_(body));
       case 'reportIssue':
         log_('', 'EXTENSION_ISSUE', (body.code || '') + ' ' + (body.message || ''));
         return json_({ ok: true });
@@ -310,8 +311,23 @@ var CONFIG_DEFAULTS = {
 };
 function cfgVal_(key) { return (typeof CONFIG !== 'undefined' && CONFIG[key] !== undefined && CONFIG[key] !== null) ? CONFIG[key] : CONFIG_DEFAULTS[key]; }
 
+/**
+ * One work item. The fields after `mode` (added for the Facebook orders page) let the extension match an order card to
+ * this purchase: seller + price, or title + date. Older extensions ignore them.
+ */
 function workItem_(r, mode) {
-  return { purchaseId: String(r['Purchase ID']), listingId: String(r['Listing ID']), url: str_(r['Facebook URL']), orderId: str_(r['FB Order ID']), mode: mode };
+  return { purchaseId: String(r['Purchase ID']), listingId: String(r['Listing ID']), url: str_(r['Facebook URL']), orderId: str_(r['FB Order ID']), mode: mode,
+           seller: str_(r['Seller']), cost: parseMoney_(r['Purchase Cost']), ask: parseMoney_(r['Ask Price (FB)']), purchasedAt: dayStr_(r['Purchased At']),
+           fbTitle: str_(r['FB Listing Title']), product: str_(r['Product']), trackingNumber: str_(r['Tracking Number']) };
+}
+
+/** 'yyyy-MM-dd' of a sheet date (Date object in the spreadsheet time zone, or a "yyyy-MM-dd HH:mm" string), or ''. */
+function dayStr_(v) {
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, purchasedSS_().getSpreadsheetTimeZone(), 'yyyy-MM-dd');
+  }
+  var m = str_(v).match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : '';
 }
 
 function apiGetWork_(body) {
@@ -359,7 +375,8 @@ function apiSubmitFb_(body) {
   log_(rec['Purchase ID'], res.ok ? 'FB_CHECKED' : 'FB_CHECK_FAILED',
        (res.ok ? ((patch['Purchase Status'] || rec['Purchase Status']) + ' | ' + (res.fbStatusRaw || '') + (res.trackingNumber ? ' | tracking ' + res.trackingNumber : ' | no tracking yet'))
                : (res.error + (res.detail ? ' (' + String(res.detail).slice(0, 200) + ')' : ''))) +
-       (patch['Seller'] ? ' | seller ' + patch['Seller'] : ''));
+       (patch['Seller'] ? ' | seller ' + patch['Seller'] : '') +
+       (res.source === 'orders-page' ? ' | orders page' + (res.matchedVia ? ' (matched by ' + res.matchedVia + ')' : '') : ''));
   if (res.ok && fbSaysDelivered_(Object.assign({}, rec, patch))) { transferEligible_(); syncInventoryStatus_(); }   // FB-delivered => inventory now
   return { ok: true, status: patch['Purchase Status'] || rec['Purchase Status'] };
 }
@@ -418,6 +435,33 @@ function apiPreviewSignals_(body) {
     }),
     ambiguous: plan.ambiguous,
     unmatched: (plan.unmatched || []).length
+  };
+}
+
+/**
+ * Read-only: what a list of Facebook results WOULD change ({results:[{purchaseId, result}]}) — used by the extension's
+ * "Probe orders page" button. Same rules as submitFbResult; nothing is written.
+ */
+function apiPreviewFbResults_(body) {
+  var rd = readPurchased_();
+  var ts = nowStr_();
+  return {
+    ok: true,
+    updates: (body.results || []).map(function (x) {
+      var rec = rd.records.filter(function (r) { return str_(r['Purchase ID']) === str_(x.purchaseId); })[0];
+      if (!rec) return { purchaseId: x.purchaseId, error: 'UNKNOWN_PURCHASE_ID' };
+      var res = x.result || {};
+      var patch;
+      if (res.mode === 'seller') patch = rec['Purchase Status'] === PURCHASE_STATUS.VOIDED ? {} : applySellerResult_(rec, res, ts);
+      else if (isTerminalStatus_(rec['Purchase Status'])) patch = sellerPatch_(rec, res);
+      else patch = applyFbResult_(rec, res, ts);
+      var changes = {};
+      Object.keys(patch).forEach(function (k) {
+        if (k === 'Notes' || k === 'Last FB Check') return;
+        if (str_(patch[k]) !== str_(rec[k])) changes[k] = patch[k];
+      });
+      return { purchaseId: str_(rec['Purchase ID']), product: str_(rec['Product']), currentStatus: str_(rec['Purchase Status']), changes: changes };
+    })
   };
 }
 
