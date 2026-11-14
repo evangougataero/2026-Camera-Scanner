@@ -31,6 +31,10 @@ Flow: Main scanner sheet (`Purchased? = Y`) → **Purchased** tab (backend) → 
 - **Probe seller only**: reads just the seller from the listing page (falls back to the Order status dialog).
 - **Probe Meta Pay**: lists the wallet rows it read (seller, status, date, amount) and `wouldChange` — a read-only preview of which Purchased
   rows the backend would update. `REAUTH_REQUIRED` means Meta asked for your password: open the wallet once by hand, then retry.
+  Scheduled runs and this probe use the same code. The wallet list is rendered client-side and can show up late in a background tab, so the
+  reader waits for the page to be ready, the "Transactions" heading and the rows (up to ~15 s, +5 s once the heading is visible). If it still
+  finds no rows, it reloads the tab **once**, waits ~5 s and reads again. Only after that does it report `META_PAY_NO_TRANSACTIONS`, with
+  `retried once after reload — …` in the log, plus heading/visibility and a short text snippet to help with diagnosis.
 - **Probe notifications**: lists recognised order events from Marketplace notifications plus the same read-only `wouldChange` preview.
 - **Probe USPS** (unchanged).
 

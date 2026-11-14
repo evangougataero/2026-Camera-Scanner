@@ -31,14 +31,25 @@ async function PT_metaPayInPage(opts) {
     return null;
   };
 
-  await waitFor(() => bodyText().length > 100, 20000);
+  // The transaction list is client-rendered and can arrive well after "complete" (slower still in a throttled
+  // background tab during a run). Wait for: document ready + some text, then the "Transactions" heading or rows, then rows.
+  const t0 = Date.now();
+  await waitFor(() => document.readyState === 'complete' && bodyText().length > 100, opts.readyWaitMs || 15000);
   let b = blocker();
   if (b) return fail(b.code, b.detail);
   const rows = () => S.parseMetaPayText(bodyText(), Date.now());
-  await waitFor(() => rows().length > 0 || blocker(), 20000);
+  const heading = () => /(^|\n)[ \t]*(transactions|recent transactions|activity|recent activity)[ \t]*(\n|$)/i.test(bodyText());
+  const rowWaitMs = opts.rowWaitMs || 15000;
+  await waitFor(() => rows().length > 0 || blocker(), rowWaitMs);
+  // Heading visible but no rows yet: the list is still loading — give it a little longer (once).
+  if (!rows().length && !blocker() && heading()) await waitFor(() => rows().length > 0 || blocker(), opts.afterHeadingMs || 5000);
   b = blocker();
   if (b) return fail(b.code, b.detail);
-  if (!rows().length) return fail('META_PAY_NO_TRANSACTIONS', 'no "name / status / date / amount" rows found');
+  if (!rows().length) {
+    return fail('META_PAY_NO_TRANSACTIONS', 'no "name / status / date / amount" rows found after ' + Math.round((Date.now() - t0) / 1000) + 's' +
+      ' (heading ' + (heading() ? 'seen' : 'not seen') + ', readyState=' + document.readyState + ', visibility=' + document.visibilityState +
+      ', text: ' + norm(bodyText()).slice(0, 160) + ')');
+  }
 
   // Load older rows: scroll the page and any scrollable list, and press a "See more"-style button (max a few times).
   const maxRounds = opts.maxRounds || 4;

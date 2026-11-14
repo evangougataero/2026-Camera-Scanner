@@ -276,12 +276,37 @@ async function runSignalsFn(tabId, func, opts) {
   return r && r.result;
 }
 
+const META_PAY_RETRY_WAIT_MS = 5000;
+
+/**
+ * Meta Pay wallet — the SAME path for scheduled runs and the "Probe Meta Pay" button (only `probe` differs).
+ * The transaction list is client-rendered; in a run the background tab can be slower/throttled, so the page function
+ * polls for rows, and if it still sees none the tab is reloaded ONCE and read again before META_PAY_NO_TRANSACTIONS
+ * is reported (the detail then says "retried"). Login / re-auth results are never retried here (reverifyWall handles walls).
+ */
 async function checkMetaPay(opts) {
   const probe = !!(opts && opts.probe);
+  const read = (tabId) => runPhase(tabId, (t, o) => runSignalsFn(t, PT_metaPayInPage, o), { probe }, { probe });
   return reverifyWall(() => inTab(META_PAY_URL, async (tabId) => {
     const wall = await tabWall(tabId);
     if (wall) return wall;
-    return (await runPhase(tabId, (t, o) => runSignalsFn(t, PT_metaPayInPage, o), { probe }, { probe })) || { ok: false, error: 'NO_RESULT' };
+    const first = (await read(tabId)) || { ok: false, error: 'NO_RESULT' };
+    if (first.ok || first.error !== 'META_PAY_NO_TRANSACTIONS') return first;
+    let second;
+    try {
+      await chrome.tabs.reload(tabId);
+      await sleep(1000);
+      await waitForStable(tabId, PAGE_TIMEOUT_MS);
+      const again = await tabWall(tabId);
+      if (again) return again;
+      await sleep(META_PAY_RETRY_WAIT_MS);                                              // let the list render
+      second = (await read(tabId)) || { ok: false, error: 'NO_RESULT' };
+    } catch (e) {
+      second = { ok: false, error: 'META_PAY_NO_TRANSACTIONS', detail: 'reload failed: ' + String(e && e.message || e).slice(0, 100) };
+    }
+    if (second.ok) return Object.assign(second, { retried: true });
+    if (second.error !== 'META_PAY_NO_TRANSACTIONS') return Object.assign(second, { retried: true });
+    return Object.assign(second, { retried: true, detail: 'retried once after reload — ' + (second.detail || first.detail || '') });
   }));
 }
 
@@ -397,7 +422,7 @@ async function handleSignals(q, item, res) {
       flagIssue(q, item.kind);
       await log('STOPPED ' + label + ': ' + res.error + why + ' — resolve it manually in Chrome (never bypassed)');
     } else {
-      await log(label + ': error ' + res.error + (res.detail ? ' (' + String(res.detail).slice(0, 120) + ')' : ''));
+      await log(label + ': error ' + res.error + (res.detail ? ' (' + String(res.detail).slice(0, 240) + ')' : '') + (res.retried && !/retried/.test(res.detail || '') ? ' (retried once)' : ''));
     }
     q.stats.errors++;
     return;
@@ -406,7 +431,7 @@ async function handleSignals(q, item, res) {
                                           : { source: 'notifications', ok: true, notifications: res.notifications || [] };
   await queueResult('submitSignals', '', payload);
   q.stats.signals++;
-  await log(label + ': ' + (item.kind === 'metapay' ? (res.transactions || []).length + ' transaction(s)' : (res.notifications || []).length + ' order notification(s) of ' + (res.scanned || 0) + ' scanned') + ' sent');
+  await log(label + ': ' + (item.kind === 'metapay' ? (res.transactions || []).length + ' transaction(s)' : (res.notifications || []).length + ' order notification(s) of ' + (res.scanned || 0) + ' scanned') + ' sent' + (res.retried ? ' (after one reload retry)' : ''));
 }
 
 async function processStep() {

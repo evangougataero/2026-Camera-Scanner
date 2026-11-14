@@ -206,6 +206,30 @@ test('Meta Pay page function reads wallet rows', async () => {
     ['Olga Serdinskaya|Delivered|2026-11-03|262.84', 'Nathan Stickler|Canceled|2026-11-03|290.4']);
 });
 
+const WALLET_URL = 'https://accountscenter.facebook.com/meta_pay_wallet/';
+const WALLET_SHELL = ['Accounts Center', 'Meta Pay', 'Payment methods', 'Manage your payment methods, see your transactions and change settings.', 'Transactions'];
+
+test('Meta Pay page function: transaction rows rendered LATE (client-side, after the heading) are still captured', async () => {
+  const list = h('div', { role: 'main' }, '', WALLET_SHELL.map((l) => h('div', {}, l)));
+  const body = h('body', {}, '', [list]);
+  setTimeout(() => WALLET.forEach((l) => list.append(h('div', {}, l))), 1200);                    // rows arrive ~1.2 s after "complete"
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-signals.js', 'signals-extractor.js'], url: WALLET_URL });
+  const r = await ctx.PT_metaPayInPage({ maxRounds: 1 });
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 300));
+  assert.equal(r.transactions.length, 2);
+  assert.equal(r.transactions[1].status, 'Canceled');
+});
+
+test('Meta Pay page function: rows that never appear => META_PAY_NO_TRANSACTIONS with diagnostics (after waiting)', async () => {
+  const body = h('body', {}, '', [h('div', { role: 'main' }, '', WALLET_SHELL.map((l) => h('div', {}, l)))]);
+  const ctx = pageContext(body, { files: ['login-guard.js', 'parse-signals.js', 'signals-extractor.js'], url: WALLET_URL });
+  const t0 = Date.now();
+  const r = await ctx.PT_metaPayInPage({ maxRounds: 1, rowWaitMs: 600, afterHeadingMs: 600 });
+  assert.equal(r.ok, false); assert.equal(r.error, 'META_PAY_NO_TRANSACTIONS');
+  assert.ok(Date.now() - t0 >= 1100, 'waited for the rows (and longer once the Transactions heading was seen)');
+  assert.match(r.detail, /heading seen/); assert.match(r.detail, /visibility=hidden/);
+});
+
 test('Meta Pay password prompt => REAUTH_REQUIRED (never bypassed)', async () => {
   const body = h('body', {}, 'Re-enter your password to continue. For your security, please confirm it is you. '.repeat(3), [h('input', { type: 'password' })]);
   const ctx = pageContext(body, { files: ['login-guard.js', 'parse-signals.js', 'signals-extractor.js'], url: 'https://accountscenter.facebook.com/meta_pay_wallet/' });

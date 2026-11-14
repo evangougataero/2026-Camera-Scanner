@@ -27,7 +27,7 @@ function worker(pageResults, backend) {
     action: { setBadgeText: async (o) => { badge.text = o.text; }, setBadgeBackgroundColor: async () => {}, onClicked: ev('click') },
     tabs: {
       create: async (o) => { calls.push({ tab: o.url }); return { id: 7, url: o.url }; },
-      update: async () => ({}), remove: async () => {},
+      update: async () => ({}), remove: async () => {}, reload: async (id) => { calls.push({ reload: id }); },
       get: async () => ({ id: 7, status: 'complete', url: 'https://www.facebook.com/marketplace/item/1/' }),
       onUpdated: ev('updated')
     },
@@ -228,4 +228,44 @@ test('an old backend that does not know submitSignals does not clog the outbox',
   await drain(w);
   assert.equal((w.store.pt_outbox || []).length, 0);
   assert.match(w.store.pt_state.log.join('\n'), /update\/redeploy the Apps Script/);
+});
+
+// ---------------------------------------------------------------- Meta Pay: one reload retry when no rows were read
+const NO_ROWS = { ok: false, error: 'META_PAY_NO_TRANSACTIONS', detail: 'no "name / status / date / amount" rows found after 15s (heading not seen)' };
+const WALLET_ROW = { seller: 'Olga Serdinskaya', status: 'Delivered', date: '2026-11-03', amount: 262.84 };
+const signalsOnly = () => ({ getWork: () => ({ ok: true, signals: true, items: [] }), getUspsWork: () => ({ ok: true, items: [] }) });
+
+test('Meta Pay in a run: no rows on the first read -> tab reloaded once, second read is submitted', async () => {
+  let n = 0;
+  const w = worker({ PT_metaPayInPage: () => (++n === 1 ? NO_ROWS : { ok: true, transactions: [WALLET_ROW] }), PT_notificationsInPage: { ok: true, notifications: [] } }, signalsOnly());
+  await w.run("startRun('test')");
+  await drain(w);
+  assert.equal(n, 2);
+  assert.equal(w.calls.filter((c) => c.reload).length, 1);
+  const sent = w.calls.find((c) => c.api === 'submitSignals' && c.body.result.source === 'metapay');
+  assert.equal(sent.body.result.transactions.length, 1);
+  assert.match(w.store.pt_state.log.join('\n'), /Meta Pay: 1 transaction\(s\) sent \(after one reload retry\)/);
+});
+
+test('Meta Pay in a run: still no rows after the retry -> META_PAY_NO_TRANSACTIONS with "retried", retried exactly once', async () => {
+  let n = 0;
+  const w = worker({ PT_metaPayInPage: () => { n++; return Object.assign({}, NO_ROWS); }, PT_notificationsInPage: { ok: true, notifications: [] } }, signalsOnly());
+  await w.run("startRun('test')");
+  await drain(w);
+  assert.equal(n, 2);                                                                             // first read + exactly one retry
+  assert.equal(w.calls.filter((c) => c.reload).length, 1);
+  assert.ok(!w.calls.some((c) => c.api === 'submitSignals' && c.body.result.source === 'metapay'));
+  assert.ok(!w.calls.some((c) => c.api === 'reportIssue'));                                      // not a login problem: no issue raised
+  assert.match(w.store.pt_state.log.join('\n'), /Meta Pay: error META_PAY_NO_TRANSACTIONS \(retried once after reload — no "name/);
+});
+
+test('Meta Pay: a password prompt is NOT retried (login/re-auth handling unchanged); the probe uses the same retry path', async () => {
+  let n = 0;
+  const w = worker({ PT_metaPayInPage: () => { n++; return { ok: false, error: 'REAUTH_REQUIRED' }; } }, signalsOnly());
+  const r = await w.run('checkMetaPay()');
+  assert.equal(r.error, 'REAUTH_REQUIRED'); assert.equal(n, 1); assert.equal(w.calls.filter((c) => c.reload).length, 0);
+  let m = 0;
+  w.ctx.chrome.scripting.executeScript = async (o) => (o.files ? [] : [{ result: ++m === 1 ? Object.assign({}, NO_ROWS) : { ok: true, transactions: [WALLET_ROW] } }]);
+  const p = await w.message({ type: 'pt:probeMetaPay' });
+  assert.equal(p.ok, true); assert.equal(p.retried, true); assert.equal(m, 2);
 });
